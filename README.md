@@ -88,7 +88,76 @@ ops/
 
 ### 如果用 C++ / CUDA 扩展实现算子
 
-用纯 PyTorch 或 Triton 写算子可以跳过这一节，不涉及下面的问题。
+用纯 PyTorch 或 Triton 写算子可以跳过这一节。C++/CUDA 扩展的接入方式和前面完全
+一样（新建 `.py` 文件、实现 `attention()`、调用 `register()`），唯一区别是
+`attention()` 函数体里调用的是编译好的 C++/CUDA kernel，而不是直接写 PyTorch
+算子。推荐用 `torch.utils.cpp_extension.load_inline` 在线编译，不需要额外的
+`setup.py` / `CMakeLists.txt`，第一次运行时自动编译并缓存，之后直接复用。
+
+以下是一个可以直接跑通的最小示例（`ops/my_flash_attention.py`，这里的 kernel
+只是把 q 原样拷贝到输出，不是真正的 attention，接入自己的实现时把 CUDA
+kernel 换成真正的计算逻辑即可）：
+
+```python
+import torch
+from torch.utils.cpp_extension import load_inline
+from .base import register
+
+# CUDA kernel 源码（.cu 部分）
+cuda_source = """
+__global__ void copy_kernel(const float* q, float* out, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        out[idx] = q[idx];
+    }
+}
+
+torch::Tensor copy_forward(torch::Tensor q) {
+    auto out = torch::empty_like(q);
+    int n = q.numel();
+    int threads = 256;
+    int blocks = (n + threads - 1) / threads;
+    copy_kernel<<<blocks, threads>>>(q.data_ptr<float>(), out.data_ptr<float>(), n);
+    return out;
+}
+"""
+
+# C++ 绑定源码（.cpp 部分），声明函数签名 + pybind11 绑定
+cpp_source = """
+#include <torch/extension.h>
+torch::Tensor copy_forward(torch::Tensor q);
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+    m.def("copy_forward", &copy_forward, "copy forward (CUDA)");
+}
+"""
+
+# name 务必改成带自己署名的唯一字符串（原因见下方"注意事项"）
+_mod = load_inline(
+    name="flash_attn_zhangsan",   # <- 改成自己的名字
+    cpp_sources=cpp_source,
+    cuda_sources=cuda_source,
+    verbose=False,  # 首次编译报错排查时可临时改成 True 看完整编译日志
+)
+
+
+def attention(q, k, v, causal=True, sm_scale=None):
+    # 这里换成真正的 attention 计算逻辑；示例 kernel 只支持 fp32，
+    # 所以需要转 dtype，真正实现里如果 kernel 原生支持 fp16/bf16 就不需要转
+    q_f32 = q.float().contiguous()
+    out = _mod.copy_forward(q_f32)
+    return out.to(q.dtype)
+
+
+register("zhangsan_fa (cuda)", attention)
+```
+
+如果算子比较复杂（比如用 cutlass 写 kernel），也可以用传统方式单独编译成
+`.so`（`python setup.py build_ext --inplace` 或 `pip install -e .`），再在
+`ops/xxx.py` 里 `import` 这个编译好的模块、包一层 `attention()` 函数注册即可，
+接入方式和上面一样。`flash-attention/csrc/cutlass/` 目录下就有完整的 cutlass
+头文件可以直接 `#include`。
+
+**注意事项**：
 
 如果用 `torch.utils.cpp_extension.load_inline`（或 `load`）在线编译 C++/CUDA
 kernel，**编译缓存目录是按你传的 `name` 参数命名的**（路径形如
