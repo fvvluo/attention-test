@@ -3261,12 +3261,18 @@ def _get_decode_streams(device, count: int):
 # producer threads, and no intra-warpgroup overlap.
 _DECODE_FIXED_BLOCK_N = 128
 _DECODE_FIXED_KV_STAGE = 5
-_DECODE_FIXED_SUPPORTED_SPLITS = (1, 8, 9, 10, 16, 18, 19, 32)
+# Single split has no direct-output epilogue; it uses the existing staged path.
+_DECODE_FIXED_SUPPORTED_SPLITS = (8, 9, 10, 16, 18, 19, 32)
 _DECODE_FIXED_KV_LEN = QWEN_CONTEXT
+# Bounded to keep long-running processes from accumulating one workspace per
+# stream; the fixed workspace is small and cold entries are cheap to rebuild.
+_DECODE_FIXED_WORKSPACE_CACHE_LIMIT = 64
 
 _QWEN3_DECODE_FIXED_KERNEL_CACHE = {}
 _QWEN3_DECODE_FIXED_WORKSPACE_CACHE = {}
 _QWEN3_DECODE_FIXED_WORKSPACE_LOCK = threading.Lock()
+_QWEN3_DEVICE_SM_COUNT_CACHE = {}
+_QWEN3_DEVICE_SM_COUNT_LOCK = threading.Lock()
 
 
 def _get_decode_fixed_workspace(device, stream_handle: int, num_splits: int):
@@ -3279,30 +3285,30 @@ def _get_decode_fixed_workspace(device, stream_handle: int, num_splits: int):
     import torch
 
     key = (device.index, stream_handle, num_splits)
-    workspace = _QWEN3_DECODE_FIXED_WORKSPACE_CACHE.get(key)
-    cache_hit = workspace is not None
-    if workspace is None:
-        with _QWEN3_DECODE_FIXED_WORKSPACE_LOCK:
-            workspace = _QWEN3_DECODE_FIXED_WORKSPACE_CACHE.get(key)
-            cache_hit = workspace is not None
-            if workspace is None:
-                o_partial = torch.empty(
-                    (num_splits, QWEN_KV_HEADS, QWEN_QUERY_HEADS // QWEN_KV_HEADS, QWEN_HEAD_DIM),
-                    dtype=torch.bfloat16,
-                    device=device,
-                )
-                lse_partial = torch.empty(
-                    (num_splits, QWEN_KV_HEADS, QWEN_QUERY_HEADS // QWEN_KV_HEADS),
-                    dtype=torch.float32,
-                    device=device,
-                )
-                workspace = {
-                    "o": o_partial,
-                    "lse": lse_partial,
-                    "o_bytes": o_partial.numel() * o_partial.element_size(),
-                    "lse_bytes": lse_partial.numel() * lse_partial.element_size(),
-                }
-                _QWEN3_DECODE_FIXED_WORKSPACE_CACHE[key] = workspace
+    with _QWEN3_DECODE_FIXED_WORKSPACE_LOCK:
+        workspace = _QWEN3_DECODE_FIXED_WORKSPACE_CACHE.get(key)
+        cache_hit = workspace is not None
+        if workspace is None:
+            if len(_QWEN3_DECODE_FIXED_WORKSPACE_CACHE) >= _DECODE_FIXED_WORKSPACE_CACHE_LIMIT:
+                evicted_key = next(iter(_QWEN3_DECODE_FIXED_WORKSPACE_CACHE))
+                del _QWEN3_DECODE_FIXED_WORKSPACE_CACHE[evicted_key]
+            o_partial = torch.empty(
+                (num_splits, QWEN_KV_HEADS, QWEN_QUERY_HEADS // QWEN_KV_HEADS, QWEN_HEAD_DIM),
+                dtype=torch.bfloat16,
+                device=device,
+            )
+            lse_partial = torch.empty(
+                (num_splits, QWEN_KV_HEADS, QWEN_QUERY_HEADS // QWEN_KV_HEADS),
+                dtype=torch.float32,
+                device=device,
+            )
+            workspace = {
+                "o": o_partial,
+                "lse": lse_partial,
+                "o_bytes": o_partial.numel() * o_partial.element_size(),
+                "lse_bytes": lse_partial.numel() * lse_partial.element_size(),
+            }
+            _QWEN3_DECODE_FIXED_WORKSPACE_CACHE[key] = workspace
     return workspace, cache_hit
 
 
@@ -3789,7 +3795,11 @@ def _qwen3_decode_attention_fixed_128k_impl(
     num_sms: int,
     return_stats: bool,
 ):
-    """Fixed 128K fast path: one partial kernel launch + PyTorch FP32 combine."""
+    """Fixed 128K fast path: one partial kernel launch + PyTorch FP32 combine.
+
+    ``causal`` is intentionally unused: for the latest-token Decode contract,
+    causal=True and causal=False both visit the complete KV cache.
+    """
     import torch
 
     torch_stream = torch.cuda.current_stream(q.device)
@@ -3923,6 +3933,22 @@ def _qwen3_decode_attention_staged_impl(
     }
 
 
+def _get_device_sm_count(device) -> int:
+    """Cache the per-device SM count so the hot Decode dispatch path does not
+    repeatedly query CUDA device properties."""
+    import torch
+
+    key = device.index
+    num_sms = _QWEN3_DEVICE_SM_COUNT_CACHE.get(key)
+    if num_sms is None:
+        with _QWEN3_DEVICE_SM_COUNT_LOCK:
+            num_sms = _QWEN3_DEVICE_SM_COUNT_CACHE.get(key)
+            if num_sms is None:
+                num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+                _QWEN3_DEVICE_SM_COUNT_CACHE[key] = num_sms
+    return num_sms
+
+
 def _qwen3_decode_attention_impl(
     q,
     k,
@@ -3938,7 +3964,7 @@ def _qwen3_decode_attention_impl(
     import torch
 
     _, block_n, _ = _resolve_prefill_config(DECODE_KERNEL_CONFIG)
-    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+    num_sms = _get_device_sm_count(q.device)
     actual_splits = _select_decode_splits(
         k.shape[2], num_splits, split_candidates, block_n=block_n, num_sms=num_sms
     )
@@ -4233,18 +4259,26 @@ def run_qwen3_decode(
             torch.cuda.synchronize()
             fixed_samples = []
             staged_samples = []
-            for _ in range(iterations):
-                for closure, samples in (
-                    (invoke, fixed_samples),
-                    (staged_invoke, staged_samples),
-                ):
+            fixed_output = output
+            for round_idx in range(iterations):
+                # Alternate A/B order each round so neither path systematically
+                # benefits from being measured first.
+                order = (
+                    ((invoke, fixed_samples), (staged_invoke, staged_samples))
+                    if round_idx % 2 == 0
+                    else ((staged_invoke, staged_samples), (invoke, fixed_samples))
+                )
+                for closure, samples in order:
                     start = torch.cuda.Event(enable_timing=True)
                     end = torch.cuda.Event(enable_timing=True)
                     start.record()
-                    output = closure()
+                    latest = closure()
                     end.record()
                     end.synchronize()
                     samples.append(start.elapsed_time(end) * 1000)
+                    if closure is invoke:
+                        fixed_output = latest
+            output = fixed_output
             fixed_samples.sort()
             staged_samples.sort()
             elapsed_us = _median_of_sorted(fixed_samples)
