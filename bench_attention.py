@@ -24,6 +24,8 @@ Prefill / Decode 说明：
     python bench_attention.py --check-only          # 只做正确性校验，不测速
     # GQA：q_heads=32, kv_heads=8（q_heads 必须是 kv_heads 的整数倍）
     python bench_attention.py --shapes 1x32x8x4096x128
+    # 多人共享一台机器时，用 --gpu 指定自己的卡号，避免大家都抢 cuda:0
+    python bench_attention.py --gpu 3
 
 新增自定义算子的方法请见同目录下 README.md。
 """
@@ -102,6 +104,13 @@ def parse_args():
         default="fp16",
         choices=["fp16", "fp32", "bf16"],
         help="计算使用的数据类型",
+    )
+    parser.add_argument(
+        "--gpu",
+        type=int,
+        default=None,
+        help="指定使用的 GPU 卡号（多人共享一台机器时用来分卡，避免抢占同一张卡），"
+        "等价于设置 CUDA_VISIBLE_DEVICES；不指定则使用当前可见的第一张卡",
     )
     parser.add_argument(
         "--causal",
@@ -564,10 +573,22 @@ def print_phase_summary(shape, phase_benches: dict):
 def main():
     args = parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if args.gpu is not None:
+        if not torch.cuda.is_available():
+            raise RuntimeError(f"指定了 --gpu {args.gpu}，但当前环境检测不到可用的 CUDA 设备")
+        if args.gpu < 0 or args.gpu >= torch.cuda.device_count():
+            raise ValueError(
+                f"--gpu {args.gpu} 超出范围，当前可见 GPU 数量为 "
+                f"{torch.cuda.device_count()}（可用卡号: 0~{torch.cuda.device_count() - 1}）"
+            )
+        torch.cuda.set_device(args.gpu)
+        device = torch.device(f"cuda:{args.gpu}")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     print(f"使用设备: {device}")
     if device.type == "cuda":
-        print(f"GPU 型号: {torch.cuda.get_device_name(0)}")
+        print(f"GPU 型号: {torch.cuda.get_device_name(device)}")
     else:
         print("警告: 未检测到 GPU，将使用 CPU 运行。CPU 模式下的性能数据仅供参考，"
               "不代表实际 GPU 性能；FlashAttention-2/3 均无法在 CPU 上运行，"

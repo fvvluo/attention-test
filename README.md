@@ -86,6 +86,32 @@ ops/
 > online-softmax（分块流式 softmax）版 FlashAttention，展示了算法的核心思路；
 > 也可以直接从 `ops/_template.py` 复制起手，里面已经写好了接入步骤的注释。
 
+## ⚠️ 多人共享 GPU 机器时必读
+
+这台机器有多张 GPU，供团队成员并行使用。脚本默认使用 `cuda:0`（即第一张卡），
+**如果大家都直接运行 `python bench_attention.py`，会全部挤到同一张卡上**，
+互相抢显存、抢算力，导致：
+- 显存不足报 `CUDA out of memory`（尤其是跑大 `--shapes` 时）；
+- 测出来的耗时 / TFLOPS 数据被别人的负载干扰，完全不可信。
+
+**解决方法：每人用 `--gpu` 参数指定自己独占的卡号再运行**：
+
+```bash
+# 用 nvidia-smi 先看看哪张卡空闲（显存占用低、无进程）
+nvidia-smi
+
+# 假设你分到了第 3 张卡（编号从 0 开始）
+python bench_attention.py --gpu 3 --shapes 1x8x1024x64
+```
+
+也可以用等价的环境变量 `CUDA_VISIBLE_DEVICES` 指定：
+
+```bash
+CUDA_VISIBLE_DEVICES=3 python bench_attention.py --shapes 1x8x1024x64
+```
+
+团队内约定好各自固定使用哪个卡号（例如按人头分配 0~7），避免临时撞卡。
+
 ## 如何运行
 
 ```bash
@@ -118,6 +144,7 @@ python bench_attention.py --phases decode
 | 参数 | 说明 | 默认值 |
 | --- | --- | --- |
 | `--shapes` | 形状列表，逗号分隔，支持两种格式：标准 MHA 用 4 段 `batchxheadsxseq_lenxhead_dim`（q/kv head 数相同）；GQA 用 5 段 `batchxq_headsxkv_headsxseq_lenxhead_dim`（`q_heads` 必须是 `kv_heads` 的整数倍） | `1x8x1024x64,1x8x4096x64` |
+| `--gpu` | 指定使用的 GPU 卡号（多人共享一台机器时用来分卡，避免抢占同一张卡），等价于设置 `CUDA_VISIBLE_DEVICES` | 自动选择当前可见的第一张卡 |
 | `--dtype` | 计算数据类型，可选 `fp16` / `fp32` / `bf16` | `fp16` |
 | `--causal` / `--no-causal` | 是否使用因果掩码（只看当前位置及之前的 token） | 开启 |
 | `--warmup` | 正式计时前的 warmup 迭代次数 | `5` |
@@ -153,3 +180,6 @@ decode（耗时/GB·s）两个阶段的表现，直观展示"prefill 拼算力�
 - 有 GPU 时自动使用 CUDA 并用 `torch.cuda.Event` 精确计时；
   没有 GPU 时会自动降级到 CPU（用 `time.perf_counter()` 计时），
   但此时性能数据仅供参考，不代表真实 GPU 性能。
+- **多人共享同一台机器时**，务必通过 `--gpu` 参数或 `CUDA_VISIBLE_DEVICES`
+  指定各自的 GPU 卡号再运行（见上方"多人共享 GPU 机器时必读"），避免抢卡
+  导致结果不可信或 OOM。
