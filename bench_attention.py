@@ -18,7 +18,10 @@ Prefill / Decode 说明：
                  去 attend 已缓存的 KV-Cache（访存密集，性能瓶颈是带宽而非算力）
     两个阶段会分别打印独立的对比表格（耗时 / TFLOPS / GB/s）。
 
-用法示例：
+最终测试命令（本次评测实际使用的命令，非用法示例）：
+    python3 bench_attention.py --shapes 1x64x8x131072x128 --dtype bf16 --causal --warmup 10 --iters 50
+
+用法示例（以下均为参数用法演示，非最终测试命令）：
     python bench_attention.py
     python bench_attention.py --shapes 1x8x1024x64,1x8x4096x64 --dtype fp16 --no-causal
     python bench_attention.py --check-only          # 只做正确性校验，不测速

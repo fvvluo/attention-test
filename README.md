@@ -5,6 +5,25 @@
 PyTorch 官方 `torch.nn.functional.scaled_dot_product_attention` 优先级自动降级
 选取（具体降级条件见下方"输出说明"）。
 
+## ✅ 最终测试命令
+
+以下是本次评测实际使用的命令，**其余文档中出现的命令均为用法示例，非最终测试
+命令**：
+
+```bash
+python3 bench_attention.py --shapes 1x64x8x131072x128 --dtype bf16 --causal --warmup 10 --iters 50
+```
+
+- `--shapes 1x64x8x131072x128`：GQA，`batch=1, q_heads=64, kv_heads=8,
+  seq_len=131072（128K）, head_dim=128`；
+- `--dtype bf16`；
+- `--causal`：开启因果掩码（当前默认值就是开启，这里显式指定）；
+- `--warmup 10 --iters 50`：10 次预热 + 50 次正式计时。
+- 序列长度 128K 属于长序列场景，prefill 阶段单次前向本身就要几秒，加上
+  60 次调用（10 warmup + 50 iters），baseline 部分预计要跑数分钟，运行期间
+  终端不会有中间输出，是正常现象（可另开窗口用 `nvidia-smi` 确认 GPU
+  利用率来判断是否仍在计算，而非卡死）。
+
 ## 目录结构
 
 ```
@@ -232,6 +251,9 @@ CUDA_VISIBLE_DEVICES=3 python bench_attention.py --shapes 1x8x1024x64
 团队内约定好各自固定使用哪个卡号（例如按人头分配 0~7），避免临时撞卡。
 
 ## 如何运行
+
+> 以下均为用法示例，展示各参数的效果，**不是最终测试命令**（最终测试命令见文档
+> 开头"✅ 最终测试命令"一节）。
 
 ```bash
 cd test
