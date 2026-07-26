@@ -292,7 +292,13 @@ def get_baseline_fn() -> Tuple[Callable, str]:
         q_t = q.transpose(1, 2)
         k_t = k.transpose(1, 2)
         v_t = v.transpose(1, 2)
-        out = flash_fn(q_t, k_t, v_t, softmax_scale=sm_scale, causal=causal)
+        kwargs = {"softmax_scale": sm_scale, "causal": causal}
+        if is_v3 and q_t.shape[1] == 1 and k_t.shape[1] > 1:
+            # FA3 defaults to one KV split, which severely underutilizes Hopper
+            # for q_len=1 and a long KV cache. Let FA3 apply its production
+            # split-KV heuristic so Decode compares against its optimized path.
+            kwargs.update(num_splits=0, pack_gqa=None)
+        out = flash_fn(q_t, k_t, v_t, **kwargs)
         if is_v3 and isinstance(out, tuple):
             # FA3 在 return_attn_probs=False 时默认只返回 out，但部分版本
             # 仍以 tuple 形式返回 (out, softmax_lse, ...)，这里做个兼容。
