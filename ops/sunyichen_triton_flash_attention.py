@@ -39,7 +39,7 @@ _N_CTX = 131072
 _HEAD_DIM = 128
 _GROUP_SIZE = _Q_HEADS // _KV_HEADS
 _BLOCK_M = 128
-_BLOCK_N = 64
+_BLOCK_N = 128            # P2: 64→128, MMA N 维填满 + softmax 调用次数减半 (对角块从 2 个变 1 个)
 _NUM_M_BLOCKS = _N_CTX // _BLOCK_M
 _QK_SCALE = (1.0 / math.sqrt(_HEAD_DIM)) * math.log2(math.e)
 _BLOCK_N_DECODE = 64
@@ -51,6 +51,22 @@ _SPLIT_LEN = _N_CTX // _N_SPLITS         # = 1024, 每段长度 (恰好 % BLOCK_
 _PAD_M = 16                              # GROUP_SIZE=8 < 16, tl.dot 的 M 维需 pad 到 16
 
 
+# P2 + autotune: 固定 BLOCK_M=128 (host 侧 grid=_NUM_M_BLOCKS=N_CTX/BLOCK_M 依赖它, 不能扫),
+# 只扫 BLOCK_N + num_warps + num_stages。key=N_CTX (shape 固定, 调优一次即缓存)。
+# 注意: 被 autotune 扫的 BLOCK_N 由 config 注入, 调用处不能再传 BLOCK_N= 实参。
+@triton.autotune(
+    configs=[
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 128}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64},  num_warps=8, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64},  num_warps=8, num_stages=4),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64},  num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_M": 128, "BLOCK_N": 64},  num_warps=4, num_stages=4),
+    ],
+    key=["N_CTX"],
+)
 @triton.jit
 def _attn_prefill_kernel(
     Q,
@@ -102,7 +118,8 @@ def _attn_prefill_kernel(
         l_i = l_i * alpha + tl.sum(p, 1)
         m_i = m_next
 
-    # BLOCK_M / BLOCK_N == 2, so both diagonal tiles must be masked.
+    # 对角块 (需 causal mask): BLOCK_N=128 时只有 1 个块, BLOCK_N=64 时 2 个块。
+    # 循环用 BLOCK_N 步进, 两种情况都正确。
     for start_n in range(diagonal_start, diagonal_start + BLOCK_M, BLOCK_N):
         k = tl.load(k_ptrs + start_n * HEAD_DIM)
         qk = tl.dot(q, k) * QK_SCALE
@@ -225,6 +242,8 @@ def _attn_decode_reduce_kernel(
 def attention(q, k, v, causal=True, sm_scale=None):
     out = torch.empty_like(q)
     if q.shape[2]!=1:
+        # grid 的 M 维用固定 _BLOCK_M=128 算 (所有 autotune config 的 BLOCK_M 都是 128)。
+        # BLOCK_M / BLOCK_N / num_warps / num_stages 均由 autotune config 注入, 此处不传。
         grid = (_GROUP_SIZE, _NUM_M_BLOCKS, _KV_HEADS)
         _attn_prefill_kernel[grid](
             q,
@@ -235,10 +254,6 @@ def attention(q, k, v, causal=True, sm_scale=None):
             N_CTX=_N_CTX,
             HEAD_DIM=_HEAD_DIM,
             GROUP_SIZE=_GROUP_SIZE,
-            BLOCK_M=_BLOCK_M,
-            BLOCK_N=_BLOCK_N,
-            # num_warps=8,
-            # num_stages=4,
         )
     else:
         # ---- Flash-Decoding: Split-KV 两阶段 ----
