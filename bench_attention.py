@@ -503,12 +503,14 @@ def print_report(
         )
 
     # 记录每个算子的 vs baseline 数值，供下方"突出显示"小节使用
-    speedups: List[Tuple[str, Optional[float]]] = []
+    # (name, speedup_pct, passed)：passed=None 表示运行失败/无正确性结果，
+    # 汇总表格里需要一起标注出来，避免只看这个表格误以为"快"就是"对"。
+    speedups: List[Tuple[str, Optional[float], Optional[bool]]] = []
 
     for r in reports:
         if r.run_error is not None:
             print_row(r.name, "运行失败", "-", "-", "-", "-", "FAIL", suffix=f"  ({r.run_error})")
-            speedups.append((r.name, None))
+            speedups.append((r.name, None, False))
             continue
 
         ms_str = f"{r.bench.avg_ms:.3f}" if r.bench else "-"
@@ -523,16 +525,19 @@ def print_report(
             speedup_str = f"{speedup_pct:.1f}%"
         else:
             speedup_str = "-"
-        speedups.append((r.name, speedup_pct))
+        passed = r.correctness.passed if r.correctness else None
+        speedups.append((r.name, speedup_pct, passed))
         abs_diff_str = f"{r.correctness.max_abs_diff:.2e}" if r.correctness else "-"
-        pass_str = "PASS" if (r.correctness and r.correctness.passed) else "FAIL"
+        pass_str = "PASS" if passed else "FAIL"
 
         print_row(r.name, ms_str, tflops_str, gbps_str, speedup_str, abs_diff_str, pass_str)
 
     print("=" * TOTAL_W)
 
-    # 单独突出显示 vs baseline，同样用表格对齐（不是纯文本），方便一眼对应到算子名
-    valid_speedups = [(name, pct) for name, pct in speedups if pct is not None]
+    # 单独突出显示 vs baseline，同样用表格对齐（不是纯文本），方便一眼对应到算子名。
+    # 正确性 FAIL 的算子即使速度很快也会被标注出来（前面加 ⚠），避免有人只看这个
+    # 汇总表格就误以为"快"等于"对"——一个啥都没算的空算子也可能显示"快 10x"。
+    valid_speedups = [(name, pct, passed) for name, pct, passed in speedups if pct is not None]
     if valid_speedups:
         VS_NAME_W, VS_PCT_W, VS_RATIO_W = NAME_W, 12, 20
         print(f">>> vs baseline（{_truncate(baseline_name, 60)}）：数值越大代表比 baseline 越快")
@@ -540,12 +545,15 @@ def print_report(
             _pad("算子", VS_NAME_W) + _pad("占比", VS_PCT_W, ">") + _pad("倍数", VS_RATIO_W, ">")
         )
         print("-" * (VS_NAME_W + VS_PCT_W + VS_RATIO_W))
-        for name, pct in valid_speedups:
+        for name, pct, passed in valid_speedups:
             ratio = pct / 100
             ratio_str = f"快 {ratio:.2f}x" if ratio >= 1 else f"慢 {1 / ratio:.2f}x" if ratio > 0 else "慢"
+            display_name = name if passed else f"[FAIL] {name}"
+            suffix = "" if passed else "  <- 正确性 FAIL，此速度数据无意义"
             print(
-                _pad(_truncate(name, VS_NAME_W), VS_NAME_W)
+                _pad(_truncate(display_name, VS_NAME_W), VS_NAME_W)
                 + _pad(f"{pct:.1f}%", VS_PCT_W, ">") + _pad(ratio_str, VS_RATIO_W, ">")
+                + suffix
             )
 
     print()
