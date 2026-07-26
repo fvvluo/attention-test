@@ -27,7 +27,7 @@
 # Each removal is marked with an `EXERCISE (n)` comment at the site where the technique used to live
 # (typically, more code is required to modify; they might be far away from the `EXERCISE (n)` comment).
 #
-#   [EASY] EXERCISE (1)  LPT tile scheduling            -> plain SingleTileScheduler
+#   [DONE] EXERCISE (1)  LPT tile scheduling            -> SingleTileLPTScheduler
 #   [EASY] EXERCISE (2)  Causal n-block skipping        -> every KV block is visited and masked
 #   [MEDIUM] EXERCISE (3)  Warp specialization          -> one merged 256-thread mainloop
 #   [EASY] EXERCISE (4)  Register redistribution        -> setmaxnreg calls deleted
@@ -69,7 +69,7 @@ from .lhx_cute.utils import AuxData
 from .lhx_cute import pipeline as pipeline_custom
 from .lhx_cute.tile_scheduler import (
     TileSchedulerArguments,
-    SingleTileScheduler,
+    SingleTileLPTScheduler,
 )
 
 from .lhx_cute.flash_fwd import FlashAttentionForwardBase
@@ -269,8 +269,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cpasync.CopyBulkTensorTileS2GOp(), mO, self.sO_layout, (self.tile_m, self.tile_hdimv)
         )
 
-        # EXERCISE (1): What does the `lpt` field of `TileSchedulerArguments` mean? Does this impact efficiency?
-        TileScheduler = SingleTileScheduler
+        # EXERCISE (1): LPT schedules the longest causal Q tiles first to reduce tail effects.
+        TileScheduler = SingleTileLPTScheduler
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
             cute.size(mQ.shape[2]),
@@ -284,6 +284,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             qhead_per_kvhead_packgqa=1,
             element_size=self.dtype.width // 8,
             is_persistent=False,
+            lpt=self.is_causal,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, None)
