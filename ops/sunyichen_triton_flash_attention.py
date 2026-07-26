@@ -97,32 +97,44 @@ def _attn_prefill_kernel(
     v_ptrs = V + kv_offset + offs_n[:, None] * HEAD_DIM + offs_k[None, :]
     o_ptrs = Out + q_offset + offs_m[:, None] * HEAD_DIM + offs_k[None, :]
 
-    q = tl.load(q_ptrs)
+    # P4: scale 预乘进 q (log2 域标量), 内循环 tl.dot(q,k) 直接得缩放后分数, 省每块一次逐元素乘。
+    q = (tl.load(q_ptrs) * QK_SCALE).to(Q.dtype.element_ty)
     m_i = tl.full([BLOCK_M], -float("inf"), tl.float32)
     l_i = tl.zeros([BLOCK_M], tl.float32)
     acc = tl.zeros([BLOCK_M, HEAD_DIM], tl.float32)
 
     diagonal_start = start_m * BLOCK_M
 
-    # Every key before this query tile is visible to every query in the tile.
-    for start_n in range(0, diagonal_start, BLOCK_N):
-        k = tl.load(k_ptrs + start_n * HEAD_DIM)
-        qk = tl.dot(q, k) * QK_SCALE
+    # 非对角块 (全可见, 无需 mask)。
+    if diagonal_start > 0:
+        # P3: 剥离第 0 块直接初始化, 省首轮 alpha=exp2(-inf)=0 的空 rescale (acc*=0 / l_i*=0)。
+        k = tl.load(k_ptrs)
+        qk = tl.dot(q, k)
+        m_i = tl.max(qk, 1)
+        p = tl.math.exp2(qk - m_i[:, None])
+        v = tl.load(v_ptrs)
+        acc = tl.dot(p.to(q.dtype), v)
+        l_i = tl.sum(p, 1)
 
-        m_next = tl.maximum(m_i, tl.max(qk, 1))
-        p = tl.math.exp2(qk - m_next[:, None])
-        alpha = tl.math.exp2(m_i - m_next)
-        acc = acc * alpha[:, None]
-        v = tl.load(v_ptrs + start_n * HEAD_DIM)
-        acc = tl.dot(p.to(q.dtype), v, acc)
-        l_i = l_i * alpha + tl.sum(p, 1)
-        m_i = m_next
+        # 其余非对角块从 BLOCK_N 起步, 走标准 online-softmax rescale。
+        for start_n in range(BLOCK_N, diagonal_start, BLOCK_N):
+            k = tl.load(k_ptrs + start_n * HEAD_DIM)
+            qk = tl.dot(q, k)
+
+            m_next = tl.maximum(m_i, tl.max(qk, 1))
+            p = tl.math.exp2(qk - m_next[:, None])
+            alpha = tl.math.exp2(m_i - m_next)
+            acc = acc * alpha[:, None]
+            v = tl.load(v_ptrs + start_n * HEAD_DIM)
+            acc = tl.dot(p.to(q.dtype), v, acc)
+            l_i = l_i * alpha + tl.sum(p, 1)
+            m_i = m_next
 
     # 对角块 (需 causal mask): BLOCK_N=128 时只有 1 个块, BLOCK_N=64 时 2 个块。
-    # 循环用 BLOCK_N 步进, 两种情况都正确。
+    # 循环用 BLOCK_N 步进, 两种情况都正确。start_m=0 时 m_i 仍为 -inf, online-softmax 首次更新正确。
     for start_n in range(diagonal_start, diagonal_start + BLOCK_M, BLOCK_N):
         k = tl.load(k_ptrs + start_n * HEAD_DIM)
-        qk = tl.dot(q, k) * QK_SCALE
+        qk = tl.dot(q, k)
         causal_mask = offs_m[:, None] >= start_n + offs_n[None, :]
         qk = tl.where(causal_mask, qk, -float("inf"))
 
