@@ -8,10 +8,11 @@
 ## ✅ 最终测试命令
 
 以下是本次评测实际使用的命令，**其余文档中出现的命令均为用法示例，非最终测试
-命令**：
+命令**。注意：`--gpu` 为必填参数，大家在命令后面加上 `--gpu <自己的GPU卡号>`
+（如 `--gpu 3`）再运行：
 
 ```bash
-python3 bench_attention.py --gpu 0 --shapes 1x64x8x131072x128 --dtype bf16 --causal --warmup 10 --iters 50
+python3 bench_attention.py --shapes 1x64x8x131072x128 --dtype bf16 --causal --warmup 10 --iters 50
 ```
 
 - `--shapes 1x64x8x131072x128`：GQA，`batch=1, q_heads=64, kv_heads=8,
