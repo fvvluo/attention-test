@@ -86,6 +86,23 @@ ops/
 > online-softmax（分块流式 softmax）版 FlashAttention，展示了算法的核心思路；
 > 也可以直接从 `ops/_template.py` 复制起手，里面已经写好了接入步骤的注释。
 
+### 如果用 C++ / CUDA 扩展实现算子
+
+用纯 PyTorch 或 Triton 写算子可以跳过这一节，不涉及下面的问题。
+
+如果用 `torch.utils.cpp_extension.load_inline`（或 `load`）在线编译 C++/CUDA
+kernel，**编译缓存目录是按你传的 `name` 参数命名的**（路径形如
+`~/.cache/torch_extensions/py<ver>_cu<ver>/<name>/`），而这台机器大家共用同一个
+账户、同一个缓存目录。如果两人都用了同一个 `name`（很容易发生，因为都是照抄同一份
+模板起步），且刚好在差不多的时间点第一次触发编译（并发编译），会导致其中一人的
+编译产物被另一人覆盖，**运行时不会报错，只会悄悄跑着别人的代码**，非常隐蔽难查。
+
+解决方法很简单：把 `name` 改成带自己署名的唯一字符串，例如：
+
+```python
+mod = load_inline(name="flash_attn_zhangsan", cpp_sources=..., cuda_sources=...)
+```
+
 ## ⚠️ 多人共享 GPU 机器时必读
 
 这台机器有多张 GPU，供团队成员并行使用。脚本默认使用 `cuda:0`（即第一张卡），
