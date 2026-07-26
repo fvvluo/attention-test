@@ -15,12 +15,12 @@ def register(name: str, fn: Callable) -> None:
     Args:
         name: 算子名称，用于在结果表格中展示，必须全局唯一。
         fn: 算子函数，约定签名为
-            fn(q, k, v, causal: bool = False, sm_scale: float = None) -> output
+            fn(q, k, v, causal: bool = True, sm_scale: float = None) -> output
             其中 q 的 shape 为 (batch, q_heads, seq_len, head_dim)，k/v 的
             shape 为 (batch, kv_heads, seq_len, head_dim)，output 的 shape
             与 q 相同。标准 MHA 时 q_heads == kv_heads；GQA 时 q_heads 必须是
             kv_heads 的整数倍，算子实现内部需要自行把 k/v 的 head 维度
-            broadcast/repeat 到 q_heads（可参考 example_flash_attention.py）。
+            broadcast/repeat 到 q_heads（可参考 _example_flash_attention.py）。
 
     Raises:
         ValueError: 如果 name 已经被注册过（防止团队成员重名冲突）。

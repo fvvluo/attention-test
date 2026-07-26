@@ -14,7 +14,7 @@ test/
 │   ├── __init__.py                 # 自动扫描并导入本目录下所有算子模块
 │   ├── base.py                     # 算子注册接口 register(name, fn)
 │   ├── _template.py                # 接入模板，复制改名即可开始写自己的算子
-│   └── example_flash_attention.py  # 示例算子：纯 PyTorch online-softmax FlashAttention
+│   └── _example_flash_attention.py # 示例算子：纯 PyTorch online-softmax FlashAttention（仅供参考，不会被自动扫描注册）
 └── bench_attention.py               # 主 benchmark 脚本
 ```
 
@@ -33,7 +33,7 @@ test/
       `(batch, kv_heads, seq_len, head_dim)`；标准 MHA 时 `q_heads == kv_heads`，
       GQA 时 `q_heads` 必须是 `kv_heads` 的整数倍，需要自己在实现里把 k/v 的
       head 维度 broadcast/repeat 到 `q_heads`（可参考
-      `ops/example_flash_attention.py` 里的 `repeat_interleave` 用法）。
+      `ops/_example_flash_attention.py` 里的 `repeat_interleave` 用法）。
 - [ ] **3. 改注册名**：把文件末尾 `register("TODO_改成你的算子名字", attention)`
       的名字改成能一眼区分实现方式的唯一名字，例如 `"zhangsan_fa (triton)"`。
 - [ ] **4. 先查正确性**：运行 `python bench_attention.py --check-only`，
@@ -49,7 +49,7 @@ ops/
 ├── base.py                          # 不要改：注册表
 ├── __init__.py                      # 不要改：自动扫描发现新算子
 ├── _template.py                     # 参考：接入模板（以 _ 开头，不会被扫描运行）
-├── example_flash_attention.py       # 参考：纯 PyTorch online-softmax 示例实现
+├── _example_flash_attention.py      # 参考：纯 PyTorch online-softmax 示例实现（以 _ 开头，不会被扫描运行）
 ├── zhangsan_flash_attention.py      # 你新增的算子（示例命名）
 └── lisi_flash_attention.py          # 队友新增的算子（示例命名）
 ```
@@ -81,7 +81,8 @@ ops/
 
 4. 完成！不需要修改任何其他文件。运行 `bench_attention.py` 时会自动发现并对比你的算子。
 
-> 可以参考 `ops/example_flash_attention.py`，里面是一个纯 PyTorch 实现的
+> 可以参考 `ops/_example_flash_attention.py`（仅供参考，文件名以 `_` 开头不会被
+> 自动扫描注册，避免和你自己接入的算子一起被跑到），里面是一个纯 PyTorch 实现的
 > online-softmax（分块流式 softmax）版 FlashAttention，展示了算法的核心思路；
 > 也可以直接从 `ops/_template.py` 复制起手，里面已经写好了接入步骤的注释。
 

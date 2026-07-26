@@ -111,4 +111,6 @@ def attention(q, k, v, causal=True, sm_scale=None, block_size=128):
     return output
 
 
+# 注：本文件名以 "_" 开头，不会被 ops/__init__.py 自动扫描导入，
+# 所以这行 register() 实际不会执行——仅保留作为参考实现的完整示例。
 register("example", attention)
