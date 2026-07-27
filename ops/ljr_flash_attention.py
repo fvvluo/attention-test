@@ -1,6 +1,5 @@
-import importlib.util
+import importlib
 import math
-import os
 
 import torch
 
@@ -10,65 +9,85 @@ from cutlass.cute.runtime import from_dlpack
 
 from .base import register
 
-_fa_path = os.path.join(os.path.dirname(__file__), "mc_attention", "flash_attention_tc.py")
-_spec = importlib.util.spec_from_file_location("ljr_mc_flash_attention_tc", _fa_path)
-_fa = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_fa)
 
-flash_attention_tc = _fa.flash_attention_tc
-MAX_HEAD_DIM_TC = _fa.MAX_HEAD_DIM_TC
+def _ensure_baseline_routed():
+    import bench_attention  # noqa: F401
+    bench_attention.get_baseline_fn()
+
+
+_FA_CLS = None
+_CUDA_STREAM = None
+_AuxData = None
+
+
+def _get_fa_cls():
+    global _FA_CLS, _CUDA_STREAM, _AuxData
+    if _FA_CLS is None:
+        _ensure_baseline_routed()
+        import cuda.bindings.driver as cuda
+        from flash_attn.cute.utils import AuxData
+        import importlib.util, os
+        kpath = os.path.join(os.path.dirname(__file__), "mc_attention", "flash_attention_fa3_kernel.py")
+        spec = importlib.util.spec_from_file_location("ljr_fa3_kernel", kpath)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _FA_CLS = mod.LjrFlashFwdSm90
+        _AuxData = AuxData
+        _CUDA_STREAM = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
+    return _FA_CLS
+
 
 _compiled_cache = {}
-
-
-def _get_compiled(sq, sk, sv, so, scale, causal_offset, cache_key):
-    compiled = _compiled_cache.get(cache_key)
-    if compiled is None:
-        compiled = cute.compile(
-            flash_attention_tc,
-            sq, sk, sv, so,
-            cutlass.Float32(scale), cutlass.Int32(causal_offset),
-        )
-        _compiled_cache[cache_key] = compiled
-    return compiled
 
 
 def attention(q, k, v, causal=True, sm_scale=None):
     batch, q_heads, q_len, head_dim = q.shape
     kv_heads = k.shape[1]
     kv_len = k.shape[2]
-
-    assert head_dim <= MAX_HEAD_DIM_TC, f"head_dim={head_dim} 超过 TC kernel 上限 {MAX_HEAD_DIM_TC}"
-    assert head_dim % 16 == 0, "TC kernel 要求 head_dim 是 16 的整数倍"
-
+    assert head_dim == 128, "该 FA3 kernel 固定 head_dim=128"
+    assert q_heads % kv_heads == 0, "GQA: q_heads 必须是 kv_heads 整数倍"
+    qhead_per_kvhead = q_heads // kv_heads
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
 
-    if kv_heads != q_heads:
-        group = q_heads // kv_heads
-        k = k.repeat_interleave(group, dim=1)
-        v = v.repeat_interleave(group, dim=1)
-
+    FA = _get_fa_cls()
     orig_dtype = q.dtype
 
-    # kernel 原生吃 bf16（tensor core 输入），合并 batch*heads 到 BH，行连续。
-    q3 = q.reshape(batch * q_heads, q_len, head_dim).contiguous().to(torch.bfloat16)
-    k3 = k.reshape(batch * q_heads, kv_len, head_dim).contiguous().to(torch.bfloat16)
-    v3 = v.reshape(batch * q_heads, kv_len, head_dim).contiguous().to(torch.bfloat16)
-    out3 = torch.empty(batch * q_heads, q_len, head_dim, device=q.device, dtype=torch.float32)
+    # (b, h, s, d) -> (b, s, h, d)，连续化为 bf16
+    q_bshd = q.transpose(1, 2).contiguous().to(torch.bfloat16)
+    k_bshd = k.transpose(1, 2).contiguous().to(torch.bfloat16)
+    v_bshd = v.transpose(1, 2).contiguous().to(torch.bfloat16)
+    o_bshd = torch.empty_like(q_bshd)
 
-    q_t = from_dlpack(q3, assumed_align=16)
-    k_t = from_dlpack(k3, assumed_align=16)
-    v_t = from_dlpack(v3, assumed_align=16)
-    out_t = from_dlpack(out3, assumed_align=16)
+    q_t = from_dlpack(q_bshd, assumed_align=16)
+    k_t = from_dlpack(k_bshd, assumed_align=16)
+    v_t = from_dlpack(v_bshd, assumed_align=16)
+    o_t = from_dlpack(o_bshd, assumed_align=16)
 
-    causal_offset = (kv_len - q_len) if causal else kv_len
+    cache_key = (qhead_per_kvhead, bool(causal), q_len, kv_len)
+    entry = _compiled_cache.get(cache_key)
+    if entry is None:
+        fa = FA(
+            cutlass.BFloat16, head_dim, head_dim, qhead_per_kvhead,
+            is_causal=bool(causal), is_local=False, pack_gqa=False,
+            tile_m=128, tile_n=128, num_stages=2, num_threads=256, Q_in_regs=False,
+        )
+        aux = _AuxData()
+        compiled = cute.compile(
+            fa, q_t, k_t, v_t, o_t, None, cutlass.Float32(sm_scale),
+            None, None, None, None, None, None, None, None, None, aux,
+            _CUDA_STREAM,
+        )
+        entry = (compiled, aux)
+        _compiled_cache[cache_key] = entry
 
-    cache_key = (batch * q_heads, q_len, kv_len, head_dim)
-    compiled = _get_compiled(q_t, k_t, v_t, out_t, sm_scale, causal_offset, cache_key)
-    compiled(q_t, k_t, v_t, out_t, cutlass.Float32(sm_scale), cutlass.Int32(causal_offset))
+    compiled, aux = entry
+    compiled(
+        q_t, k_t, v_t, o_t, None, cutlass.Float32(sm_scale),
+        None, None, None, None, None, None, None, None, None, aux,
+        _CUDA_STREAM,
+    )
+    return o_bshd.transpose(1, 2).to(orig_dtype)
 
-    return out3.reshape(batch, q_heads, q_len, head_dim).to(orig_dtype)
 
-
-register("ljr_flash_attention_tc (tensor core)", attention)
+register("ljr_flash_attention_fa3", attention)
