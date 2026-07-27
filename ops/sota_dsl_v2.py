@@ -1,8 +1,6 @@
 import os, sys
 _dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "flash-attention-baseline")
-print(_dir)
 sys.path.insert(0, _dir)
-
 # Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
 #
 # SM90 (Hopper) forward pass for flash attention -- RE-OPTIMIZED VERSION.
@@ -733,7 +731,24 @@ def _prefill(q, k, v, out):
     fn(*args)
 
 
-# ---- Decode: 原 SOTA.py 的 Triton Split-KV 两阶段 (未翻译) ----
+# ---- Decode: Triton Split-KV 两阶段 + R6 autotune (只扫 num_warps/num_stages) ----
+# 诊断: 每 block 默认仅 4 warp, 每 SM 4 scheduler 各只 ~3 warp, 一 stall 无 warp 可切 => Issue Slots 仅 22%。
+# autotune 扫 num_warps∈{4,8,16} × num_stages∈{2,3,4} 找发射率最优组合。含默认(4,3)兜底 => 只赚不赔。
+# 【不扫 BLOCK_N/N_SPLITS/SPLIT_LEN】: BLOCK_N 进 config 会改 SMEM 影响 occupancy(已知 32 伤带宽); N_SPLITS/SPLIT_LEN 决定 grid 扫了失配。
+# key=["SPLIT_LEN"](决定段内循环规模)。被扫的 num_warps/num_stages 由 config 注入, launch 处不能再传。
+@triton.autotune(
+    configs=[
+        triton.Config({}, num_warps=4,  num_stages=3),
+        triton.Config({}, num_warps=4,  num_stages=2),
+        triton.Config({}, num_warps=8,  num_stages=2),
+        triton.Config({}, num_warps=8,  num_stages=3),
+        triton.Config({}, num_warps=8,  num_stages=4),
+        triton.Config({}, num_warps=16, num_stages=2),
+        triton.Config({}, num_warps=16, num_stages=3),
+        triton.Config({}, num_warps=16, num_stages=4),
+    ],
+    key=["SPLIT_LEN"],
+)
 @triton.jit
 def _attn_decode_split_kernel(Q, K, V, M_buf, L_buf, Acc_buf, QK_SCALE: tl.constexpr,
     N_CTX: tl.constexpr, HEAD_DIM: tl.constexpr, GROUP_SIZE: tl.constexpr, BLOCK_N: tl.constexpr,
@@ -793,6 +808,7 @@ def _decode(q, k, v, out):
     m_buf = torch.empty((_Q_HEADS, _N_SPLITS), dtype=torch.float32, device=q.device)
     l_buf = torch.empty((_Q_HEADS, _N_SPLITS), dtype=torch.float32, device=q.device)
     acc_buf = torch.empty((_Q_HEADS, _N_SPLITS, _HEAD_DIM), dtype=torch.float32, device=q.device)
+    # R6: num_warps/num_stages 由 autotune config 注入 (扫 4/8/16 × 2/3/4), 此处不传。
     _attn_decode_split_kernel[(_KV_HEADS, _N_SPLITS)](q, k, v, m_buf, l_buf, acc_buf,
         QK_SCALE=_QK_SCALE, N_CTX=_N_CTX, HEAD_DIM=_HEAD_DIM, GROUP_SIZE=_GROUP_SIZE,
         BLOCK_N=_BLOCK_N_DECODE, SPLIT_LEN=_SPLIT_LEN, N_SPLITS=_N_SPLITS, PAD_M=_PAD_M)

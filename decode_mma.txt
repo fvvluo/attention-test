@@ -1,0 +1,36 @@
+==PROF== Connected to process 3569466 (/usr/bin/python3.12)
+==PROF== Profiling "_attn_decode_split_kernel": 0%....50%....100% - 12 passes
+==PROF== Disconnected from process 3569466
+[3569466] python3.12@127.0.0.1
+  _attn_decode_split_kernel (8, 128, 1)x(128, 1, 1), Context 1, Stream 7, Device 2, CC 9.0
+    Section: Compute Workload Analysis
+    -------------------- ----------- ------------
+    Metric Name          Metric Unit Metric Value
+    -------------------- ----------- ------------
+    Executed Ipc Active   inst/cycle         0.87
+    Executed Ipc Elapsed  inst/cycle         0.83
+    Issue Slots Busy               %        21.81
+    Issued Ipc Active     inst/cycle         0.87
+    SM Busy                        %        65.67
+    -------------------- ----------- ------------
+
+    OPT   Est. Local Speedup: 83.58%                                                                                    
+          All compute pipelines are under-utilized. Either this workload is very small or it doesn't issue enough warps 
+          per scheduler. Check the Launch Statistics and Scheduler Statistics sections for further details.             
+
+    Section: Instruction Statistics
+    ---------------------------------------- ----------- ------------
+    Metric Name                              Metric Unit Metric Value
+    ---------------------------------------- ----------- ------------
+    Avg. Executed Instructions Per Scheduler        inst     53563.08
+    Executed Instructions                           inst     16711680
+    Avg. Issued Instructions Per Scheduler          inst     53571.33
+    Issued Instructions                             inst     16714254
+    ---------------------------------------- ----------- ------------
+
+    OPT   Est. Speedup: 2.621%                                                                                          
+          This kernel executes 393216 fused and 2293760 non-fused FP32 instructions. By converting pairs of non-fused   
+          instructions to their fused (https://docs.nvidia.com/cuda/floating-point/#cuda-and-floating-point),           
+          higher-throughput equivalent, the achieved FP32 performance could be increased by up to 43% (relative to its  
+          current performance).                                                                                         
+
