@@ -698,7 +698,9 @@ _HEAD_DIM = 128
 _GROUP_SIZE = _Q_HEADS // _KV_HEADS
 _QK_SCALE = (1.0 / math.sqrt(_HEAD_DIM)) * math.log2(math.e)   # decode 用: 已含 log2(e)
 _BLOCK_N_DECODE = 64
-_N_SPLITS = 128
+# R9: N_SPLITS 改为外层自动选择 (见下方 _pick_n_splits, 候选 {16,32,64,128})。
+#   下面这两个模块常量仅作默认/参考, decode 实际用 _run_decode 里现算的 n_splits/split_len, 不再引用它们。
+_N_SPLITS = 16
 _SPLIT_LEN = _N_CTX // _N_SPLITS
 _PAD_M = 16
 _DT = {torch.float16: cutlass.Float16, torch.bfloat16: cutlass.BFloat16}
@@ -811,16 +813,72 @@ def _attn_decode_reduce_kernel(M_buf, L_buf, Acc_buf, Out, HEAD_DIM: tl.constexp
     tl.store(Out + q_head * HEAD_DIM + offs_k, out.to(Out.dtype.element_ty))
 
 
-def _decode(q, k, v, out):
-    m_buf = torch.empty((_Q_HEADS, _N_SPLITS), dtype=torch.float32, device=q.device)
-    l_buf = torch.empty((_Q_HEADS, _N_SPLITS), dtype=torch.float32, device=q.device)
-    acc_buf = torch.empty((_Q_HEADS, _N_SPLITS, _HEAD_DIM), dtype=torch.float32, device=q.device)
-    # R7: BLOCK_N / num_warps / num_stages 均由 autotune config 注入, 此处不传 (否则重复参数报错)。
-    _attn_decode_split_kernel[(_KV_HEADS, _N_SPLITS)](q, k, v, m_buf, l_buf, acc_buf,
+# ---- R9: N_SPLITS 外层自动选择 ----
+# N_SPLITS 决定 grid + buffer shape + stage-2 的 N_SPLITS, 全在 host 侧 kernel 外, Triton @autotune 碰不到,
+# 故用外层 Python 计时选择器: 首次 decode 在候选里各跑一次选最快, 按 device 缓存, 之后零开销。
+# 与 kernel 内 BLOCK_N/warps autotune 是两层嵌套 (每个 n_splits 对应不同 SPLIT_LEN, 会各自触发 kernel autotune)。
+# 候选须满足: N_CTX % n_splits == 0, SPLIT_LEN % 最小BLOCK_N(64)==0, n_splits 为 2 的幂 (reduce 的 tl.arange)。
+#   {16,32,64,128} -> SPLIT_LEN {8192,4096,2048,1024} 均整除 64/128/256。
+_N_SPLITS_CANDIDATES = (16, 32, 64, 128)
+_DECODE_BUFS = {}          # (device, n_splits) -> (m_buf, l_buf, acc_buf)
+_BEST_N_SPLITS = {}        # device -> 选中的 n_splits
+
+
+def _get_decode_bufs(device, n_splits):
+    bufs = _DECODE_BUFS.get((device, n_splits))
+    if bufs is None:
+        bufs = (
+            torch.empty((_Q_HEADS, n_splits), dtype=torch.float32, device=device),
+            torch.empty((_Q_HEADS, n_splits), dtype=torch.float32, device=device),
+            torch.empty((_Q_HEADS, n_splits, _HEAD_DIM), dtype=torch.float32, device=device),
+        )
+        _DECODE_BUFS[(device, n_splits)] = bufs
+    return bufs
+
+
+def _run_decode(q, k, v, out, n_splits):
+    split_len = _N_CTX // n_splits
+    m_buf, l_buf, acc_buf = _get_decode_bufs(q.device, n_splits)
+    # BLOCK_N / num_warps / num_stages 由 kernel autotune 注入 (key=SPLIT_LEN, 不同 n_splits 各自调优)。
+    _attn_decode_split_kernel[(_KV_HEADS, n_splits)](q, k, v, m_buf, l_buf, acc_buf,
         QK_SCALE=_QK_SCALE, N_CTX=_N_CTX, HEAD_DIM=_HEAD_DIM, GROUP_SIZE=_GROUP_SIZE,
-        SPLIT_LEN=_SPLIT_LEN, N_SPLITS=_N_SPLITS, PAD_M=_PAD_M)
+        SPLIT_LEN=split_len, N_SPLITS=n_splits, PAD_M=_PAD_M)
     _attn_decode_reduce_kernel[(_Q_HEADS,)](m_buf, l_buf, acc_buf, out,
-        HEAD_DIM=_HEAD_DIM, N_SPLITS=_N_SPLITS)
+        HEAD_DIM=_HEAD_DIM, N_SPLITS=n_splits)
+
+
+def _pick_n_splits(q, k, v, out):
+    dev = q.device
+    best = _BEST_N_SPLITS.get(dev)
+    if best is not None:
+        return best
+    best_n, best_ms = None, float("inf")
+    for n in _N_SPLITS_CANDIDATES:
+        try:
+            for _ in range(3):                     # warmup: 触发该 n 下的 kernel autotune + buffer 分配
+                _run_decode(q, k, v, out, n)
+            torch.cuda.synchronize()
+            start = torch.cuda.Event(enable_timing=True)
+            end = torch.cuda.Event(enable_timing=True)
+            start.record()
+            for _ in range(20):
+                _run_decode(q, k, v, out, n)
+            end.record()
+            torch.cuda.synchronize()
+            ms = start.elapsed_time(end) / 20
+        except Exception:
+            continue                               # 某个 n 编译/运行失败则跳过
+        if ms < best_ms:
+            best_ms, best_n = ms, n
+    if best_n is None:
+        best_n = 128                               # 兜底: 所有候选都失败时回退默认
+    _BEST_N_SPLITS[dev] = best_n
+    return best_n
+
+
+def _decode(q, k, v, out):
+    n_splits = _pick_n_splits(q, k, v, out)        # 首次选最优, 之后命中缓存 (零开销)
+    _run_decode(q, k, v, out, n_splits)            # 用选中的 n_splits 正式跑 (确保 out 是最终正确结果)
 
 
 def attention(q, k, v, causal=True, sm_scale=None):
