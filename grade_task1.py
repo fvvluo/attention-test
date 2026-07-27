@@ -15,7 +15,7 @@ from datetime import datetime
 # ================= Configuration =================
 # Define exactly where the repo is relative to this script
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_DIR = os.path.join(SCRIPT_DIR, "attention-test")  # <--- CHANGE THIS IF YOUR REPO FOLDER NAME IS DIFFERENT
+REPO_DIR = SCRIPT_DIR
 
 # Logs and CSV will be saved safely in the parent directory, away from Git operations
 CSV_FILENAME = os.path.join(SCRIPT_DIR, "attention_leaderboard.csv")
