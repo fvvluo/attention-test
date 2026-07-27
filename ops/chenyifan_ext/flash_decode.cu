@@ -109,7 +109,7 @@ __global__ void decode_split_kernel(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
     const __nv_bfloat16* __restrict__ v,
-    float* __restrict__ partial_o,
+    __nv_bfloat16* __restrict__ partial_o,
     float* __restrict__ partial_m,
     float* __restrict__ partial_l,
     int batch,
@@ -363,10 +363,10 @@ __global__ void decode_split_kernel(
         #pragma unroll
         for (int db = 0; db < kHeadDim / 16; ++db) {
             const int d0 = db * 16 + drow;
-            partial_o[stat0 * kHeadDim + d0] = acc_o[db][0];
-            partial_o[stat1 * kHeadDim + d0] = acc_o[db][1];
-            partial_o[stat0 * kHeadDim + d0 + 8] = acc_o[db][2];
-            partial_o[stat1 * kHeadDim + d0 + 8] = acc_o[db][3];
+            partial_o[stat0 * kHeadDim + d0] = __float2bfloat16(acc_o[db][0]);
+            partial_o[stat1 * kHeadDim + d0] = __float2bfloat16(acc_o[db][1]);
+            partial_o[stat0 * kHeadDim + d0 + 8] = __float2bfloat16(acc_o[db][2]);
+            partial_o[stat1 * kHeadDim + d0 + 8] = __float2bfloat16(acc_o[db][3]);
         }
         if (drow == 0) {
             partial_m[stat0] = s_row_max[head0];
@@ -378,7 +378,7 @@ __global__ void decode_split_kernel(
 }
 
 __global__ void decode_combine_kernel(
-    const float* __restrict__ partial_o,
+    const __nv_bfloat16* __restrict__ partial_o,
     const float* __restrict__ partial_m,
     const float* __restrict__ partial_l,
     __nv_bfloat16* __restrict__ output,
@@ -411,7 +411,8 @@ __global__ void decode_combine_kernel(
 
     float numerator = 0.0f;
     for (int split = 0; split < splits; ++split) {
-        numerator += partial_o[(stat_base + split) * kHeadDim + d] * weights[split];
+        numerator += __bfloat162float(
+            partial_o[(stat_base + split) * kHeadDim + d]) * weights[split];
     }
 
     const long long out_idx =
@@ -470,7 +471,7 @@ torch::Tensor decode_forward(
     const float scale = static_cast<float>(sm_scale);
 
     auto partial_o = torch::empty(
-        {batch, q_heads, splits, kHeadDim}, q_contig.options().dtype(torch::kFloat32));
+        {batch, q_heads, splits, kHeadDim}, q_contig.options());
     auto partial_m = torch::empty(
         {batch, q_heads, splits}, q_contig.options().dtype(torch::kFloat32));
     auto partial_l = torch::empty(
@@ -483,7 +484,7 @@ torch::Tensor decode_forward(
         reinterpret_cast<const __nv_bfloat16*>(q_contig.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(k_contig.data_ptr()),
         reinterpret_cast<const __nv_bfloat16*>(v_contig.data_ptr()),
-        partial_o.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(partial_o.data_ptr()),
         partial_m.data_ptr<float>(),
         partial_l.data_ptr<float>(),
         batch,
@@ -496,7 +497,7 @@ torch::Tensor decode_forward(
 
     const dim3 combine_grid(q_heads, batch);
     decode_combine_kernel<<<combine_grid, kHeadDim, 0, stream>>>(
-        partial_o.data_ptr<float>(),
+        reinterpret_cast<__nv_bfloat16*>(partial_o.data_ptr()),
         partial_m.data_ptr<float>(),
         partial_l.data_ptr<float>(),
         reinterpret_cast<__nv_bfloat16*>(output.data_ptr()),
