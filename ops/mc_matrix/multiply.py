@@ -57,8 +57,8 @@ def load_tile(
     global_a_tile = cute.local_tile(a, (BLOCK_N, BLOCK_K), (block_y, tile_k))
     global_b_tile = cute.local_tile(b, (BLOCK_K, BLOCK_M), (tile_k, block_x))
 
-    smem_a = shared_a[stage, None, :-PAD]
-    smem_b = shared_b[stage, None, :-PAD]
+    smem_a = shared_a[stage, None, :BLOCK_K]
+    smem_b = shared_b[stage, None, :BLOCK_M]
 
     thread_copy_a = tiled_copy_a.get_slice(thread_idx)
     cute.copy(
