@@ -178,11 +178,15 @@ def _decode_fused_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
     阶段 1（partial）：每个 program 负责一个 kv head 的一段 kv [lo, hi)，
     一次性载入该组全部 g 个 q head（GNQ = g*n_q 行）与同一份 K/V 做
     attention —— K/V 只从 HBM 读一次，避免朴素 GQA 每 q head 各读一遍的
-    g 倍冗余流量。该段的 partial (o, m, l) 写入全局暂存。
+    g 倍冗余流量。partial (o, m, l)（o 存 fp16 以减半暂存读写流量，
+    m/l 仍 fp32）写入全局暂存。
 
     阶段 2（merge）：每个 (b, kv_head) 组内最后一个完成 partial 的 program
-    （通过对 cnt_ptr 计数判断）负责本组的 log-sum-exp 合并与归一化写出，
-    省掉单独的 merge kernel 启动（decode 场景 launch 开销占大头）。
+    （通过对 cnt_ptr 计数判断）负责本组的 log-sum-exp 合并、归一化写出，
+    并把计数器复位供下一次调用。省掉单独 merge kernel 的启动开销。
+
+    注：persistent CTA（grid-stride 复用描述符）曾实测为负优化（峰值 2988
+    vs 本结构 3039 GB/s @128K），见 flashattn_notes.md。
     """
     s_id = tl.program_id(axis=0)
     bhk = tl.program_id(axis=1)
@@ -193,7 +197,7 @@ def _decode_fused_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
     v_ptr += bhk * n_kv * D
 
     GNQ = g * n_q
-    # q/o 本组 g 个 head 的 GNQ 行地址连续
+    # q 本组 g 个 head 的 GNQ 行地址连续
     row0 = bhk * GNQ
     q_desc = tl.make_tensor_descriptor(q_ptr, shape=[bhn, D], strides=[D, 1],
                                        block_shape=[M_PAD, D])
@@ -238,8 +242,8 @@ def _decode_fused_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
     pid = bhk * splits + s_id
     dcols = tl.arange(0, D)
     valid = rows < GNQ
-    tl.store(op_ptr + (pid * GNQ + rows)[:, None] * D + dcols[None, :], o,
-             mask=valid[:, None])
+    tl.store(op_ptr + (pid * GNQ + rows)[:, None] * D + dcols[None, :],
+             o.to(op_ptr.dtype.element_ty), mask=valid[:, None])
     tl.store(mp_ptr + pid * GNQ + rows, m, mask=valid)
     tl.store(lp_ptr + pid * GNQ + rows, l, mask=valid)
 
@@ -270,7 +274,7 @@ def _decode_fused_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
             w = tl.math.exp2(m_s - m_gsafe)
             o_s = tl.load(op_ptr + (pid2 * GNQ + rows)[:, None] * D
                           + dcols[None, :], mask=valid[:, None], other=0.0)
-            o_g += w[:, None] * o_s
+            o_g += w[:, None] * o_s.to(tl.float32)  # partial 为 fp16
 
         o_g = o_g / l_g[:, None]  # l_g==0 只在 valid=False 的 padding 行
         tl.store(o_ptr + (row0 + rows)[:, None] * D + dcols[None, :],
@@ -336,7 +340,9 @@ def _decode_scratch(BHK, splits, GNQ, d, device):
     if len(_DECODE_SCRATCH) > 32:
         _DECODE_SCRATCH.clear()
     if key not in _DECODE_SCRATCH:
-        o_part = torch.empty(BHK * splits * GNQ * d, device=device, dtype=torch.float32)
+        # o_part 用 fp16（读写流量减半，merge 是带宽/延迟受限的；
+        # 精度足够 —— 最终输出也是 fp16，merge 权重 m/l 仍保持 fp32）
+        o_part = torch.empty(BHK * splits * GNQ * d, device=device, dtype=torch.float16)
         m_part = torch.empty(BHK * splits * GNQ, device=device, dtype=torch.float32)
         l_part = torch.empty(BHK * splits * GNQ, device=device, dtype=torch.float32)
         cnt = torch.zeros(BHK, device=device, dtype=torch.int32)
@@ -345,7 +351,8 @@ def _decode_scratch(BHK, splits, GNQ, d, device):
 
 
 def _decode_run(q, k, v, o, qk_scale, causal, splits):
-    """按给定 splits 发起一次 fused decode kernel，返回实际 splits。"""
+    """按给定 splits 发起一次 fused decode kernel（partial + merge 融合，
+    单次启动），返回实际 splits。"""
     b, h, n_q, d = q.shape
     _, h_kv, n_kv, _ = k.shape
     g = h // h_kv
@@ -358,7 +365,7 @@ def _decode_run(q, k, v, o, qk_scale, causal, splits):
     _decode_fused_kernel[(sp, BHK)](q, k, v, o, o_part, m_part, l_part, cnt,
                                     b * h * n_q, n_q, n_kv, h_kv, g,
                                     qk_scale, chunk, sp,
-                                    D=d, M_PAD=M_PAD, S_PAD=32,
+                                    D=d, M_PAD=M_PAD, S_PAD=64,
                                     CAUSAL=causal)
     return sp
 
@@ -368,13 +375,16 @@ _DECODE_TUNE = {}
 
 
 def _tune_decode_splits(q, k, v, o, qk_scale, causal, key):
-    """splits 是 host 侧 grid 参数，triton.autotune 覆盖不到；对少量候选
-    （目标 CTA 数 ~= {1.5, 2, 2.7, 4} x SM 数）实测一次并缓存最优值，
-    语义与 autotune 相同：每个形状只在首次调用时调一次。"""
+    """splits 是 host 侧 grid 参数，triton.autotune 覆盖不到；实测少量候选
+    并缓存最优值，语义与 autotune 相同：每个形状只在首次调用时调一次。
+
+    候选为目标总 program 数 ~= {1.5, 2, 2.7, 4} x SM 数 的 splits
+    （每个工作项一个 program 的结构下，波次整数倍附近通常最优）。
+    """
     b, h, _, _ = q.shape
     _, h_kv, n_kv, _ = k.shape
     BHK = b * h_kv
-    cap = min(triton.cdiv(n_kv, 512), 32)
+    cap = min(triton.cdiv(n_kv, 256), 64)
     cands = sorted({min(max(triton.cdiv(int(f * 78), BHK), 1), cap)
                     for f in (1.5, 2.0, 2.7, 4.0)})
     best_t, best_s = float("inf"), cands[0]
@@ -391,12 +401,13 @@ def _tune_decode_splits(q, k, v, o, qk_scale, causal, key):
 
 
 def decode(q, k, v, causal=True, sm_scale=None):
-    """decode 专用内核（FlashDecoding split-K + GQA 组共享，单 kernel 融合）。
+    """decode 专用内核（FlashDecoding split-K + GQA 组共享，partial + merge
+    融合为单次 kernel 启动）。
 
     要求 n_q <= 16 且 g*n_q <= 128。同一 kv 组内的所有 q head 在一个 program
-    里共享同一份 K/V（K/V 只从 HBM 读一次）；kv 按 splits 段并行，各段写出
-    partial 后由组内最后一个 program 直接 merge（信号量计数），全程只有一次
-    kernel 启动 —— decode 场景下 Python/launch 开销与 GPU 耗时同量级。
+    里共享同一份 K/V（K/V 只从 HBM 读一次）；kv 按 splits 段并行算出
+    partial (o, m, l)（o 为 fp16），由组内最后一个 program（信号量计数）
+    直接做 log-sum-exp 合并并复位信号量。
     kernel 配置由 triton.autotune 调，splits 由 _tune_decode_splits 实测。
     """
     b, h, n_q, d = q.shape
