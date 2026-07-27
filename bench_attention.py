@@ -15,7 +15,7 @@ Prefill / Decode 说明：
     两个阶段会分别打印独立的对比表格（耗时 / TFLOPS / GB/s）。
 
 最终测试命令（本次评测实际使用的命令，非用法示例）：
-    python3 bench_attention.py --gpu 0 --shapes 1x64x8x131072x128 --dtype bf16 --causal --warmup 10 --iters 50
+    python3 bench_attention.py --gpu 0 --shapes 1x64x8x131072x128 --dtype bf16 --causal --warmup 10 --iters 10
 
 用法示例（以下均为参数用法演示，非最终测试命令）：
     python bench_attention.py --gpu 0
