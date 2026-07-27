@@ -54,7 +54,7 @@ def _get_decode_ext():
     if _DECODE_EXT is None:
         source = Path(__file__).resolve().parent / "chenyifan_ext" / "flash_decode.cu"
         _DECODE_EXT = load(
-            name="flash_attention_decode_chenyifan_v44_qkpvtranspose",
+            name="flash_attention_decode_chenyifan_v48_kvswizzle",
             sources=[str(source)],
             extra_cuda_cflags=["-O3", "--use_fast_math"],
             verbose=False,

@@ -14,8 +14,8 @@ constexpr int kHeadDim = 128;
 constexpr int kWarps = 1;
 constexpr int kThreads = kWarps * 32;
 constexpr int kTokensPerTile = 32;
-constexpr int kKStride = kHeadDim + 16;
-constexpr int kVStride = kHeadDim + 16;
+constexpr int kKStride = kHeadDim;
+constexpr int kVStride = kHeadDim;
 constexpr int kQStride = kHeadDim + 8;
 constexpr int kPStride = kTokensPerTile + 8;
 constexpr int kMaxSplits = 64;
@@ -48,6 +48,13 @@ __device__ __forceinline__ void cp_async_commit() {
 
 __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group 0;\n" ::);
+}
+
+// XOR 16-byte chunks by token-row low bits. Both cp.async writers and
+// ldmatrix readers use this mapping, so swizzle has no inner scalar loads.
+__device__ __forceinline__ int swizzle_kv_col(int row, int logical_col) {
+    const int chunk = logical_col >> 3;
+    return ((chunk ^ (row & 7)) << 3) | (logical_col & 7);
 }
 
 // D[16x8] += A[16x16] * B[16x8]^T ; A row-major, B col-major, bf16 in, f32 out.
@@ -111,10 +118,10 @@ __global__ void decode_split_kernel(
     int kv_len,
     int splits,
     float scale) {
-    __shared__ __align__(16) __nv_bfloat16 s_q[16][kQStride];  // 16 mma-M rows + bank padding
+    __shared__ __align__(16) __nv_bfloat16 s_q[kMaxGroup][kQStride];  // Q heads are mma-N
     __shared__ __align__(16) __nv_bfloat16 s_k[2][kTokensPerTile][kKStride];
     __shared__ __align__(16) __nv_bfloat16 s_v[2][kTokensPerTile][kVStride];
-    __shared__ __align__(16) __nv_bfloat16 s_pbf[16][kPStride];  // P (bf16), padded for PV ldmatrix
+    __shared__ __align__(16) __nv_bfloat16 s_pbf[kMaxGroup][kPStride];  // P heads are mma-N
     __shared__ float s_row_max[kMaxGroup];
     __shared__ float s_row_sum[kMaxGroup];
     __shared__ float s_alpha[kMaxGroup];
@@ -149,15 +156,12 @@ __global__ void decode_split_kernel(
     const long long q_group_offset =
         (static_cast<long long>(b) * q_heads + kv_head * group) * kHeadDim;
     constexpr int kQVecsPerRow = kHeadDim / 8;
-    constexpr int kQVectors = kMaxGroup * kQVecsPerRow;  // rows 0..7: real q heads
-    constexpr int kQVectorsPad = 16 * kQVecsPerRow;      // rows 8..15: mma zero pad
-    for (int vec = tid; vec < kQVectorsPad; vec += kThreads) {
+    constexpr int kQVectors = kMaxGroup * kQVecsPerRow;
+    for (int vec = tid; vec < kQVectors; vec += kThreads) {
         const int row = vec / kQVecsPerRow;
         const int vec_in_row = vec % kQVecsPerRow;
         reinterpret_cast<uint4*>(&s_q[row][vec_in_row * 8])[0] =
-            vec < kQVectors
-                ? reinterpret_cast<const uint4*>(q + q_group_offset)[vec]
-                : make_uint4(0, 0, 0, 0);
+            reinterpret_cast<const uint4*>(q + q_group_offset)[vec];
     }
 
     const long long kv_head_offset =
@@ -171,10 +175,10 @@ __global__ void decode_split_kernel(
             const int token = vec / (kHeadDim / 8);
             const int vec_in_row = vec % (kHeadDim / 8);
             cp_async_16(
-                &s_k[0][token][vec_in_row * 8],
+                &s_k[0][token][swizzle_kv_col(token, vec_in_row * 8)],
                 reinterpret_cast<const uint4*>(k + first_offset) + vec);
             cp_async_16(
-                &s_v[0][token][vec_in_row * 8],
+                &s_v[0][token][swizzle_kv_col(token, vec_in_row * 8)],
                 reinterpret_cast<const uint4*>(v + first_offset) + vec);
         }
         cp_async_commit();
@@ -196,10 +200,10 @@ __global__ void decode_split_kernel(
                 const int token = vec / (kHeadDim / 8);
                 const int vec_in_row = vec % (kHeadDim / 8);
                 cp_async_16(
-                    &s_k[next_stage][token][vec_in_row * 8],
+                    &s_k[next_stage][token][swizzle_kv_col(token, vec_in_row * 8)],
                     reinterpret_cast<const uint4*>(k + next_offset) + vec);
                 cp_async_16(
-                    &s_v[next_stage][token][vec_in_row * 8],
+                    &s_v[next_stage][token][swizzle_kv_col(token, vec_in_row * 8)],
                     reinterpret_cast<const uint4*>(v + next_offset) + vec);
             }
             cp_async_commit();
@@ -225,9 +229,11 @@ __global__ void decode_split_kernel(
                 for (int tb = 0; tb < 2; ++tb) {
                     uint32_t k_frag[4];
                     // A is a row-major 16-token x 16-dim K tile.
+                    const int k_row = tb * 16 + (lane % 16);
+                    const int k_col = d0 + (lane / 16) * 8;
                     ldmatrix_x4(
                         k_frag,
-                        &s_k[stage][tb * 16 + (lane % 16)][d0 + (lane / 16) * 8]);
+                        &s_k[stage][k_row][swizzle_kv_col(k_row, k_col)]);
                     mma_m16n8k16(acc[tb], k_frag, q_frag);
                 }
             }
@@ -282,10 +288,6 @@ __global__ void decode_split_kernel(
                 s_pbf[head1][t0] = __float2bfloat16(p01);
                 s_pbf[head0][t8] = __float2bfloat16(p08);
                 s_pbf[head1][t8] = __float2bfloat16(p09);
-                s_pbf[head0 + 8][t0] = __float2bfloat16(0.0f);
-                s_pbf[head1 + 8][t0] = __float2bfloat16(0.0f);
-                s_pbf[head0 + 8][t8] = __float2bfloat16(0.0f);
-                s_pbf[head1 + 8][t8] = __float2bfloat16(0.0f);
             }
             #pragma unroll
             for (int offset = 4; offset <= 16; offset <<= 1) {
@@ -331,7 +333,9 @@ __global__ void decode_split_kernel(
                     const int matrix = lane / 8;
                     const int src_token = t0 + (lane % 8) + (matrix / 2) * 8;
                     const int src_d = d0 + (matrix & 1) * 8;
-                    ldmatrix_x4_trans(v_frag, &s_v[stage][src_token][src_d]);
+                    ldmatrix_x4_trans(
+                        v_frag,
+                        &s_v[stage][src_token][swizzle_kv_col(src_token, src_d)]);
                     mma_m16n8k16(acc_o[db], v_frag, p_frag);
                 }
             }
@@ -388,18 +392,20 @@ __global__ void decode_combine_kernel(
     __shared__ float weights[kMaxSplits];
     __shared__ float denominator;
 
-    if (d == 0) {
-        float global_max = -INFINITY;
-        for (int split = 0; split < splits; ++split) {
-            global_max = fmaxf(global_max, partial_m[stat_base + split]);
+    if (d < 32) {
+        float local_max = -INFINITY;
+        for (int split = d; split < splits; split += 32) {
+            local_max = fmaxf(local_max, partial_m[stat_base + split]);
         }
-        float denom = 0.0f;
-        for (int split = 0; split < splits; ++split) {
+        const float global_max = warp_max(local_max);
+        float local_denom = 0.0f;
+        for (int split = d; split < splits; split += 32) {
             const float weight = __expf(partial_m[stat_base + split] - global_max);
             weights[split] = weight;
-            denom += partial_l[stat_base + split] * weight;
+            local_denom += partial_l[stat_base + split] * weight;
         }
-        denominator = denom;
+        const float denom = warp_sum(local_denom);
+        if (d == 0) denominator = denom;
     }
     __syncthreads();
 
@@ -415,9 +421,8 @@ __global__ void decode_combine_kernel(
 
 int choose_splits(int batch, int kv_heads, int kv_len, int num_sms) {
     const int max_useful_splits = min(kMaxSplits, kv_len / kTokensPerTile);
-    const int target_blocks = 4 * num_sms;
-    const int splits_for_occupancy =
-        (target_blocks + batch * kv_heads - 1) / (batch * kv_heads);
+    const int target_blocks = 6 * num_sms;
+    const int splits_for_occupancy = target_blocks / (batch * kv_heads);
     return max(1, min(max_useful_splits, splits_for_occupancy));
 }
 
