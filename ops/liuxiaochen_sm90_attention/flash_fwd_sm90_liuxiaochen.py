@@ -62,6 +62,7 @@ from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
 from flash_attn.cute.softmax import Softmax
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
+from flash_attn.cute.block_info import BlockInfo  # EXERCISE (2): causal n-block skipping
 from flash_attn.cute.block_sparsity import BlockSparseTensors  # signature only
 from flash_attn.cute.utils import AuxData  # signature only
 from flash_attn.cute import pipeline as pipeline_custom
@@ -73,7 +74,7 @@ from flash_attn.cute.tile_scheduler import (
 from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
 
 
-class LiuXiaochenFlashAttentionForwardSm90(FlashAttentionForwardBase):
+class LiuXiaochenFlashAttentionForwardSm90Exercise2(FlashAttentionForwardBase):
     def __init__(
         self,
         *args,
@@ -548,11 +549,27 @@ class LiuXiaochenFlashAttentionForwardSm90(FlashAttentionForwardBase):
                 self.load_KV, copy_utils.tma_producer_copy_fn(tma_load_V, pipeline_v), pipeline_v
             )
 
-            # EXERCISE (6): no BlockInfo, no causal narrowing. n_block_min is hard-wired to
-            # 0 and n_block_max covers the whole key sequence, so for causal attention every
-            # CTA also loads and multiplies the blocks that sit entirely above the diagonal
-            # and are then masked to -inf in their entirety.
-            n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+            # EXERCISE (2) RESTORED: causal n-block skipping.
+            # Reuse the shared BlockInfo helper to narrow the KV block range so
+            # that causal attention skips the whole blocks that sit entirely
+            # above the diagonal (which the teaching version used to load,
+            # multiply, and then mask to -inf in their entirety).  For
+            # non-causal, get_n_block_min_max returns the full range, preserving
+            # the original behavior.  pack_gqa/local are asserted off in __init__,
+            # so qhead_per_kvhead_packgqa=1 and no split-KV.
+            block_info = BlockInfo(
+                self.tile_m,
+                self.tile_n,
+                self.is_causal,
+                self.is_local,
+                False,  # is_split_kv
+                None,  # window_size_left
+                None,  # window_size_right
+                qhead_per_kvhead_packgqa=(
+                    self.qhead_per_kvhead if const_expr(self.pack_gqa) else 1
+                ),
+            )
+            n_block_min, n_block_max = block_info.get_n_block_min_max(seqlen, m_block)
 
             if warp_idx == 0:
                 pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
@@ -580,7 +597,11 @@ class LiuXiaochenFlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mask_fn,
                 is_first=True,
             )
-            for n_tile in cutlass.range(n_block_max - 1, unroll=1):
+            # EXERCISE (2): descend only to n_block_min instead of 0, so causal
+            # attention skips the fully-above-diagonal blocks entirely.  The
+            # first block (n_block_max - 1) is handled above; this loop covers
+            # [n_block_min, n_block_max - 2] in descending order.
+            for n_tile in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
                 kv_producer_state, kv_consumer_state = self.one_n_block(
                     n_block_max - 2 - n_tile,
                     warp_idx,

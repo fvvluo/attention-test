@@ -70,14 +70,29 @@ def _setup():
     import flash_attn.cute.interface as _bi
 
     # Import the personal derived kernel class.
-    from .flash_fwd_sm90_liuxiaochen import LiuXiaochenFlashAttentionForwardSm90
+    from .flash_fwd_sm90_liuxiaochen import (
+        LiuXiaochenFlashAttentionForwardSm90Exercise2,
+    )
 
     # Inject the personal class in place of the baseline's SM90 class so that
     # _flash_attn_fwd instantiates and compiles OUR kernel on the SM90 path.
-    _bi.FlashAttentionForwardSm90 = LiuXiaochenFlashAttentionForwardSm90
+    # The unique Exercise2 class name gives the JIT/generated symbol a distinct
+    # identity, so we can confirm from logs that OUR kernel is compiled/run.
+    _bi.FlashAttentionForwardSm90 = LiuXiaochenFlashAttentionForwardSm90Exercise2
 
     _driver = (_bi._flash_attn_fwd, _bi)
     return _driver
+
+
+# Private compile cache dedicated to the personal kernel.  CRITICAL: the
+# baseline's _flash_attn_fwd.compile_cache is keyed only by dtype/shape/causal/
+# tile/... and does NOT include the kernel class identity.  When the benchmark
+# runs baseline first (populating that cache) and then our op with the same
+# shape, our compile_key collides and we'd silently re-execute the BASELINE's
+# compiled kernel instead of ours.  We therefore swap in our own cache dict for
+# the duration of each personal call so our injected Exercise2 class is actually
+# compiled and launched, then restore the baseline cache.
+_PERSONAL_COMPILE_CACHE = {}
 
 
 def sm90_attention_bhsd(q, k, v, causal=True, sm_scale=None):
@@ -92,13 +107,20 @@ def sm90_attention_bhsd(q, k, v, causal=True, sm_scale=None):
     k_bshd = k.transpose(1, 2)
     v_bshd = v.transpose(1, 2)
 
-    out = flash_attn_fwd(
-        q_bshd,
-        k_bshd,
-        v_bshd,
-        softmax_scale=sm_scale,
-        causal=causal,
-    )
+    # Isolate our compilation from the baseline's shared cache (see note above).
+    _saved_cache = getattr(flash_attn_fwd, "compile_cache", None)
+    flash_attn_fwd.compile_cache = _PERSONAL_COMPILE_CACHE
+    try:
+        out = flash_attn_fwd(
+            q_bshd,
+            k_bshd,
+            v_bshd,
+            softmax_scale=sm_scale,
+            causal=causal,
+        )
+    finally:
+        if _saved_cache is not None:
+            flash_attn_fwd.compile_cache = _saved_cache
     if isinstance(out, tuple):
         out = out[0]
     # BSHD -> BHSD view back.
