@@ -28,7 +28,7 @@
 # (typically, more code is required to modify; they might be far away from the `EXERCISE (n)` comment).
 #
 #   [DONE] EXERCISE (1)  LPT tile scheduling            -> SingleTileLPTScheduler
-#   [EASY] EXERCISE (2)  Causal n-block skipping        -> every KV block is visited and masked
+#   [DONE] EXERCISE (2)  Causal n-block skipping        -> skip invisible blocks; mask boundaries only
 #   [MEDIUM] EXERCISE (3)  Warp specialization          -> one merged 256-thread mainloop
 #   [EASY] EXERCISE (4)  Register redistribution        -> setmaxnreg calls deleted
 #   [MEDIUM] EXERCISE (5)  Intra-warpgroup overlap      -> QK and PV serialized in one iteration
@@ -518,8 +518,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             seqlen = SeqlenInfoCls(batch_idx)
             head_idx_kv = head_idx // self.qhead_per_kvhead  # GQA
             mask = AttentionMaskCls(seqlen)
-            # Exercise (2). Every block gets the full mask treatment, including
-            # seqlen masking on blocks that are entirely inside seqlen_k.
+            # EXERCISE (2): mask_fn is only called for boundary blocks below.
+            # Blocks strictly before the causal / seqlen boundary are fully valid.
             mask_fn = partial(
                 mask.apply_mask,
                 batch_idx=batch_idx,
@@ -553,11 +553,30 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 self.load_KV, copy_utils.tma_producer_copy_fn(tma_load_V, pipeline_v), pipeline_v
             )
 
-            # EXERCISE (6): no BlockInfo, no causal narrowing. n_block_min is hard-wired to
-            # 0 and n_block_max covers the whole key sequence, so for causal attention every
-            # CTA also loads and multiplies the blocks that sit entirely above the diagonal
-            # and are then masked to -inf in their entirety.
+            # EXERCISE (2): crop the descending KV loop at the causal right boundary.
+            # Causal attention is bottom-right aligned when Q/K lengths differ:
+            #   k_idx <= q_idx + seqlen_k - seqlen_q.
+            # Therefore keys at or beyond causal_k_end are invisible to every row in
+            # this Q tile and must not be loaded or multiplied.
             n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+            if const_expr(self.is_causal):
+                causal_k_end = (
+                    (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q
+                )
+                n_block_max = cutlass.min(
+                    n_block_max, cute.ceil_div(causal_k_end, self.tile_n)
+                )
+
+            # Blocks [0, n_block_mask_start) are fully valid and skip apply_mask.
+            # A causal block is fully valid iff its last K index is visible to the
+            # first Q row in this tile. For non-causal attention, only a partial
+            # final K block needs seqlen masking.
+            if const_expr(self.is_causal):
+                first_q_idx = m_block * self.tile_m
+                first_q_k_end = first_q_idx + seqlen.seqlen_k - seqlen.seqlen_q + 1
+                n_block_mask_start = cutlass.max(first_q_k_end // self.tile_n, 0)
+            else:
+                n_block_mask_start = seqlen.seqlen_k // self.tile_n
 
             if warp_idx == 0:
                 pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
@@ -565,9 +584,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             q_producer_phase ^= 1
             pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
 
-            # EXERCISE (5): a flat loop of self-contained iterations. Each one loads K[n]
-            # and V[n], runs the QK gemm to completion, does the softmax, then runs the PV
-            # gemm to completion. Try to overlap the GEMMs and inspect its performance impacts.
+            # EXERCISE (5): QK and PV remain serialized. EXERCISE (2) keeps one
+            # loop body, but passes a compile-time mask switch: only boundary blocks
+            # compile/execute mask predicates; fully-valid blocks don't.
             kv_producer_state, kv_consumer_state = self.one_n_block(
                 n_block_max - 1,
                 warp_idx,
@@ -583,26 +602,49 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 tOrP,
                 softmax,
                 mask_fn,
+                apply_mask=True,
                 is_first=True,
             )
             for n_tile in cutlass.range(n_block_max - 1, unroll=1):
-                kv_producer_state, kv_consumer_state = self.one_n_block(
-                    n_block_max - 2 - n_tile,
-                    warp_idx,
-                    load_K,
-                    load_V,
-                    pipeline_k,
-                    pipeline_v,
-                    kv_producer_state,
-                    kv_consumer_state,
-                    mma_qk_fn,
-                    mma_pv_fn,
-                    acc_O,
-                    tOrP,
-                    softmax,
-                    mask_fn,
-                    is_first=False,
-                )
+                n_block = n_block_max - 2 - n_tile
+                if n_block >= n_block_mask_start:
+                    kv_producer_state, kv_consumer_state = self.one_n_block(
+                        n_block,
+                        warp_idx,
+                        load_K,
+                        load_V,
+                        pipeline_k,
+                        pipeline_v,
+                        kv_producer_state,
+                        kv_consumer_state,
+                        mma_qk_fn,
+                        mma_pv_fn,
+                        acc_O,
+                        tOrP,
+                        softmax,
+                        mask_fn,
+                        apply_mask=True,
+                        is_first=False,
+                    )
+                else:
+                    kv_producer_state, kv_consumer_state = self.one_n_block(
+                        n_block,
+                        warp_idx,
+                        load_K,
+                        load_V,
+                        pipeline_k,
+                        pipeline_v,
+                        kv_producer_state,
+                        kv_consumer_state,
+                        mma_qk_fn,
+                        mma_pv_fn,
+                        acc_O,
+                        tOrP,
+                        softmax,
+                        mask_fn,
+                        apply_mask=False,
+                        is_first=False,
+                    )
 
             # Release Q so the producer can load the next tile's Q
             pipeline_q.consumer_release_w_index(0)
@@ -652,6 +694,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tOrP: cute.Tensor,
         softmax: Softmax,
         mask_fn: Callable,
+        apply_mask: cutlass.Constexpr,
         is_first: cutlass.Constexpr = False,
     ):
         """Load K[n] and V[n], then S = Q@K.T, softmax, O += P@V -- all fully serialized."""
@@ -672,7 +715,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_k.consumer_release(kv_consumer_state)
 
         # ---- softmax ----------------------------------------------------------------
-        mask_fn(acc_S=acc_S, n_block=n_block)
+        # EXERCISE (2): boundary blocks mask causal/seqlen residue. Fully-valid
+        # blocks skip this whole region at compile time.
+        if const_expr(apply_mask):
+            mask_fn(acc_S=acc_S, n_block=n_block)
         if const_expr(is_first):
             # row_scale unused: the PV gemm below writes acc_O instead of accumulating.
             softmax.online_softmax(acc_S, is_first=True)
