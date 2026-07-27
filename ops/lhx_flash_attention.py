@@ -1578,17 +1578,15 @@ def _run_attention_sm90(q, k, v, causal=True, sm_scale=None):
 
 
 def _decode_split_config(batch, q_heads, kv_heads, kv_len, device):
-    """Choose four complete CTA waves for the current GPU when possible."""
+    """Fill one resident wave at three four-warp CTAs per SM."""
     num_blocks = (kv_len + GqaDecodeSm90.tile_n - 1) // GqaDecodeSm90.tile_n
     q_ratio = q_heads // kv_heads
     q_groups = (q_ratio + GqaDecodeSm90.qheads_per_cta - 1) // GqaDecodeSm90.qheads_per_cta
     base_ctas = batch * kv_heads * q_groups
     sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    target_ctas = sm_count * 4
-    num_splits = max(
-        1,
-        min(num_blocks, (target_ctas + base_ctas - 1) // base_ctas),
-    )
+    resident_ctas = sm_count * 3
+    # Round down to avoid crossing into a sparsely populated second wave.
+    num_splits = max(1, min(num_blocks, resident_ctas // base_ctas))
     return num_splits, (num_blocks + num_splits - 1) // num_splits
 
 
