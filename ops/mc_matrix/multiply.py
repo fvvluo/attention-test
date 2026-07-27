@@ -9,7 +9,7 @@ WARP_SIZE = 32
 
 BLOCK_N = 64
 BLOCK_M = 64
-BLOCK_K = 16
+BLOCK_K = 32
 
 THREAD_N = 16
 THREAD_M = 16
@@ -17,7 +17,7 @@ THREAD_M = 16
 THREAD_TILE_N = 4
 THREAD_TILE_M = 4
 
-STAGES = 2
+STAGES = 3
 
 @cute.jit
 def make_fp32_tiled_copy(major_size: cutlass.Constexpr, use_async: cutlass.Constexpr = False):
