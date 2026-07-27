@@ -69,6 +69,7 @@ from flash_attn.cute import pipeline as pipeline_custom
 from flash_attn.cute.tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
+    SingleTileLPTScheduler,  # EXERCISE (1): LPT tile scheduling
 )
 
 from flash_attn.cute.flash_fwd import FlashAttentionForwardBase
@@ -266,8 +267,16 @@ class LiuXiaochenFlashAttentionForwardSm90Exercise2(FlashAttentionForwardBase):
             cpasync.CopyBulkTensorTileS2GOp(), mO, self.sO_layout, (self.tile_m, self.tile_hdimv)
         )
 
-        # EXERCISE (1): What does the `lpt` field of `TileSchedulerArguments` mean? Does this impact efficiency?
-        TileScheduler = SingleTileScheduler
+        # EXERCISE (1) RESTORED: LPT tile scheduling.
+        # Use SingleTileLPTScheduler (L2-swizzled coordinate mapping + longest-
+        # processing-time-first block reversal, block = num_block-1-block) instead
+        # of the plain SingleTileScheduler.  For causal attention the per-m_block
+        # work is highly unbalanced (heavy blocks near the diagonal end); LPT
+        # schedules the heavy, later m_blocks first so the static grid balances
+        # better and the Exercise-2 block skipping actually shows up in wall-clock.
+        # For non-causal, all m_blocks do equal work; the reversal only changes
+        # ordering (not results), so behavior stays correct.
+        TileScheduler = SingleTileLPTScheduler
         tile_sched_args = TileSchedulerArguments(
             cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
             cute.size(mQ.shape[2]),
@@ -281,6 +290,7 @@ class LiuXiaochenFlashAttentionForwardSm90Exercise2(FlashAttentionForwardBase):
             qhead_per_kvhead_packgqa=1,
             element_size=self.dtype.width // 8,
             is_persistent=False,
+            lpt=True,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
         softmax_scale_log2, softmax_scale = utils.compute_softmax_scale_log2(softmax_scale, None)
