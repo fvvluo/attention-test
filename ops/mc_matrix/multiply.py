@@ -17,8 +17,6 @@ THREAD_M = 16
 THREAD_TILE_N = 4
 THREAD_TILE_M = 4
 
-PAD = 4
-
 STAGES = 2
 
 @cute.jit
@@ -85,12 +83,12 @@ def matrix_mul_kernel(a: cute.Tensor, b: cute.Tensor, c: cute.Tensor):
     row = block_y * BLOCK_N + thread_y * THREAD_TILE_N
 
     layout_a = cute.make_layout(
-        (STAGES, BLOCK_N, BLOCK_K + PAD),
-        stride = (BLOCK_N * (BLOCK_K + PAD), BLOCK_K + PAD, 1)
+        (STAGES, BLOCK_N, BLOCK_K),
+        stride = (BLOCK_N * BLOCK_K, BLOCK_K, 1)
     )
     layout_b = cute.make_layout(
-        (STAGES, BLOCK_K, BLOCK_M + PAD),
-        stride = (BLOCK_K * (BLOCK_M + PAD), BLOCK_M + PAD, 1)
+        (STAGES, BLOCK_K, BLOCK_M),
+        stride = (BLOCK_K * BLOCK_M, BLOCK_M, 1)
     )
 
     smem = SmemAllocator()
