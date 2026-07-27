@@ -15,7 +15,10 @@ Prefill / Decode 说明：
     两个阶段会分别打印独立的对比表格（耗时 / TFLOPS / GB/s）。
 
 最终测试命令（本次评测实际使用的命令，非用法示例）：
-    python3 bench_attention.py --gpu 0 --shapes 1x64x8x131072x128 --dtype bf16 --causal --prefill-warmup 10 --prefill-iters 10 --decode-warmup 100 --decode-iters 100
+    python3 bench_attention.py --gpu 0 --shapes 1x64x8x131072x128 --dtype bf16 --causal \
+        --prefill-warmup 10 --prefill-iters 10 --decode-warmup 100 --decode-iters 100
+    （prefill 用 10+10；decode 单次耗时极小，用 100+100 降低测量噪声，
+     总耗时几乎不变，因为总时间由 prefill 主导。这也是各参数的默认值。）
 
 用法示例（以下均为参数用法演示，非最终测试命令）：
     python bench_attention.py --gpu 0
@@ -119,7 +122,13 @@ def parse_args():
     )
     parser.add_argument("--prefill-warmup", type=int, default=10, help="prefill 阶段正式计时前的 warmup 次数")
     parser.add_argument("--prefill-iters", type=int, default=10, help="prefill 阶段正式计时的迭代次数")
-    parser.add_argument("--decode-warmup", type=int, default=100, help="decode 阶段正式计时前的 warmup 次数")
+    parser.add_argument(
+        "--decode-warmup",
+        type=int,
+        default=100,
+        help="decode 阶段正式计时前的 warmup 次数（decode 单次耗时远小于 "
+        "prefill，用更多次数降低测量噪声）",
+    )
     parser.add_argument("--decode-iters", type=int, default=100, help="decode 阶段正式计时的迭代次数")
     parser.add_argument(
         "--check-only",
