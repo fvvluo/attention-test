@@ -4,9 +4,9 @@ import torch
 import cutlass.cute as cute
 from cutlass.cute.runtime import from_dlpack
 
-from mc_matrix import matrix_mul
+from .mc_matrix import matrix_mul
 
-from mc_benchmark import benchmark_kernel
+from .mc_benchmark import benchmark_kernel
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
