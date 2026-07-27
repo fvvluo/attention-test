@@ -167,7 +167,9 @@ def fmha_ref_attention(q, k, v, sm_scale=None, is_causal=False,
 # ----------------------------------------------------------------------
 # The vendored FMHA reference natively supports Float8E4M3FN in/out with
 # Float32 qk/pv accumulators. On H20 (SM90a) the FP8 causal prefill runs at
-# ~240-274 TFLOP/s vs the 143 TFLOP/s bf16 roofline (== FA3), i.e. ~1.7-1.9x.
+# ~276 TFLOP/s vs the 143 TFLOP/s bf16 roofline (== FA3), i.e. ~1.93x
+# (mma_tiler_mn=(64,256); M is locked at 64 by the FP8 MMA, N widened 128->256
+# to halve the K-loop iteration count -- validated fastest, persistent no gain).
 #
 # Numerics: FP8 attention is accurate in the "bulk" (each query row averages
 # over many keys, so e4m3 rounding cancels) but WRONG for the first ~2500
@@ -264,7 +266,7 @@ def _bf16_correct_early(q, k, v, o, ncorr, sm_scale):
 
 
 def fp8_hybrid_attention(q, k, v, sm_scale=None, is_causal=True,
-                         mma_tiler_mn=(64, 128), ncorr=4096):
+                         mma_tiler_mn=(64, 256), ncorr=4096, is_persistent=False):
     """q,k,v: [B,S,H,D] bf16 cuda, causal. Returns o [B,Sq,Hq,D] bf16.
     FP8 bulk + bf16 correction of the first `ncorr` query rows."""
     B, Sq, Hq, D = q.shape
@@ -295,13 +297,13 @@ def fp8_hybrid_attention(q, k, v, sm_scale=None, is_causal=True,
     if not is_causal:
         wsr = None
 
-    key = (B, Sq, Sk, Hq, Hkv, D, is_causal, mma_tiler_mn)
+    key = (B, Sq, Sk, Hq, Hkv, D, is_causal, mma_tiler_mn, is_persistent)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     if key not in _FP8_CACHE:
         mma_tiler = (*mma_tiler_mn, D)
         fmha = _fmha.HopperFusedMultiHeadAttentionForward(
-            cutlass.Float32, cutlass.Float32, mma_tiler, False, mask_type)
+            cutlass.Float32, cutlass.Float32, mma_tiler, is_persistent, mask_type)
         _FP8_CACHE[key] = cute.compile(
             fmha, q_ct, k_ct, v_ct, o_ct, lse_ct,
             cutlass.Float32(scale_softmax_log2),
