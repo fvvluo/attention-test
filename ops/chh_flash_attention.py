@@ -31,9 +31,18 @@ import triton.language as tl
 from .base import register
 
 
+_TMA_SCRATCH = [None]
+
+
 def _triton_alloc(size: int, alignment: int, stream):
-    # device-side TMA descriptor (tl.make_tensor_descriptor) 需要的全局显存暂存区
-    return torch.empty(size, dtype=torch.uint8, device='cuda')
+    # device-side TMA descriptor (tl.make_tensor_descriptor) 需要的全局显存暂存区。
+    # 复用缓存 buffer，省去每次 launch 的 torch.empty；同一 stream 上 kernel 串行
+    # 执行不会并发读写该暂存区（本文件均为单 stream 使用）。
+    buf = _TMA_SCRATCH[0]
+    if buf is None or buf.numel() < size:
+        buf = torch.empty(size, dtype=torch.uint8, device='cuda')
+        _TMA_SCRATCH[0] = buf
+    return buf
 
 
 triton.set_allocator(_triton_alloc)
@@ -52,10 +61,10 @@ def _prefill_configs():
 
 
 def _decode_configs():
-    """decode partial kernel 的 autotune 候选（BR 固定 16，只调 BC/warps/stages）。"""
+    """decode fused kernel 的 autotune 候选（共享显存超限的会被自动跳过）。"""
     cfgs = []
     for BC, w, s in [(64, 4, 2), (64, 4, 4), (128, 4, 2), (128, 4, 3),
-                     (128, 4, 4), (128, 8, 3), (256, 4, 2), (256, 8, 3)]:
+                     (128, 4, 4), (128, 8, 3), (256, 4, 2), (256, 8, 2)]:
         cfgs.append(triton.Config({'BC': BC}, num_warps=w, num_stages=s))
     return cfgs
 
@@ -156,39 +165,41 @@ def flash_attn_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
     o_desc.store([i * BR, 0], o.to(o_ptr.dtype.element_ty))  # TMA：越界自动裁剪
 
 
-@triton.autotune(configs=_decode_configs(), key=['n_kv', 'D'])
+@triton.autotune(configs=_decode_configs(), key=['n_kv', 'chunk', 'D', 'M_PAD'])
 @triton.jit
-def _decode_partial_kernel(q_ptr, k_ptr, v_ptr, op_ptr, mp_ptr, lp_ptr,
-                           sqm, sqd,
-                           skb, skh, skn, skd,
-                           svb, svh, svn, svd,
-                           bhn, n_q, n_kv, h_kv, g, qk_scale, chunk, splits,
-                           D: tl.constexpr, M_PAD: tl.constexpr,
-                           BC: tl.constexpr, CAUSAL: tl.constexpr):
-    """FlashDecoding + GQA 共享，第一段：grid = (splits, b*h_kv)。
+def _decode_fused_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
+                         op_ptr, mp_ptr, lp_ptr, cnt_ptr,
+                         bhn, n_q, n_kv, h_kv, g, qk_scale, chunk, splits,
+                         D: tl.constexpr, M_PAD: tl.constexpr,
+                         BC: tl.constexpr, S_PAD: tl.constexpr,
+                         CAUSAL: tl.constexpr):
+    """FlashDecoding + GQA 共享，单 kernel 融合版：grid = (splits, b*h_kv)。
 
-    每个 program 负责一个 kv head 的一段 kv [lo, hi)，并一次性载入该组全部
-    g 个 q head（共 GNQ = g*n_q 行）与同一份 K/V 做 attention —— K/V 只从
-    HBM 读一次，而不是像朴素 GQA 那样每个 q head 各读一遍（g 倍冗余流量）。
-    输出该段的 partial (o, m, l)（未归一化），供 merge kernel 合并。
+    阶段 1（partial）：每个 program 负责一个 kv head 的一段 kv [lo, hi)，
+    一次性载入该组全部 g 个 q head（GNQ = g*n_q 行）与同一份 K/V 做
+    attention —— K/V 只从 HBM 读一次，避免朴素 GQA 每 q head 各读一遍的
+    g 倍冗余流量。该段的 partial (o, m, l) 写入全局暂存。
+
+    阶段 2（merge）：每个 (b, kv_head) 组内最后一个完成 partial 的 program
+    （通过对 cnt_ptr 计数判断）负责本组的 log-sum-exp 合并与归一化写出，
+    省掉单独的 merge kernel 启动（decode 场景 launch 开销占大头）。
     """
     s_id = tl.program_id(axis=0)
     bhk = tl.program_id(axis=1)
-    b = bhk // h_kv
-    hk = bhk % h_kv
 
-    k_ptr += b * skb + hk * skh
-    v_ptr += b * svb + hk * svh
+    # 输入均为连续 (b, h, n, d) 布局：stride 全部由形状推出，
+    # (b, hk) 对应的 kv 起点即 bhk * n_kv * D
+    k_ptr += bhk * n_kv * D
+    v_ptr += bhk * n_kv * D
 
     GNQ = g * n_q
-    # q 为连续 (b, h, n_q, d) 布局，本组 g 个 head 的 GNQ 行地址连续，
-    # 可整体视为 [bhn, D] 矩阵从 row0 开始的一块
-    row0 = (b * (h_kv * g) + hk * g) * n_q
-    q_desc = tl.make_tensor_descriptor(q_ptr, shape=[bhn, D], strides=[sqm, sqd],
+    # q/o 本组 g 个 head 的 GNQ 行地址连续
+    row0 = bhk * GNQ
+    q_desc = tl.make_tensor_descriptor(q_ptr, shape=[bhn, D], strides=[D, 1],
                                        block_shape=[M_PAD, D])
-    k_desc = tl.make_tensor_descriptor(k_ptr, shape=[n_kv, D], strides=[skn, skd],
+    k_desc = tl.make_tensor_descriptor(k_ptr, shape=[n_kv, D], strides=[D, 1],
                                        block_shape=[BC, D])
-    v_desc = tl.make_tensor_descriptor(v_ptr, shape=[n_kv, D], strides=[svn, svd],
+    v_desc = tl.make_tensor_descriptor(v_ptr, shape=[n_kv, D], strides=[D, 1],
                                        block_shape=[BC, D])
     q = q_desc.load([row0, 0])  # TMA：超过 GNQ 的 padding 行自动补零
 
@@ -232,58 +243,41 @@ def _decode_partial_kernel(q_ptr, k_ptr, v_ptr, op_ptr, mp_ptr, lp_ptr,
     tl.store(mp_ptr + pid * GNQ + rows, m, mask=valid)
     tl.store(lp_ptr + pid * GNQ + rows, l, mask=valid)
 
+    # ---- 阶段 2：组内最后一个 program 做 merge ----
+    tl.debug_barrier()  # 保证本 CTA 所有 warp 的 partial store 都已发出
+    # release：本 CTA 的 store 先于计数器自增对其他 CTA 可见；
+    # acq_rel：最后到达者同时获得 acquire，能看到同组全部 partial store。
+    old = tl.atomic_add(cnt_ptr + bhk, 1, sem="acq_rel", scope="gpu")
+    if old == splits - 1:
+        # 一次性载入全部 split 的 (m, l)，算全局 max 与各 split 权重
+        sids = tl.arange(0, S_PAD)
+        smask = (sids < splits)[:, None] & valid[None, :]
+        pids = bhk * splits + sids
+        m_all = tl.load(mp_ptr + pids[:, None] * GNQ + rows[None, :],
+                        mask=smask, other=float("-inf"))
+        l_all = tl.load(lp_ptr + pids[:, None] * GNQ + rows[None, :],
+                        mask=smask, other=0.0)
+        m_star = tl.max(m_all, axis=0)
+        m_gsafe = tl.where(m_star == float("-inf"), 0.0, m_star)
+        w_all = tl.math.exp2(m_all - m_gsafe[None, :])  # 无效 split -> w=0
+        l_g = tl.sum(l_all * w_all, axis=0)
 
-@triton.jit
-def _decode_merge_kernel(op_ptr, mp_ptr, lp_ptr, o_ptr,
-                         sob, soh, som, sod,
-                         n_q, h_q, h_kv, g, splits,
-                         D: tl.constexpr, BR: tl.constexpr, S_PAD: tl.constexpr):
-    """FlashDecoding 第二段：grid = (b*h_q,)。
+        o_g = tl.zeros([M_PAD, D], dtype=tl.float32)
+        for sid in range(splits):
+            pid2 = bhk * splits + sid
+            m_s = tl.load(mp_ptr + pid2 * GNQ + rows, mask=valid,
+                          other=float("-inf"))
+            w = tl.math.exp2(m_s - m_gsafe)
+            o_s = tl.load(op_ptr + (pid2 * GNQ + rows)[:, None] * D
+                          + dcols[None, :], mask=valid[:, None], other=0.0)
+            o_g += w[:, None] * o_s
 
-    定位本 q head 在其 kv 组 partial 缓冲中的行段（组内第 gi 个 head）。
-    先用一次 2D load 算出所有 split 的全局 max 与权重，再在不相关的循环里
-    累加 o（迭代间无依赖，可流水），最后归一化写出。
-    """
-    bh = tl.program_id(axis=0)
-    b = bh // h_q
-    h = bh % h_q
-    hk = h // g
-    gi = h % g
-    o_ptr += b * sob + h * soh
-
-    GNQ = g * n_q
-    base_row = gi * n_q
-
-    rows = tl.arange(0, BR)
-    rmask = rows < n_q
-    dcols = tl.arange(0, D)
-    sids = tl.arange(0, S_PAD)
-    smask = (sids < splits)[:, None] & rmask[None, :]
-    pids = (b * h_kv + hk) * splits + sids
-
-    # 一次性载入全部 split 的 (m, l)，算全局 max 与各 split 权重
-    m_all = tl.load(mp_ptr + pids[:, None] * GNQ + base_row + rows[None, :],
-                    mask=smask, other=float("-inf"))
-    l_all = tl.load(lp_ptr + pids[:, None] * GNQ + base_row + rows[None, :],
-                    mask=smask, other=0.0)
-    m_star = tl.max(m_all, axis=0)
-    m_safe = tl.where(m_star == float("-inf"), 0.0, m_star)
-    w_all = tl.math.exp2(m_all - m_safe[None, :])  # 无效 split 的 m=-inf -> w=0
-    l = tl.sum(l_all * w_all, axis=0)
-
-    o = tl.zeros([BR, D], dtype=tl.float32)
-    for sid in range(splits):
-        pid = (b * h_kv + hk) * splits + sid
-        m_s = tl.load(mp_ptr + pid * GNQ + base_row + rows, mask=rmask,
-                      other=float("-inf"))
-        w = tl.math.exp2(m_s - m_safe)
-        o_s = tl.load(op_ptr + (pid * GNQ + base_row + rows)[:, None] * D
-                      + dcols[None, :], mask=rmask[:, None], other=0.0)
-        o += w[:, None] * o_s
-
-    o = o / l[:, None]  # l==0 只会出现在 rmask=False 的 padding 行，不会写出
-    tl.store(o_ptr + rows[:, None] * som + dcols[None, :] * sod,
-             o.to(o_ptr.dtype.element_ty), mask=rmask[:, None])
+        o_g = o_g / l_g[:, None]  # l_g==0 只在 valid=False 的 padding 行
+        tl.store(o_ptr + (row0 + rows)[:, None] * D + dcols[None, :],
+                 o_g.to(o_ptr.dtype.element_ty), mask=valid[:, None])
+        # 复位信号量供下一次调用：本 kernel 内不会再有 CTA 读它，
+        # 下一次 kernel launch 与本 kernel 有 stream 顺序保证可见性
+        tl.store(cnt_ptr + bhk, 0)
 
 
 def _prep(q, k, v, sm_scale):
@@ -332,12 +326,78 @@ def prefill(q, k, v, causal=True, sm_scale=None):
     return o
 
 
+# decode 暂存缓冲缓存：decode 对 launch/alloc 开销敏感（GPU 工作只有几十 us，
+# Python 侧每次 torch.empty 就要几 us），按形状缓存复用。
+_DECODE_SCRATCH = {}
+
+
+def _decode_scratch(BHK, splits, GNQ, d, device):
+    key = (BHK, splits, GNQ, d, device)
+    if len(_DECODE_SCRATCH) > 32:
+        _DECODE_SCRATCH.clear()
+    if key not in _DECODE_SCRATCH:
+        o_part = torch.empty(BHK * splits * GNQ * d, device=device, dtype=torch.float32)
+        m_part = torch.empty(BHK * splits * GNQ, device=device, dtype=torch.float32)
+        l_part = torch.empty(BHK * splits * GNQ, device=device, dtype=torch.float32)
+        cnt = torch.zeros(BHK, device=device, dtype=torch.int32)
+        _DECODE_SCRATCH[key] = (o_part, m_part, l_part, cnt)
+    return _DECODE_SCRATCH[key]
+
+
+def _decode_run(q, k, v, o, qk_scale, causal, splits):
+    """按给定 splits 发起一次 fused decode kernel，返回实际 splits。"""
+    b, h, n_q, d = q.shape
+    _, h_kv, n_kv, _ = k.shape
+    g = h // h_kv
+    GNQ = g * n_q
+    M_PAD = max(16, triton.next_power_of_2(GNQ))
+    BHK = b * h_kv
+    chunk = triton.cdiv(triton.cdiv(n_kv, splits), 128) * 128
+    sp = triton.cdiv(n_kv, chunk)
+    o_part, m_part, l_part, cnt = _decode_scratch(BHK, sp, GNQ, d, q.device)
+    _decode_fused_kernel[(sp, BHK)](q, k, v, o, o_part, m_part, l_part, cnt,
+                                    b * h * n_q, n_q, n_kv, h_kv, g,
+                                    qk_scale, chunk, sp,
+                                    D=d, M_PAD=M_PAD, S_PAD=32,
+                                    CAUSAL=causal)
+    return sp
+
+
+# 每个 decode 形状实测最优 splits 的缓存（见 _tune_decode_splits）
+_DECODE_TUNE = {}
+
+
+def _tune_decode_splits(q, k, v, o, qk_scale, causal, key):
+    """splits 是 host 侧 grid 参数，triton.autotune 覆盖不到；对少量候选
+    （目标 CTA 数 ~= {1.5, 2, 2.7, 4} x SM 数）实测一次并缓存最优值，
+    语义与 autotune 相同：每个形状只在首次调用时调一次。"""
+    b, h, _, _ = q.shape
+    _, h_kv, n_kv, _ = k.shape
+    BHK = b * h_kv
+    cap = min(triton.cdiv(n_kv, 512), 32)
+    cands = sorted({min(max(triton.cdiv(int(f * 78), BHK), 1), cap)
+                    for f in (1.5, 2.0, 2.7, 4.0)})
+    best_t, best_s = float("inf"), cands[0]
+    for sp in cands:
+        t = triton.testing.do_bench(
+            lambda: _decode_run(q, k, v, o, qk_scale, causal, sp),
+            warmup=3, rep=20)
+        if t < best_t:
+            best_t, best_s = t, sp
+    if len(_DECODE_TUNE) > 64:
+        _DECODE_TUNE.clear()
+    _DECODE_TUNE[key] = best_s
+    return best_s
+
+
 def decode(q, k, v, causal=True, sm_scale=None):
-    """decode 专用内核（FlashDecoding split-K + GQA 组共享）。
+    """decode 专用内核（FlashDecoding split-K + GQA 组共享，单 kernel 融合）。
 
     要求 n_q <= 16 且 g*n_q <= 128。同一 kv 组内的所有 q head 在一个 program
-    里共享同一份 K/V（K/V 只从 HBM 读一次），kv 再按 splits 段并行，适合
-    q_len 极短、kv 很长的自回归生成场景。
+    里共享同一份 K/V（K/V 只从 HBM 读一次）；kv 按 splits 段并行，各段写出
+    partial 后由组内最后一个 program 直接 merge（信号量计数），全程只有一次
+    kernel 启动 —— decode 场景下 Python/launch 开销与 GPU 耗时同量级。
+    kernel 配置由 triton.autotune 调，splits 由 _tune_decode_splits 实测。
     """
     b, h, n_q, d = q.shape
     _, h_kv, n_kv, _ = k.shape
@@ -349,26 +409,11 @@ def decode(q, k, v, causal=True, sm_scale=None):
     q, k, v, qk_scale = _prep(q, k, v, sm_scale)
     o = torch.empty_like(q)
 
-    GNQ = g * n_q
-    M_PAD = max(16, triton.next_power_of_2(GNQ))
-    BHK = b * h_kv
-    splits = min(max(triton.cdiv(4 * 78, BHK), 1), min(triton.cdiv(n_kv, 256), 128))
-    chunk = triton.cdiv(triton.cdiv(n_kv, splits), 128) * 128
-    splits = triton.cdiv(n_kv, chunk)
-
-    o_part = torch.empty(BHK * splits * GNQ * d, device=q.device, dtype=torch.float32)
-    m_part = torch.empty(BHK * splits * GNQ, device=q.device, dtype=torch.float32)
-    l_part = torch.empty(BHK * splits * GNQ, device=q.device, dtype=torch.float32)
-    _decode_partial_kernel[(splits, BHK)](q, k, v, o_part, m_part, l_part,
-                                          d, 1,
-                                          *k.stride(), *v.stride(),
-                                          b * h * n_q, n_q, n_kv, h_kv, g,
-                                          qk_scale, chunk, splits,
-                                          D=d, M_PAD=M_PAD, CAUSAL=causal)
-    _decode_merge_kernel[(b * h,)](o_part, m_part, l_part, o,
-                                   *o.stride(),
-                                   n_q, h, h_kv, g, splits,
-                                   D=d, BR=16, S_PAD=128, num_warps=4)
+    key = (b, h, h_kv, n_q, n_kv, d, causal, q.device)
+    splits = _DECODE_TUNE.get(key)
+    if splits is None:
+        splits = _tune_decode_splits(q, k, v, o, qk_scale, causal, key)
+    _decode_run(q, k, v, o, qk_scale, causal, splits)
     return o
 
 
