@@ -243,6 +243,7 @@ class CuteFlashDecode:
         return val
 
 
+
 # --------------------------------------------------------------------------
 # Phase 2: combine NUM_SPLITS partials via LSE reduction (CuTe DSL)
 # --------------------------------------------------------------------------
@@ -281,6 +282,17 @@ class CuteCombine:
             grid=grid, block=[self._nt, 1, 1], stream=stream,
             use_pdl=self._use_pdl)
 
+    def _warp_sum(self, val):  # CuteCombine warp helpers
+        for off in (16, 8, 4, 2, 1):
+            val = val + cute.arch.shuffle_sync_bfly(val, offset=off, mask=-1, mask_and_clamp=31)
+        return val
+
+    def _warp_max(self, val):
+        for off in (16, 8, 4, 2, 1):
+            val = cute.arch.fmax(
+                val, cute.arch.shuffle_sync_bfly(val, offset=off, mask=-1, mask_and_clamp=31))
+        return val
+
     @cute.kernel
     def kernel(self, mOp: cute.Tensor, mLse: cute.Tensor, mO: cute.Tensor,
                Smem: cutlass.Constexpr):
@@ -297,17 +309,23 @@ class CuteCombine:
         s_wt = st.wt.get_tensor(cute.make_layout(NS))
         s_red = st.red.get_tensor(cute.make_layout(NT))
 
-        # phase 1: local max over this thread's stripe of splits -> block max
+        # phase 1: local max over this thread's stripe of splits -> block max.
+        # WARP_SHFL_COMBINE: warp shuffle reduce, 1 smem value per warp, warp0 finalizes.
+        NWARP = NT // 32
+        warp_id = tidx // 32
+        lane = tidx % 32
         lm = -cutlass.Float32.inf
         s = tidx
         while s < NS:
             lm = cute.arch.fmax(lm, mLse[b, h, s])
             s = s + NT
-        s_red[tidx] = lm
+        lm = self._warp_max(lm)                 # every lane in warp -> warp max
+        if lane == 0:
+            s_red[warp_id] = lm
         self._bar.arrive_and_wait()
         m = -cutlass.Float32.inf
-        for i in cutlass.range_constexpr(NT):
-            m = cute.arch.fmax(m, s_red[i])
+        for i in cutlass.range_constexpr(NWARP):
+            m = cute.arch.fmax(m, s_red[i])     # NWARP (=4) loads, all threads agree
         self._bar.arrive_and_wait()
 
         # phase 2: local denom + store weight exp(lse-m) per split (single exp)
@@ -318,11 +336,14 @@ class CuteCombine:
             s_wt[s] = w
             ld = ld + w
             s = s + NT
-        s_red[tidx] = ld
+        # WARP_SHFL_COMBINE: warp shuffle sum, 1 smem value per warp, warp0 finalizes.
+        ld = self._warp_sum(ld)                 # every lane in warp -> warp sum
+        if lane == 0:
+            s_red[warp_id] = ld
         self._bar.arrive_and_wait()
         denom = cutlass.Float32(0.0)
-        for i in cutlass.range_constexpr(NT):
-            denom = denom + s_red[i]
+        for i in cutlass.range_constexpr(NWARP):
+            denom = denom + s_red[i]            # NWARP (=4) loads
         inv = cute.arch.rcp_approx(denom) if denom > 0.0 else cutlass.Float32(0.0)
         s = tidx
         while s < NS:
