@@ -1,5 +1,5 @@
 import os, sys
-_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "flash_attention_baseline")
+_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "flash-attention-baseline")
 print(_dir)
 sys.path.insert(0, _dir)
 
