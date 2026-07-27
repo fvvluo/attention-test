@@ -35,7 +35,6 @@ from typing import Callable, Type
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-import cutlass.cute.arch as arch
 import cutlass.pipeline as pipeline
 import cutlass.utils as utils
 from cutlass.cute.nvgpu import cpasync, warp
@@ -68,7 +67,10 @@ _LAUNCH_PLAN_LOCK = threading.Lock()
 _WORKSPACE_CACHE = {}
 _WORKSPACE_LOCK = threading.Lock()
 _WORKSPACE_CACHE_LIMIT = 32
-_LAUNCH_PLAN_CACHE_LIMIT = 32
+# DLPack wrappers retain their Torch owners. A single-entry hot plan preserves
+# steady-state benchmark/one-layer dispatch speed without pinning tens of GiB
+# from completed requests.
+_LAUNCH_PLAN_CACHE_LIMIT = 1
 _WORKSPACE_LAYOUT_VERSION = 5
 _PARTIAL_KERNEL_VERSION = 3
 _COMBINE_KERNEL_VERSION = 3
@@ -87,22 +89,15 @@ class Decode128KWarpMmaPartial:
         num_threads: int = 128,
         is_causal: bool = False,
     ):
-        """Initializes the configuration for a flash attention v2 kernel.
-
-        All contiguous dimensions must be at least 16 bytes aligned which indicates the head dimension
-        should be a multiple of 8.
-
-        :param head_dim: head dimension
-        :type head_dim: int
-        :param m_block_size: m block size
-        :type m_block_size: int
-        :param n_block_size: n block size
-        :type n_block_size: int
-        :param num_threads: number of threads
-        :type num_threads: int
-        :param is_causal: is causal
-        """
-        self._head_dim = head_dim
+        """Create the fixed M16, one-warp split-attention kernel."""
+        if (
+            head_dim != QWEN_HEAD_DIM
+            or m_block_size != 16
+            or n_block_size not in (32, 64)
+            or num_threads != 32
+            or is_causal
+        ):
+            raise ValueError("unsupported fixed warp-HMMA Decode configuration")
         self._m_block_size = m_block_size
         self._n_block_size = n_block_size
         # padding head_dim to a multiple of 32 as k_block_size
@@ -113,53 +108,6 @@ class Decode128KWarpMmaPartial:
         self.cta_sync_barrier = pipeline.NamedBarrier(
             barrier_id=1, num_threads=num_threads
         )
-
-    @staticmethod
-    def can_implement(
-        dtype, head_dim, m_block_size, n_block_size, num_threads, is_causal
-    ) -> bool:
-        """Check if the kernel can be implemented with the given parameters.
-
-        :param dtype: data type
-        :type dtype: cutlass.Numeric
-        :param head_dim: head dimension
-        :type head_dim: int
-        :param m_block_size: m block size
-        :type m_block_size: int
-        :param n_block_size: n block size
-        :type n_block_size: int
-        :param num_threads: number of threads
-        :type num_threads: int
-        :param is_causal: is causal
-        :type is_causal: bool
-
-        :return: True if the kernel can be implemented, False otherwise
-        :rtype: bool
-        """
-        # Check if data type is fp16 or bf16
-        if dtype != cutlass.Float16 and dtype != cutlass.BFloat16:
-            return False
-
-        # Check if head dimension is a multiple of 8
-        if head_dim % 8 != 0:
-            return False
-
-        # Check if number of threads is a multiple of 32
-        if num_threads % 32 != 0:
-            return False
-
-        # Check if block size setting is out of shared memory capacity
-        # Shared memory usage: Q tile + (K tile + V tile) where K and V use the same tile size
-        smem_usage = (m_block_size * head_dim + n_block_size * head_dim * 2) * 2
-        smem_capacity = utils.get_smem_capacity_in_bytes("sm_80")
-        if smem_usage > smem_capacity:
-            return False
-
-        # Check if twice the block size is divisible by the number of threads
-        if (m_block_size * 2) % num_threads != 0:
-            return False
-
-        return True
 
     @cute.jit
     def __call__(
@@ -172,39 +120,23 @@ class Decode128KWarpMmaPartial:
         softmax_scale: cutlass.Float32,
         stream: cuda.CUstream,
     ):
-        """Configures and launches the flash attention v2 kernel.
+        """Launch one CTA per ``(split, KV head)``.
 
-        mQ/mK/mV/mO has same data types(supports fp16 and bf16) and same layout:
-        (batch_size, seqlen_q, num_head, head_dim):(seqlen_q * num_head * head_dim, num_head * head_dim, head_dim, 1)
-
-        Prepares the shared memory layout, tiled copy atoms, tiled mma and shared memory storage.
-        Then launches the kernel function with the prepared parameters.
-
-        :param mQ: query tensor
-        :type mQ: cute.Tensor
-        :param mK: key tensor
-        :type mK: cute.Tensor
-        :param mV: value tensor
-        :type mV: cute.Tensor
-        :param mO: output tensor
-        :type mO: cute.Tensor
-        :param softmax_scale: softmax scale
-        :type softmax_scale: cutlass.Float32
+        Layouts are Q=[ratio,kv,D], K/V=[split,split_len,kv,D],
+        O=[split,ratio,kv,D], and stats=[ratio,split,kv,2].
         """
-        # Get the data type and check if it is fp16 or bf16
         if cutlass.const_expr(
             not (
-                mQ.element_type == mK.element_type == mV.element_type == mO.element_type
+                mQ.element_type
+                == mK.element_type
+                == mV.element_type
+                == mO.element_type
+                == cutlass.BFloat16
             )
         ):
-            raise TypeError("All tensors must have the same data type")
-        if cutlass.const_expr(
-            not (
-                mQ.element_type == cutlass.Float16
-                or mQ.element_type == cutlass.BFloat16
-            )
-        ):
-            raise TypeError("Only Float16 or BFloat16 is supported")
+            raise TypeError("fixed Decode Q/K/V/O must all be BFloat16")
+        if cutlass.const_expr(mStats.element_type != cutlass.Float32):
+            raise TypeError("fixed Decode stats must be Float32")
         self._dtype: Type[cutlass.Numeric] = mQ.element_type
         # ///////////////////////////////////////////////////////////////////////////////
         # Shared memory layout: Q/K/V
@@ -292,7 +224,7 @@ class Decode128KWarpMmaPartial:
             permutation_mnk=(self._num_threads // 32 * 16, 16, 16),
         )
 
-        # grid_dim: (m_block, batch_size, num_head)
+        # grid_dim: (m_block, split_idx, num_head)
         grid_dim = (
             cute.ceil_div(mQ.shape[0], self._m_block_size),
             cute.size(mK.shape[0]),
@@ -337,36 +269,10 @@ class Decode128KWarpMmaPartial:
         tiled_mma: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
     ):
-        """Kernel function for flash attention v2.
-
-        :param mQ: query tensor
-        :type mQ: cute.Tensor
-        :param mK: key tensor
-        :type mK: cute.Tensor
-        :param mV: value tensor
-        :type mV: cute.Tensor
-        :param mO: output tensor
-        :type mO: cute.Tensor
-        :param softmax_scale_log2: softmax scale log2
-        :type softmax_scale_log2: cutlass.Float32
-        :param sQ_layout: query layout
-        :type sQ_layout: cute.ComposedLayout
-        :param sKV_layout: key/value layout
-        :type sKV_layout: cute.ComposedLayout
-        :param sO_layout: output layout
-        :type sO_layout: cute.ComposedLayout
-        :param gmem_tiled_copy_QKV: tiled copy for QKV load
-        :type gmem_tiled_copy_QKV: cute.TiledCopy
-        :param gmem_tiled_copy_O: tiled copy for O store
-        :type gmem_tiled_copy_O: cute.TiledCopy
-        :param tiled_mma: tiled mma
-        :type tiled_mma: cute.TiledMma
-        :param SharedStorage: shared storage
-        :type SharedStorage: cutlass.Constexpr
-        """
+        """Execute the fixed split-KV online-softmax mainloop."""
         # Thread index, block index
         tidx, _, _ = cute.arch.thread_idx()
-        m_block, batch_size, num_head = cute.arch.block_idx()
+        m_block, split_idx, num_head = cute.arch.block_idx()
 
         n_block_max = cute.ceil_div(mK.shape[1], self._n_block_size)
         if self._is_causal:
@@ -390,13 +296,13 @@ class Decode128KWarpMmaPartial:
         )
         # (n_block_size, head_dim, n_block)
         gK = cute.local_tile(
-            mK[batch_size, None, num_head, None],
+            mK[split_idx, None, num_head, None],
             (self._n_block_size, self._head_dim_padded),
             (None, 0),
         )
         # (n_block_size, head_dim, n_block)
         gV = cute.local_tile(
-            mV[batch_size, None, num_head, None],
+            mV[split_idx, None, num_head, None],
             (self._n_block_size, self._head_dim_padded),
             (None, 0),
         )
@@ -487,7 +393,7 @@ class Decode128KWarpMmaPartial:
             (m_block, 0),
         )
         cKV = cute.local_tile(
-            mcKV[batch_size, None, num_head, None],
+            mcKV[split_idx, None, num_head, None],
             (self._n_block_size, self._head_dim_padded),
             (n_block, 0),
         )
@@ -578,7 +484,7 @@ class Decode128KWarpMmaPartial:
             n_block=n_block,
             mQ=mQ,
             mK=mK,
-            batch_size=batch_size,
+            split_idx=split_idx,
             num_head=num_head,
         )
         mma_params = SimpleNamespace(
@@ -678,10 +584,10 @@ class Decode128KWarpMmaPartial:
         for row_idx in cutlass.range_constexpr(cute.size(row_max)):
             row = cLM_thr[(0, row_idx), 0, 0][0]
             if cute.elem_less(row, HEAD_RATIO):
-                mStats[row, batch_size, num_head, 0] = (
+                mStats[row, split_idx, num_head, 0] = (
                     row_max[row_idx] * softmax_scale_log2
                 )
-                mStats[row, batch_size, num_head, 1] = row_sum[row_idx]
+                mStats[row, split_idx, num_head, 1] = row_sum[row_idx]
 
 
         # store acc_O
@@ -706,7 +612,7 @@ class Decode128KWarpMmaPartial:
             taccOsO,
         )
         gO = cute.local_tile(
-            mO[batch_size, None, num_head, None],
+            mO[split_idx, None, num_head, None],
             (self._m_block_size, self._head_dim_padded),
             (m_block, 0),
         )
@@ -725,7 +631,7 @@ class Decode128KWarpMmaPartial:
         )
         mcO = cute.make_identity_tensor(mO.layout.shape)
         cO = cute.local_tile(
-            mcO[batch_size, None, num_head, None],
+            mcO[split_idx, None, num_head, None],
             (self._m_block_size, self._head_dim_padded),
             (m_block, 0),
         )
@@ -1315,12 +1221,16 @@ def _normalize_sm_scale(sm_scale):
         raise TypeError("sm_scale must be a positive finite real number or None")
     try:
         value = float(sm_scale)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         raise TypeError(
             "sm_scale must be a positive finite real number or None"
         ) from exc
     if not math.isfinite(value) or value <= 0.0:
         raise ValueError("sm_scale must be a positive finite real number")
+    # Runtime scalars are Float32. Reject values that would silently round to
+    # zero, as well as values whose internal log2(e) scaling would overflow.
+    if value < 1.401298464324817e-45:
+        raise ValueError("sm_scale is not representable as a positive float32")
     if value > torch.finfo(torch.float32).max / LOG2_E:
         raise ValueError("sm_scale is not representable after log2(e) scaling")
     return value
@@ -1356,26 +1266,28 @@ def _validate_inputs(q, k, v, causal):
             raise ValueError(f"{name} must be 16-byte aligned")
         if tensor.requires_grad:
             raise ValueError("qwen3_decode_attention is forward-only")
-    if torch.cuda.is_current_stream_capturing():
-        raise RuntimeError(
-            "CUDA Graph capture is not supported by this Decode-only API; "
-            "prepare fixed workspace/output separately"
-        )
-    properties = torch.cuda.get_device_properties(q.device)
-    capability = torch.cuda.get_device_capability(q.device)
-    if capability != (9, 0):
-        raise RuntimeError(
-            f"the fixed kernel requires SM90 (H20), got sm_{capability[0]}{capability[1]}"
-        )
-    if "H20" not in properties.name.upper():
-        raise RuntimeError(
-            f"the fixed kernel requires NVIDIA H20, got {properties.name}"
-        )
-    if properties.multi_processor_count != 78:
-        raise RuntimeError(
-            "the fixed kernel targets the 78-SM H20 SKU, got "
-            f"{properties.multi_processor_count} SMs"
-        )
+    with torch.cuda.device(q.device):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "CUDA Graph capture is not supported by this Decode-only API; "
+                "prepare fixed workspace/output separately"
+            )
+        properties = torch.cuda.get_device_properties(q.device)
+        capability = torch.cuda.get_device_capability(q.device)
+        if capability != (9, 0):
+            raise RuntimeError(
+                f"the fixed kernel requires SM90 (H20), "
+                f"got sm_{capability[0]}{capability[1]}"
+            )
+        if "H20" not in properties.name.upper():
+            raise RuntimeError(
+                f"the fixed kernel requires NVIDIA H20, got {properties.name}"
+            )
+        if properties.multi_processor_count != 78:
+            raise RuntimeError(
+                "the fixed kernel targets the 78-SM H20 SKU, got "
+                f"{properties.multi_processor_count} SMs"
+            )
 
 
 def _get_workspace(device, stream_handle, config_name, num_splits):
@@ -1404,6 +1316,9 @@ def _get_workspace(device, stream_handle, config_name, num_splits):
                     dtype=torch.float32,
                     device=device,
                 ),
+                # Prevent two host threads from interleaving the two launches
+                # that share this stream-scoped workspace.
+                "launch_lock": threading.Lock(),
             }
             _WORKSPACE_CACHE[key] = workspace
     return workspace
@@ -1511,16 +1426,17 @@ def _launch_forward(q, k, v, workspace, sm_scale, config_name, values):
                     stream,
                 )
                 _FORWARD_KERNEL_CACHE[key] = compiled
-    compiled(
-        plan["q"],
-        plan["k"],
-        plan["v"],
-        plan["partial"],
-        plan["stats"],
-        output_tensor,
-        sm_scale,
-        stream,
-    )
+    with workspace["launch_lock"]:
+        compiled(
+            plan["q"],
+            plan["k"],
+            plan["v"],
+            plan["partial"],
+            plan["stats"],
+            output_tensor,
+            sm_scale,
+            stream,
+        )
     for tensor in (q, k, v, workspace["o"], workspace["stats"], output):
         tensor.record_stream(torch_stream)
     return output
@@ -1546,10 +1462,13 @@ def qwen3_decode_attention(q, k, v, *, causal=True, sm_scale=None, config="auto"
     contract: both attend all 131072 cached keys.
     """
 
+    import torch
+
     _validate_inputs(q, k, v, causal)
-    scale = _normalize_sm_scale(sm_scale)
-    config_name, values = _resolve_config(config)
-    return _run_decode(q, k, v, scale, config_name, values)
+    with torch.cuda.device(q.device):
+        scale = _normalize_sm_scale(sm_scale)
+        config_name, values = _resolve_config(config)
+        return _run_decode(q, k, v, scale, config_name, values)
 
 
 def qwen3_attention(q, k, v, *, causal=True, sm_scale=None, config="auto"):
@@ -1736,7 +1655,6 @@ def _run_benchmark(args):
             median, _, out = _time_cuda(
                 lambda fn=fn: fn(q, k, v, scale), args.warmup, args.iterations
             )
-            p95 = None
             round_medians[name].append((median, out))
             print(f"  {name}: median={median:.3f} us")
     print("median-of-medians")
