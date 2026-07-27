@@ -31,7 +31,7 @@
 #   [DONE] EXERCISE (2)  Causal n-block skipping        -> skip invisible blocks; mask boundaries only
 #   [DONE] EXERCISE (3)  Warp specialization            -> 128-thread TMA WG + 256-thread MMA WGs
 #   [DONE] EXERCISE (4)  Register redistribution        -> producer 24, MMA consumers 240
-#   [MEDIUM] EXERCISE (5)  Intra-warpgroup overlap      -> QK and PV serialized in one iteration
+#   [DONE] EXERCISE (5)  Intra-warpgroup overlap        -> QK[current] overlaps PV[previous]
 #   [HARD] EXERCISE (6)  Inter-warpgroup ping-pong      -> warp scheduler barriers deleted
 #
 # If you are stuck, refer to https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/flash_fwd_sm90.py.
@@ -91,9 +91,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             "this de-optimized SM90 kernel only supports mma_pv_is_rs=True, "
             "paged_kv_non_tma=False"
         )
-        # EXERCISE (5): intra_wg_overlap is accepted for signature compatibility but ignored.
-        # The mainloop below runs QK and PV back to back inside a single iteration. Is this efficient?
-        self.intra_wg_overlap, self.mma_pv_is_rs = False, mma_pv_is_rs
+        assert intra_wg_overlap, "this optimized kernel requires intra_wg_overlap=True"
+        self.intra_wg_overlap, self.mma_pv_is_rs = intra_wg_overlap, mma_pv_is_rs
         self.use_tma_Q = self.use_tma_O = self.use_tma_KV = True
         self.buffer_align_bytes = 1024
         self.cluster_shape_mn = (1, 1)
@@ -609,7 +608,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         q_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, 1
         )
-        kv_consumer_state = pipeline.make_pipeline_state(
+        k_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, self.num_stages
+        )
+        v_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_stages
         )
         softmax = Softmax.create(
@@ -666,30 +668,29 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 q_consumer_state, pipeline_q.consumer_try_wait(q_consumer_state)
             )
 
-            # EXERCISE (5) remains serialized within the consumer stream. Exercise 2
-            # passes a compile-time switch so fully-valid blocks skip mask predicates.
-            kv_consumer_state = self.compute_one_n_block(
+            # Exercise 5 prologue: produce P for the first block but defer its PV.
+            k_consumer_state = self.compute_first_qk(
                 n_block_max - 1,
                 pipeline_k,
-                pipeline_v,
-                kv_consumer_state,
+                k_consumer_state,
                 mma_qk_fn,
-                mma_pv_fn,
-                acc_O,
                 tOrP,
                 softmax,
                 mask_fn,
                 apply_mask=True,
-                is_first=True,
             )
-            for n_tile in cutlass.range(n_block_max - 1, unroll=1):
-                n_block = n_block_max - 2 - n_tile
+
+            # Steady state: QK[current] is the older WGMMA group and PV[previous]
+            # is the newer group. The first PV initializes acc_O; later PVs accumulate.
+            if n_block_max > 1:
+                n_block = n_block_max - 2
                 if n_block >= n_block_mask_start:
-                    kv_consumer_state = self.compute_one_n_block(
+                    k_consumer_state, v_consumer_state = self.compute_overlapped_block(
                         n_block,
                         pipeline_k,
                         pipeline_v,
-                        kv_consumer_state,
+                        k_consumer_state,
+                        v_consumer_state,
                         mma_qk_fn,
                         mma_pv_fn,
                         acc_O,
@@ -697,14 +698,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         softmax,
                         mask_fn,
                         apply_mask=True,
-                        is_first=False,
+                        is_first_pv=True,
                     )
                 else:
-                    kv_consumer_state = self.compute_one_n_block(
+                    k_consumer_state, v_consumer_state = self.compute_overlapped_block(
                         n_block,
                         pipeline_k,
                         pipeline_v,
-                        kv_consumer_state,
+                        k_consumer_state,
+                        v_consumer_state,
                         mma_qk_fn,
                         mma_pv_fn,
                         acc_O,
@@ -712,8 +714,59 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         softmax,
                         mask_fn,
                         apply_mask=False,
-                        is_first=False,
+                        is_first_pv=True,
                     )
+
+            for n_tile in cutlass.range(cutlass.max(n_block_max - 2, 0), unroll=1):
+                n_block = n_block_max - 3 - n_tile
+                if n_block >= n_block_mask_start:
+                    k_consumer_state, v_consumer_state = self.compute_overlapped_block(
+                        n_block,
+                        pipeline_k,
+                        pipeline_v,
+                        k_consumer_state,
+                        v_consumer_state,
+                        mma_qk_fn,
+                        mma_pv_fn,
+                        acc_O,
+                        tOrP,
+                        softmax,
+                        mask_fn,
+                        apply_mask=True,
+                        is_first_pv=False,
+                    )
+                else:
+                    k_consumer_state, v_consumer_state = self.compute_overlapped_block(
+                        n_block,
+                        pipeline_k,
+                        pipeline_v,
+                        k_consumer_state,
+                        v_consumer_state,
+                        mma_qk_fn,
+                        mma_pv_fn,
+                        acc_O,
+                        tOrP,
+                        softmax,
+                        mask_fn,
+                        apply_mask=False,
+                        is_first_pv=False,
+                    )
+
+            # Epilogue: the last P fragment has no following QK iteration to carry it.
+            if n_block_max == 1:
+                v_consumer_state = self.flush_last_pv(
+                    pipeline_v,
+                    v_consumer_state,
+                    mma_pv_fn,
+                    zero_init=True,
+                )
+            else:
+                v_consumer_state = self.flush_last_pv(
+                    pipeline_v,
+                    v_consumer_state,
+                    mma_pv_fn,
+                    zero_init=False,
+                )
 
             # Normalize acc_O by row_sum and compute the lse.
             softmax.rescale_O(acc_O, softmax.finalize())
@@ -743,12 +796,39 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             work_tile = tile_scheduler.get_current_work()
 
     @cute.jit
-    def compute_one_n_block(
+    def compute_first_qk(
+        self,
+        n_block: Int32,
+        pipeline_k: pipeline.PipelineAsync,
+        k_consumer_state,
+        mma_qk_fn: Callable,
+        tOrP: cute.Tensor,
+        softmax: Softmax,
+        mask_fn: Callable,
+        apply_mask: cutlass.Constexpr,
+    ):
+        """Compute the first score tile and retain P in registers for the next iteration."""
+        pipeline_k.consumer_wait(
+            k_consumer_state, pipeline_k.consumer_try_wait(k_consumer_state)
+        )
+        acc_S = mma_qk_fn(B_idx=k_consumer_state.index, wg_wait=0)
+        pipeline_k.consumer_release(k_consumer_state)
+        k_consumer_state.advance()
+
+        if const_expr(apply_mask):
+            mask_fn(acc_S=acc_S, n_block=n_block)
+        softmax.online_softmax(acc_S, is_first=True)
+        utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), tOrP)
+        return k_consumer_state
+
+    @cute.jit
+    def compute_overlapped_block(
         self,
         n_block: Int32,
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
-        kv_consumer_state,
+        k_consumer_state,
+        v_consumer_state,
         mma_qk_fn: Callable,
         mma_pv_fn: Callable,
         acc_O: cute.Tensor,
@@ -756,39 +836,62 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         softmax: Softmax,
         mask_fn: Callable,
         apply_mask: cutlass.Constexpr,
-        is_first: cutlass.Constexpr = False,
+        is_first_pv: cutlass.Constexpr,
     ):
-        """Consume K/V[n], then run serialized QK, softmax, and PV."""
-        # ---- S = Q @ K.T ------------------------------------------------------------
-        # EXERCISE (5): warp_scheduler_barrier_sync() is still absent here.
-        pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
-        # wg_wait=0: block on the QK gemm immediately instead of leaving it in flight.
-        acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
-        pipeline_k.consumer_release(kv_consumer_state)
+        """Overlap QK[current], softmax[current], and PV[previous]."""
+        # QK is committed first so wait_group(1) below makes its accumulator visible
+        # while leaving the newer PV group eligible to execute asynchronously.
+        pipeline_k.consumer_wait(
+            k_consumer_state, pipeline_k.consumer_try_wait(k_consumer_state)
+        )
+        acc_S = mma_qk_fn(B_idx=k_consumer_state.index, wg_wait=-1)
 
-        # ---- softmax ----------------------------------------------------------------
-        # EXERCISE (2): boundary blocks mask causal/seqlen residue. Fully-valid
-        # blocks skip this whole region at compile time.
+        pipeline_v.consumer_wait(
+            v_consumer_state, pipeline_v.consumer_try_wait(v_consumer_state)
+        )
+        mma_pv_fn(
+            B_idx=v_consumer_state.index,
+            zero_init=is_first_pv,
+            wg_wait=1,
+        )
+        pipeline_k.consumer_release(k_consumer_state)
+        k_consumer_state.advance()
+
+        # QK is complete, but PV can remain in flight while mask, exp, and row
+        # reductions consume acc_S on the CUDA cores/SFU.
         if const_expr(apply_mask):
             mask_fn(acc_S=acc_S, n_block=n_block)
-        if const_expr(is_first):
-            # row_scale unused: the PV gemm below writes acc_O instead of accumulating.
-            softmax.online_softmax(acc_S, is_first=True)
-            utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), tOrP)
-        else:
-            row_scale = softmax.online_softmax(acc_S, check_inf=True)
-            utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), tOrP)
-            # Must happen before the PV gemm accumulates into acc_O.
-            softmax.rescale_O(acc_O, row_scale)
+        row_scale = softmax.online_softmax(acc_S, check_inf=True)
 
-        # ---- O += P @ V -------------------------------------------------------------
-        # EXERCISE (5): warp_scheduler_barrier_arrive() is still absent here.
-        pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
-        mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=is_first, wg_wait=0)
-        pipeline_v.consumer_release(kv_consumer_state)
-        kv_consumer_state.advance()
+        # acc_O and tOrP are PV destinations/source operands, so neither may be
+        # modified until the outstanding PV has consumed P and updated O.
+        warpgroup.wait_group(0)
+        pipeline_v.consumer_release(v_consumer_state)
+        v_consumer_state.advance()
+        softmax.rescale_O(acc_O, row_scale)
+        utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), tOrP)
+        return k_consumer_state, v_consumer_state
 
-        return kv_consumer_state
+    @cute.jit
+    def flush_last_pv(
+        self,
+        pipeline_v: pipeline.PipelineAsync,
+        v_consumer_state,
+        mma_pv_fn: Callable,
+        zero_init: cutlass.Constexpr,
+    ):
+        """Consume the final deferred P/V tile after the QK loop is exhausted."""
+        pipeline_v.consumer_wait(
+            v_consumer_state, pipeline_v.consumer_try_wait(v_consumer_state)
+        )
+        mma_pv_fn(
+            B_idx=v_consumer_state.index,
+            zero_init=zero_init,
+            wg_wait=0,
+        )
+        pipeline_v.consumer_release(v_consumer_state)
+        v_consumer_state.advance()
+        return v_consumer_state
 
 
 # ---------------------------------------------------------------------------
@@ -860,7 +963,7 @@ def attention(q, k, v, causal=True, sm_scale=None):
             num_stages=2,
             num_threads=256,
             Q_in_regs=False,
-            intra_wg_overlap=False,
+            intra_wg_overlap=True,
             mma_pv_is_rs=True,
         )
         compiled = cute.compile(
