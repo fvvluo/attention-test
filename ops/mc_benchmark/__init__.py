@@ -1,1 +1,1 @@
-from benchmark import benchmark_kernel
+from mc_benchmark.benchmark import benchmark_kernel
