@@ -78,6 +78,14 @@ CONFIGS = {
         "num_stages": 1,
         "num_workers": 72,
     },
+    "wgmma-s9-n256-st1-w72-t160": {
+        "num_splits": 9,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 72,
+        "num_threads": 160,
+        "compact_roles": True,
+    },
     "wgmma-s18-n256-st1-w72": {
         "num_splits": 18,
         "block_n": 256,
@@ -397,7 +405,9 @@ class FlashDecodeKernel:
         num_k_stages: int = NUM_STAGES,
         num_v_stages: int = NUM_STAGES,
         num_workers: int = 78,
+        num_threads: int = NUM_THREADS,
         balanced_heads: bool = False,
+        compact_roles: bool = False,
         sm_scale: float = 1.0 / math.sqrt(HEAD_DIM),
     ):
         if kv_heads * self.GROUP_M != q_heads:
@@ -411,10 +421,11 @@ class FlashDecodeKernel:
         self.num_splits = num_splits
         self.num_workers = num_workers
         self.balanced_heads = balanced_heads
+        self.compact_roles = compact_roles
         self.BLOCK_N = block_n
         self.K_STAGES = num_k_stages
         self.V_STAGES = num_v_stages
-        self.NUM_THREADS = NUM_THREADS
+        self.NUM_THREADS = num_threads
         self.scale_log2 = sm_scale * math.log2(math.e)
 
     @cute.jit
@@ -627,9 +638,15 @@ class FlashDecodeKernel:
         if cutlass.const_expr(self.balanced_heads):
             num_items = self.num_workers
 
-        if warp_idx < 4:
-            # ------------------------- producer (warp 0 only) -------------------------
-            if warp_idx == 0:
+        producer_warp = 0
+        is_producer = warp_idx < 4
+        if cutlass.const_expr(self.compact_roles):
+            # WGMMA consumers must occupy an aligned four-warp group (warps 0..3).
+            producer_warp = 4
+            is_producer = warp_idx == producer_warp
+        if is_producer:
+            # ------------------------- producer warp -------------------------
+            if warp_idx == producer_warp:
                 producer_state_k = pipeline.make_pipeline_state(
                     pipeline.PipelineUserType.Producer, self.K_STAGES
                 )
@@ -701,6 +718,8 @@ class FlashDecodeKernel:
         else:
             # ------------------------- consumer -------------------------
             tidx2 = tidx - 128
+            if cutlass.const_expr(self.compact_roles):
+                tidx2 = tidx
             lane = tidx2 % 32
             warp_in_wg = tidx2 // 32
 
@@ -1153,7 +1172,9 @@ def _get_compiled(plan, output_tensor, stream, device, scale, config_name, value
                     num_k_stages=values.get("num_k_stages", values["num_stages"]),
                     num_v_stages=values.get("num_v_stages", values["num_stages"]),
                     num_workers=values["num_workers"],
+                    num_threads=values.get("num_threads", NUM_THREADS),
                     balanced_heads=values.get("balanced_heads", False),
+                    compact_roles=values.get("compact_roles", False),
                     sm_scale=scale,
                 )
                 compiled = cute.compile(
