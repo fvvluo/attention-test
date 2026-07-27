@@ -16,8 +16,8 @@ from datetime import datetime
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = SCRIPT_DIR
 
-CSV_FILENAME = os.path.join(os.dirname(SCRIPT_DIR), "attention_leaderboard.csv")
-LOG_FILENAME = os.path.join(os.dirname(SCRIPT_DIR), "attn_sentinel.log")
+CSV_FILENAME = os.path.join(os.path.dirname(SCRIPT_DIR), "attention_leaderboard.csv")
+LOG_FILENAME = os.path.join(os.path.dirname(SCRIPT_DIR), "attn_sentinel.log")
 
 POLL_INTERVAL_SECONDS = 60
 
