@@ -59,6 +59,55 @@ NUM_THREADS = 256  # one producer warpgroup + one consumer warpgroup
 LOG2_E = 1.4426950408889634074
 
 CONFIGS = {
+    "wgmma-balanced-n256-st1-w78": {
+        "num_splits": 10,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 78,
+        "balanced_heads": True,
+    },
+    "wgmma-s8-n256-st1-w64": {
+        "num_splits": 8,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 64,
+    },
+    "wgmma-s9-n256-st1-w72": {
+        "num_splits": 9,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 72,
+    },
+    "wgmma-s18-n256-st1-w72": {
+        "num_splits": 18,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 72,
+    },
+    "wgmma-s19-n256-st1-w76": {
+        "num_splits": 19,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 76,
+    },
+    "wgmma-s19-n256-st1-w78": {
+        "num_splits": 19,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 78,
+    },
+    "wgmma-s38-n256-st1-w76": {
+        "num_splits": 38,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 76,
+    },
+    "wgmma-s39-n256-st1-w78": {
+        "num_splits": 39,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 78,
+    },
     "wgmma-s8-n128-st2-w64": {
         "num_splits": 8,
         "block_n": 128,
@@ -348,6 +397,7 @@ class FlashDecodeKernel:
         num_k_stages: int = NUM_STAGES,
         num_v_stages: int = NUM_STAGES,
         num_workers: int = 78,
+        balanced_heads: bool = False,
         sm_scale: float = 1.0 / math.sqrt(HEAD_DIM),
     ):
         if kv_heads * self.GROUP_M != q_heads:
@@ -360,6 +410,7 @@ class FlashDecodeKernel:
         self.batch = batch
         self.num_splits = num_splits
         self.num_workers = num_workers
+        self.balanced_heads = balanced_heads
         self.BLOCK_N = block_n
         self.K_STAGES = num_k_stages
         self.V_STAGES = num_v_stages
@@ -573,6 +624,8 @@ class FlashDecodeKernel:
         tiles_total = self.kv_len // self.BLOCK_N
 
         num_items = self.num_splits * self.kv_heads * self.batch
+        if cutlass.const_expr(self.balanced_heads):
+            num_items = self.num_workers
 
         if warp_idx < 4:
             # ------------------------- producer (warp 0 only) -------------------------
@@ -584,11 +637,23 @@ class FlashDecodeKernel:
                     pipeline.PipelineUserType.Producer, self.V_STAGES
                 )
                 for item in cutlass.range(worker, num_items, self.num_workers, unroll=1):
-                    kv_head = (item // self.batch) % self.kv_heads
-                    split = item // (self.batch * self.kv_heads)
-                    batch = item % self.batch
-                    tile_beg = split * tiles_total // self.num_splits
-                    tile_end = (split + 1) * tiles_total // self.num_splits
+                    if cutlass.const_expr(self.balanced_heads):
+                        kv_head = worker // 10
+                        split = worker % 10
+                        head_splits = 10
+                        if worker >= 60:
+                            kv_head = 6 + (worker - 60) // 9
+                            split = (worker - 60) % 9
+                            head_splits = 9
+                        batch = 0
+                        tile_beg = split * tiles_total // head_splits
+                        tile_end = (split + 1) * tiles_total // head_splits
+                    else:
+                        kv_head = (item // self.batch) % self.kv_heads
+                        split = item // (self.batch * self.kv_heads)
+                        batch = item % self.batch
+                        tile_beg = split * tiles_total // self.num_splits
+                        tile_end = (split + 1) * tiles_total // self.num_splits
                     n_tiles = tile_end - tile_beg
                     gK = cute.local_tile(
                         mK[None, None, (kv_head, batch)],
@@ -687,11 +752,23 @@ class FlashDecodeKernel:
                 pipeline.PipelineUserType.Consumer, self.V_STAGES
             )
             for item in cutlass.range(worker, num_items, self.num_workers, unroll=1):
-                kv_head = (item // self.batch) % self.kv_heads
-                split = item // (self.batch * self.kv_heads)
-                batch = item % self.batch
-                tile_beg = split * tiles_total // self.num_splits
-                tile_end = (split + 1) * tiles_total // self.num_splits
+                if cutlass.const_expr(self.balanced_heads):
+                    kv_head = worker // 10
+                    split = worker % 10
+                    head_splits = 10
+                    if worker >= 60:
+                        kv_head = 6 + (worker - 60) // 9
+                        split = (worker - 60) % 9
+                        head_splits = 9
+                    batch = 0
+                    tile_beg = split * tiles_total // head_splits
+                    tile_end = (split + 1) * tiles_total // head_splits
+                else:
+                    kv_head = (item // self.batch) % self.kv_heads
+                    split = item // (self.batch * self.kv_heads)
+                    batch = item % self.batch
+                    tile_beg = split * tiles_total // self.num_splits
+                    tile_end = (split + 1) * tiles_total // self.num_splits
                 n_tiles = tile_end - tile_beg
 
                 if not _DBG_SKIP_QCOPY:
@@ -856,7 +933,12 @@ class FlashDecodeKernel:
             cutlass.Float32, cute.make_layout(self.num_splits), 16
         )
         for idx in cutlass.range(tidx, self.num_splits, 128):
-            lse_buf[idx] = mLSE[idx, kv_head, g, batch]
+            if cutlass.const_expr(self.balanced_heads):
+                lse_buf[idx] = -cutlass.Float32.inf
+                if idx < 9 or kv_head < 6:
+                    lse_buf[idx] = mLSE[idx, kv_head, g, batch]
+            else:
+                lse_buf[idx] = mLSE[idx, kv_head, g, batch]
         cute.arch.barrier()
 
         # num_splits is a compile-time constant: fully unroll for ILP.
@@ -870,7 +952,15 @@ class FlashDecodeKernel:
             denom += ws[s]
         acc = cutlass.Float32(0.0)
         for s in cutlass.range_constexpr(self.num_splits):
-            acc += ws[s] * cutlass.Float32(mOpart[s, kv_head, g, tidx, batch])
+            if cutlass.const_expr(self.balanced_heads):
+                if s < 9 or kv_head < 6:
+                    acc += ws[s] * cutlass.Float32(
+                        mOpart[s, kv_head, g, tidx, batch]
+                    )
+            else:
+                acc += ws[s] * cutlass.Float32(
+                    mOpart[s, kv_head, g, tidx, batch]
+                )
         inv = 0.0 if denom == 0.0 or denom != denom else cute.arch.rcp_approx(denom)
         mO[q_head, tidx, batch] = cutlass.BFloat16(acc * inv)
 
@@ -1063,6 +1153,7 @@ def _get_compiled(plan, output_tensor, stream, device, scale, config_name, value
                     num_k_stages=values.get("num_k_stages", values["num_stages"]),
                     num_v_stages=values.get("num_v_stages", values["num_stages"]),
                     num_workers=values["num_workers"],
+                    balanced_heads=values.get("balanced_heads", False),
                     sm_scale=scale,
                 )
                 compiled = cute.compile(
