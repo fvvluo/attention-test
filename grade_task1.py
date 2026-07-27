@@ -24,7 +24,8 @@ LOG_FILENAME = os.path.join(SCRIPT_DIR, "attn_sentinel.log")
 POLL_INTERVAL_SECONDS = 60
 BENCH_CMD = (
     "python3 bench_attention.py --gpu {gpu} --shapes 1x64x8x131072x128 "
-    "--dtype bf16 --causal --warmup 10 --iters 10"
+    "--dtype bf16 --causal --prefill-warmup 10 --prefill-iters 10 "
+    "--decode-warmup 100 --decode-iters 100"
 )
 
 # Fallback baselines

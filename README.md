@@ -12,18 +12,43 @@
 （如 `--gpu 3`）再运行：
 
 ```bash
-python3 bench_attention.py --shapes 1x64x8x131072x128 --dtype bf16 --causal --warmup 10 --iters 10
+python3 bench_attention.py --shapes 1x64x8x131072x128 --dtype bf16 --causal \
+    --prefill-warmup 10 --prefill-iters 10 --decode-warmup 100 --decode-iters 100
 ```
 
 - `--shapes 1x64x8x131072x128`：GQA，`batch=1, q_heads=64, kv_heads=8,
   seq_len=131072（128K）, head_dim=128`；
 - `--dtype bf16`；
 - `--causal`：开启因果掩码（当前默认值就是开启，这里显式指定）；
-- `--warmup 10 --iters 10`：10 次预热 + 10 次正式计时。
+- `--prefill-warmup 10 --prefill-iters 10`：prefill 阶段 10 次预热 + 10 次正式计时。
+- `--decode-warmup 100 --decode-iters 100`：decode 阶段单独用 100 次预热 +
+  100 次正式计时。decode 单次耗时极小（毫秒级），用更多次数降低测量噪声、
+  提高分数稳定性；由于总耗时几乎全部来自 prefill，decode 加到 100 对总时间
+  影响可忽略（约 +1%）。
+- `--prefill-* / --decode-*` 是阶段专用参数；未指定时会回落到全局
+  `--warmup / --iters`（默认 5 / 20）。
 - 序列长度 128K 属于长序列场景，prefill 阶段单次前向本身就要几秒，加上
   20 次调用（10 warmup + 10 iters），baseline 部分预计要跑数分钟，运行期间
   终端不会有中间输出，是正常现象（可另开窗口用 `nvidia-smi` 确认 GPU
   利用率来判断是否仍在计算，而非卡死）。
+
+## 📊 参考评分（score）
+
+评价大家算子性能的参考 score 计算方式如下：
+
+```
+score = (prefill 加速比 / 2) + (decode 加速比 / 35)
+```
+
+其中：
+
+- **prefill 加速比** = `baseline prefill 耗时 / 你的算子 prefill 耗时`（即输出表格里
+  prefill 阶段 `vs baseline` 列对应的倍数）；
+- **decode 加速比** = `baseline decode 耗时 / 你的算子 decode 耗时`；
+- 两个加速比越大越好；除以 `2` 和 `35` 是为了把两个阶段的量级归一化后再相加，
+  最终 score 越高越好。
+- **正确性必须先 PASS**：正确性 FAIL 的算子，速度再快也不计分（一个啥都不算的
+  空算子也能显示"快 10x"，所以先保证对、再谈快）。
 
 ## 目录结构
 
@@ -105,6 +130,19 @@ ops/
 > 自动扫描注册，避免和你自己接入的算子一起被跑到），里面是一个纯 PyTorch 实现的
 > online-softmax（分块流式 softmax）版 FlashAttention，展示了算法的核心思路；
 > 也可以直接从 `ops/_template.py` 复制起手，里面已经写好了接入步骤的注释。
+
+> **遇到 import 问题时（例如无法 `import flash_attn.cute`）**：如果没遇到可以忽略
+> 这一条。如果你基于 `flash-attention-baseline` 修改，且出现 import 失败，可以把
+> 下面这段代码放到算子文件开头，手动把 baseline 目录加入搜索路径：
+>
+> ```python
+> import os, sys
+> _dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "flash-attention-baseline")
+> sys.path.insert(0, _dir)
+> ```
+>
+> 其中 `_dir` 为项目根目录下 `flash-attention-baseline` 的路径，应根据你的算子
+> 文件实际所在位置调整（上例假设算子文件在 `ops/` 下，需向上两级到项目根目录）。
 
 ### 如果用 C++ / CUDA 扩展实现算子
 
@@ -289,8 +327,12 @@ python bench_attention.py --gpu 0 --phases decode
 | `--gpu` | 指定使用的 GPU 卡号（必填；多人共享一台机器时用来分卡，避免抢占同一张卡） | 无，必须显式指定 |
 | `--dtype` | 计算数据类型，可选 `fp16` / `bf16` | `fp16` |
 | `--causal` / `--no-causal` | 是否使用因果掩码（只看当前位置及之前的 token） | 开启 |
-| `--warmup` | 正式计时前的 warmup 迭代次数 | `5` |
-| `--iters` | 正式计时的迭代次数，取平均耗时 | `20` |
+| `--warmup` | 全局 warmup 迭代次数（阶段未单独指定时使用） | `5` |
+| `--iters` | 全局计时迭代次数，取平均耗时（阶段未单独指定时使用） | `20` |
+| `--prefill-warmup` | prefill 阶段单独的 warmup 次数；不指定时回落到 `--warmup` | 回落到 `--warmup` |
+| `--prefill-iters` | prefill 阶段单独的计时迭代次数；不指定时回落到 `--iters` | 回落到 `--iters` |
+| `--decode-warmup` | decode 阶段单独的 warmup 次数；不指定时回落到 `--warmup` | 回落到 `--warmup` |
+| `--decode-iters` | decode 阶段单独的计时迭代次数；不指定时回落到 `--iters` | 回落到 `--iters` |
 | `--check-only` | 只做正确性校验，跳过性能测速 | 关闭 |
 | `--phases` | 要跑的阶段，逗号分隔，可选 `prefill` / `decode` | `prefill,decode` |
 
