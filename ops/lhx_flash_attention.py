@@ -29,7 +29,7 @@
 #
 #   [EASY] EXERCISE (1)  LPT tile scheduling            -> plain SingleTileScheduler
 #   [EASY] EXERCISE (2)  Causal n-block skipping        -> every KV block is visited and masked
-#   [MEDIUM] EXERCISE (3)  Warp specialization          -> one merged 256-thread mainloop
+#   [DONE] EXERCISE (3)  Warp specialization            -> 128-thread TMA WG + 256-thread MMA WGs
 #   [EASY] EXERCISE (4)  Register redistribution        -> setmaxnreg calls deleted
 #   [MEDIUM] EXERCISE (5)  Intra-warpgroup overlap      -> QK and PV serialized in one iteration
 #   [HARD] EXERCISE (6)  Inter-warpgroup ping-pong      -> warp scheduler barriers deleted
@@ -219,17 +219,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.num_wg_mma = self.num_mma_threads // self.num_threads_per_warp_group
         assert self.num_wg_mma == 2
 
-        # EXERCISE (3): no warp specialization.
-        # The same threads that run the WGMMAs also issue the TMA loads, sharing a single program counter.
-        # How does adding warp specialization impact performance?
-        self.num_threads = self.num_mma_threads
-        self.num_producer_threads = 32  # one warp still elects to issue the TMAs
-        self.num_Q_load_threads = self.num_threads_per_warp_group
+        # Warp specialization: one 128-thread producer warpgroup followed by the two
+        # 128-thread WGMMA consumer warpgroups. Only warp 0 issues TMA instructions, but
+        # keeping a complete producer warpgroup preserves WGMMA warpgroup alignment.
+        self.num_producer_threads = self.num_threads_per_warp_group
+        self.num_threads = self.num_producer_threads + self.num_mma_threads
+        self.num_Q_load_threads = self.num_producer_threads
         self.num_epilogue_threads = self.num_mma_threads
 
-        # EXERCISE (4): the num_mma_regs / num_producer_regs table is gone. Without warp
-        # specialization there is nobody to donate registers to, so every thread keeps the
-        # compiler's default allocation out of the 65536-register file.
+        # EXERCISE (4): register redistribution is still deliberately disabled. The
+        # producer and consumer warpgroups retain the compiler's default allocation.
         self._setup_attributes()
 
         self.sQ_layout, self.sK_layout, self.sV_layout, self.sO_layout = [
@@ -350,10 +349,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         smem = cutlass.utils.SmemAllocator()
         storage = smem.allocate(SharedStorage)
 
-        # The pipelines survive the removal of warp specialization: the producer group is
-        # still a single elected thread (warp 0), but it is now one of the 8 consumer warps
-        # rather than a separate warpgroup. Producer and consumer states therefore advance
-        # in lockstep and the pipeline never runs ahead.
+        # Warp 0 in the producer warpgroup elects one TMA issuer; the two consumer
+        # warpgroups independently wait on and release the shared-memory stages.
         ThreadCooperativeGroup = partial(pipeline.CooperativeGroup, pipeline.Agent.Thread)
         tma_warp = ThreadCooperativeGroup(1)
         mma_warps = ThreadCooperativeGroup(self.num_mma_threads // cute.arch.WARP_SIZE)
@@ -395,38 +392,51 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
-        # EXERCISE (3): a single entry point for all 256 threads. There is no
-        # `if warp_idx < 4: load(...) else: mma(...)` split and no setmaxregister pair.
+        # Producer WG0 and consumer WG1/WG2 follow independent instruction streams.
+        # The tiled MMA sees a consumer-local thread index in [0, 256), while role
+        # selection and the TMA-O epilogue continue to use the global warp index.
         tidx, _, _ = cute.arch.thread_idx()
-        self.mainloop(
-            tiled_mma_qk,
-            tiled_mma_pv,
-            mQ,
-            mK,
-            mV,
-            mO,
-            mLSE,
-            sQ,
-            sK,
-            sV,
-            sVt,
-            sO,
-            tma_atom_Q,
-            tma_atom_K,
-            tma_atom_V,
-            tma_atom_O,
-            pipeline_q,
-            pipeline_k,
-            pipeline_v,
-            gmem_tiled_copy_O,
-            tidx,
-            warp_idx,
-            softmax_scale_log2,
-            softmax_scale,
-            SeqlenInfoCls,
-            AttentionMaskCls,
-            TileSchedulerCls,
-        )
+        if warp_idx < self.num_producer_threads // cute.arch.WARP_SIZE:
+            if warp_idx == 0:
+                self.load_mainloop(
+                    mQ,
+                    mK,
+                    mV,
+                    sQ,
+                    sK,
+                    sV,
+                    tma_atom_Q,
+                    tma_atom_K,
+                    tma_atom_V,
+                    pipeline_q,
+                    pipeline_k,
+                    pipeline_v,
+                    SeqlenInfoCls,
+                    TileSchedulerCls,
+                )
+        else:
+            consumer_tidx = tidx - self.num_producer_threads
+            self.compute_mainloop(
+                tiled_mma_qk,
+                tiled_mma_pv,
+                mO,
+                mLSE,
+                sQ,
+                sK,
+                sVt,
+                sO,
+                tma_atom_O,
+                pipeline_q,
+                pipeline_k,
+                pipeline_v,
+                gmem_tiled_copy_O,
+                consumer_tidx,
+                softmax_scale_log2,
+                softmax_scale,
+                SeqlenInfoCls,
+                AttentionMaskCls,
+                TileSchedulerCls,
+            )
 
     @cute.jit
     def load_KV(
@@ -441,38 +451,121 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_kv.producer_commit(producer_state)
 
     @cute.jit
-    def mainloop(
+    def load_mainloop(
         self,
-        tiled_mma_qk: cute.TiledMma,
-        tiled_mma_pv: cute.TiledMma,
         mQ: cute.Tensor,
         mK: cute.Tensor,
         mV: cute.Tensor,
+        sQ: cute.Tensor,
+        sK: cute.Tensor,
+        sV: cute.Tensor,
+        tma_atom_Q: cute.CopyAtom,
+        tma_atom_K: cute.CopyAtom,
+        tma_atom_V: cute.CopyAtom,
+        pipeline_q: pipeline.PipelineAsync,
+        pipeline_k: pipeline.PipelineAsync,
+        pipeline_v: pipeline.PipelineAsync,
+        SeqlenInfoCls: Callable,
+        TileSchedulerCls: Callable,
+    ):
+        """Producer-only TMA loop for Q, K, and V."""
+        q_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, 1
+        )
+        kv_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.num_stages
+        )
+
+        tile_scheduler = TileSchedulerCls()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            m_block, head_idx, batch_idx, _ = work_tile.tile_idx
+            seqlen = SeqlenInfoCls(batch_idx)
+            head_idx_kv = head_idx // self.qhead_per_kvhead
+
+            gQ = cute.local_tile(
+                mQ[None, None, head_idx, batch_idx],
+                (self.tile_m, self.tile_hdim),
+                (m_block, 0),
+            )
+            load_Q, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
+            )
+            gK = cute.local_tile(
+                mK[None, None, head_idx_kv, batch_idx],
+                (self.tile_n, self.tile_hdim),
+                (None, 0),
+            )
+            gV = cute.local_tile(
+                mV[None, None, head_idx_kv, batch_idx],
+                (self.tile_n, self.tile_hdimv),
+                (None, 0),
+            )
+            tma_load_K, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_K, 0, cute.make_layout(1), gK, sK
+            )
+            tma_load_V, _, _ = copy_utils.tma_get_copy_fn(
+                tma_atom_V, 0, cute.make_layout(1), gV, sV
+            )
+            load_K = partial(
+                self.load_KV,
+                copy_utils.tma_producer_copy_fn(tma_load_K, pipeline_k),
+                pipeline_k,
+            )
+            load_V = partial(
+                self.load_KV,
+                copy_utils.tma_producer_copy_fn(tma_load_V, pipeline_v),
+                pipeline_v,
+            )
+
+            pipeline_q.producer_acquire(q_producer_state)
+            load_Q(
+                tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(
+                    q_producer_state.index
+                )
+            )
+            q_producer_state.advance()
+
+            n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+            for n_tile in cutlass.range(n_block_max, unroll=1):
+                n_block = n_block_max - 1 - n_tile
+                load_K(n_block, kv_producer_state)
+                load_V(n_block, kv_producer_state)
+                kv_producer_state.advance()
+
+            tile_scheduler.prefetch_next_work()
+            tile_scheduler.advance_to_next_work()
+            work_tile = tile_scheduler.get_current_work()
+
+        pipeline_q.producer_tail(q_producer_state)
+        pipeline_k.producer_tail(kv_producer_state.clone())
+        pipeline_v.producer_tail(kv_producer_state)
+
+    @cute.jit
+    def compute_mainloop(
+        self,
+        tiled_mma_qk: cute.TiledMma,
+        tiled_mma_pv: cute.TiledMma,
         mO: cute.Tensor,
         mLSE: Optional[cute.Tensor],
         sQ: cute.Tensor,
         sK: cute.Tensor,
-        sV: cute.Tensor,
         sVt: cute.Tensor,
         sO: cute.Tensor,
-        tma_atom_Q: cute.CopyAtom,
-        tma_atom_K: cute.CopyAtom,
-        tma_atom_V: cute.CopyAtom,
         tma_atom_O: cute.CopyAtom,
         pipeline_q: pipeline.PipelineAsync,
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
         gmem_tiled_copy_O: cute.TiledCopy,
         tidx: Int32,
-        warp_idx: Int32,
         softmax_scale_log2: Float32,
         softmax_scale: Optional[Float32],
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
     ):
-        """Loads and computes in one instruction stream, one N block at a time."""
-        # tidx runs 0..255 now (no producer warpgroup to subtract off).
+        """Consumer-only QK, softmax, PV, and epilogue loop."""
+        # tidx is local to the two consumer warpgroups and runs from 0 to 255.
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         wg_thread_layout = cute.make_layout(
             self.num_wg_mma, stride=self.num_threads_per_warp_group
@@ -496,10 +589,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # having warpgroup 1 arrive on NamedBarrierFwd.WarpSchedulerWG1. Both MMA
         # warpgroups now issue their WGMMAs whenever the hardware warp scheduler pleases.
 
-        q_producer_phase = Int32(1)
-        q_consumer_phase = Int32(0)
-        kv_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.num_stages
+        q_consumer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Consumer, 1
         )
         kv_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_stages
@@ -515,7 +606,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            head_idx_kv = head_idx // self.qhead_per_kvhead  # GQA
             mask = AttentionMaskCls(seqlen)
             # Exercise (2). Every block gets the full mask treatment, including
             # seqlen masking on blocks that are entirely inside seqlen_k.
@@ -531,50 +621,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mask_mod=None,
             )
 
-            gQ = cute.local_tile(
-                mQ[None, None, head_idx, batch_idx], (self.tile_m, self.tile_hdim), (m_block, 0)
-            )
-            load_Q, _, _ = copy_utils.tma_get_copy_fn(
-                tma_atom_Q, 0, cute.make_layout(1), gQ, sQ, single_stage=True
-            )
-            gK = cute.local_tile(
-                mK[None, None, head_idx_kv, batch_idx], (self.tile_n, self.tile_hdim), (None, 0)
-            )
-            gV = cute.local_tile(
-                mV[None, None, head_idx_kv, batch_idx], (self.tile_n, self.tile_hdimv), (None, 0)
-            )
-            tma_load_K, _, _ = copy_utils.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gK, sK)
-            tma_load_V, _, _ = copy_utils.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gV, sV)
-            load_K = partial(
-                self.load_KV, copy_utils.tma_producer_copy_fn(tma_load_K, pipeline_k), pipeline_k
-            )
-            load_V = partial(
-                self.load_KV, copy_utils.tma_producer_copy_fn(tma_load_V, pipeline_v), pipeline_v
-            )
-
             # EXERCISE (6): no BlockInfo, no causal narrowing. n_block_min is hard-wired to
             # 0 and n_block_max covers the whole key sequence, so for causal attention every
             # CTA also loads and multiplies the blocks that sit entirely above the diagonal
             # and are then masked to -inf in their entirety.
             n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
 
-            if warp_idx == 0:
-                pipeline_q.producer_acquire_w_index_phase(0, q_producer_phase)
-                load_Q(tma_bar_ptr=pipeline_q.sync_object_full.get_barrier(0))
-            q_producer_phase ^= 1
-            pipeline_q.consumer_wait_w_index_phase(0, q_consumer_phase)
+            pipeline_q.consumer_wait(
+                q_consumer_state, pipeline_q.consumer_try_wait(q_consumer_state)
+            )
 
-            # EXERCISE (5): a flat loop of self-contained iterations. Each one loads K[n]
-            # and V[n], runs the QK gemm to completion, does the softmax, then runs the PV
-            # gemm to completion. Try to overlap the GEMMs and inspect its performance impacts.
-            kv_producer_state, kv_consumer_state = self.one_n_block(
+            # EXERCISE (5) remains serialized within the consumer stream: QK, softmax,
+            # and PV complete back-to-back. The producer stream can nevertheless load
+            # later K/V stages concurrently with this work.
+            kv_consumer_state = self.compute_one_n_block(
                 n_block_max - 1,
-                warp_idx,
-                load_K,
-                load_V,
                 pipeline_k,
                 pipeline_v,
-                kv_producer_state,
                 kv_consumer_state,
                 mma_qk_fn,
                 mma_pv_fn,
@@ -585,14 +648,10 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 is_first=True,
             )
             for n_tile in cutlass.range(n_block_max - 1, unroll=1):
-                kv_producer_state, kv_consumer_state = self.one_n_block(
+                kv_consumer_state = self.compute_one_n_block(
                     n_block_max - 2 - n_tile,
-                    warp_idx,
-                    load_K,
-                    load_V,
                     pipeline_k,
                     pipeline_v,
-                    kv_producer_state,
                     kv_consumer_state,
                     mma_qk_fn,
                     mma_pv_fn,
@@ -603,11 +662,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     is_first=False,
                 )
 
-            # Release Q so the producer can load the next tile's Q
-            pipeline_q.consumer_release_w_index(0)
-            q_consumer_phase ^= 1
-
-            # Normalize acc_O by row_sum and compute the lse
+            # Normalize acc_O by row_sum and compute the lse.
             softmax.rescale_O(acc_O, softmax.finalize())
             self.epilogue(
                 acc_O,
@@ -625,25 +680,21 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 batch_idx,
             )
 
+            # sO aliases sQ, so Q cannot be released until the epilogue has completed
+            # its shared-memory staging and TMA store.
+            pipeline_q.consumer_release(q_consumer_state)
+            q_consumer_state.advance()
+
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
-        # Redundant here (every TMA is consumer-waited inside the loop) but kept so the
-        # producer-side accounting still balances if the loop structure is changed.
-        if warp_idx == 0:
-            pipeline_v.producer_tail(kv_producer_state)
-
     @cute.jit
-    def one_n_block(
+    def compute_one_n_block(
         self,
         n_block: Int32,
-        warp_idx: Int32,
-        load_K: Callable,
-        load_V: Callable,
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
-        kv_producer_state,
         kv_consumer_state,
         mma_qk_fn: Callable,
         mma_pv_fn: Callable,
@@ -653,18 +704,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         mask_fn: Callable,
         is_first: cutlass.Constexpr = False,
     ):
-        """Load K[n] and V[n], then S = Q@K.T, softmax, O += P@V -- all fully serialized."""
-        # ---- load -------------------------------------------------------------------
-        # EXERCISE (3)/(5): the loads live inside the compute loop and are issued for this
-        # block only. The original skewed the streams (K of block n-1 issued alongside V of
-        # block n) so that the consumer's deferred PV always had its V resident.
-        if warp_idx == 0:
-            load_K(n_block, kv_producer_state)
-            load_V(n_block, kv_producer_state)
-        kv_producer_state.advance()
-
+        """Consume K/V[n], then run serialized QK, softmax, and PV."""
         # ---- S = Q @ K.T ------------------------------------------------------------
-        # EXERCISE (3)/(5): warp_scheduler_barrier_sync() used to guard this region.
+        # EXERCISE (5): warp_scheduler_barrier_sync() is still absent here.
         pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
         # wg_wait=0: block on the QK gemm immediately instead of leaving it in flight.
         acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
@@ -683,13 +725,13 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             softmax.rescale_O(acc_O, row_scale)
 
         # ---- O += P @ V -------------------------------------------------------------
-        # EXERCISE (3)/(5): warp_scheduler_barrier_arrive() used to release the token here.
+        # EXERCISE (5): warp_scheduler_barrier_arrive() is still absent here.
         pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
         mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=is_first, wg_wait=0)
         pipeline_v.consumer_release(kv_consumer_state)
         kv_consumer_state.advance()
 
-        return kv_producer_state, kv_consumer_state
+        return kv_consumer_state
 
 
 # ---------------------------------------------------------------------------
