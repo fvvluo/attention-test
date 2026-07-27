@@ -422,7 +422,8 @@ __global__ void decode_combine_kernel(
 int choose_splits(int batch, int kv_heads, int kv_len, int num_sms) {
     const int max_useful_splits = min(kMaxSplits, kv_len / kTokensPerTile);
     const int target_blocks = 6 * num_sms;
-    const int splits_for_occupancy = target_blocks / (batch * kv_heads);
+    const int splits_for_occupancy =
+        max(1, (target_blocks / (batch * kv_heads)) - 1);
     return max(1, min(max_useful_splits, splits_for_occupancy));
 }
 
