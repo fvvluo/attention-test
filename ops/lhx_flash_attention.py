@@ -32,7 +32,7 @@
 #   [DONE] EXERCISE (3)  Warp specialization            -> 128-thread TMA WG + 256-thread MMA WGs
 #   [DONE] EXERCISE (4)  Register redistribution        -> producer 24, MMA consumers 240
 #   [DONE] EXERCISE (5)  Intra-warpgroup overlap        -> QK[current] overlaps PV[previous]
-#   [HARD] EXERCISE (6)  Inter-warpgroup ping-pong      -> warp scheduler barriers deleted
+#   [DONE] EXERCISE (6)  Inter-warpgroup ping-pong      -> named-barrier token ring
 #
 # If you are stuck, refer to https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/flash_fwd_sm90.py.
 
@@ -62,6 +62,7 @@ from quack.cute_dsl_utils import ParamsBase
 from .lhx_cute.cute_dsl_utils import assume_tensor_aligned, to_cute_tensor
 from .lhx_cute import utils
 from .lhx_cute.mask import AttentionMask
+from .lhx_cute.named_barrier import NamedBarrierFwd
 from .lhx_cute.softmax import Softmax
 from .lhx_cute.seqlen_info import SeqlenInfoQK
 from .lhx_cute.block_sparsity import BlockSparseTensors  # signature only
@@ -558,6 +559,32 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_v.producer_tail(kv_producer_state)
 
     @cute.jit
+    def warp_scheduler_barrier_init(self, warp_group_idx: Int32):
+        """Seed the consumer warpgroup token ring with local WG0."""
+        if warp_group_idx == 0:
+            cute.arch.barrier_arrive(
+                barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1),
+                number_of_threads=self.num_mma_threads,
+            )
+
+    @cute.jit
+    def warp_scheduler_barrier_sync(self, warp_group_idx: Int32):
+        """Wait until this consumer warpgroup owns the WGMMA issue token."""
+        cute.arch.barrier(
+            barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1) + warp_group_idx,
+            number_of_threads=self.num_mma_threads,
+        )
+
+    @cute.jit
+    def warp_scheduler_barrier_arrive(self, warp_group_idx: Int32):
+        """Pass the WGMMA issue token to the other consumer warpgroup."""
+        next_wg = 1 - warp_group_idx
+        cute.arch.barrier_arrive(
+            barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1) + next_wg,
+            number_of_threads=self.num_mma_threads,
+        )
+
+    @cute.jit
     def compute_mainloop(
         self,
         tiled_mma_qk: cute.TiledMma,
@@ -601,9 +628,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         mma_pv_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_pv, acc_O, tOrP, tOrVt)
 
-        # EXERCISE (6): mma_init() used to prime the warp-scheduler token ring here by
-        # having warpgroup 1 arrive on NamedBarrierFwd.WarpSchedulerWG1. Both MMA
-        # warpgroups now issue their WGMMAs whenever the hardware warp scheduler pleases.
+        # Exercise 6: local consumer WG0 seeds the token ring. Each WGMMA issue
+        # phase passes the token to the other consumer WG before scalar/SFU work.
+        self.warp_scheduler_barrier_init(warp_group_idx)
 
         q_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, 1
@@ -671,6 +698,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Exercise 5 prologue: produce P for the first block but defer its PV.
             k_consumer_state = self.compute_first_qk(
                 n_block_max - 1,
+                warp_group_idx,
                 pipeline_k,
                 k_consumer_state,
                 mma_qk_fn,
@@ -687,6 +715,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if n_block >= n_block_mask_start:
                     k_consumer_state, v_consumer_state = self.compute_overlapped_block(
                         n_block,
+                        warp_group_idx,
                         pipeline_k,
                         pipeline_v,
                         k_consumer_state,
@@ -703,6 +732,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 else:
                     k_consumer_state, v_consumer_state = self.compute_overlapped_block(
                         n_block,
+                        warp_group_idx,
                         pipeline_k,
                         pipeline_v,
                         k_consumer_state,
@@ -722,6 +752,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 if n_block >= n_block_mask_start:
                     k_consumer_state, v_consumer_state = self.compute_overlapped_block(
                         n_block,
+                        warp_group_idx,
                         pipeline_k,
                         pipeline_v,
                         k_consumer_state,
@@ -738,6 +769,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 else:
                     k_consumer_state, v_consumer_state = self.compute_overlapped_block(
                         n_block,
+                        warp_group_idx,
                         pipeline_k,
                         pipeline_v,
                         k_consumer_state,
@@ -755,6 +787,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             # Epilogue: the last P fragment has no following QK iteration to carry it.
             if n_block_max == 1:
                 v_consumer_state = self.flush_last_pv(
+                    warp_group_idx,
                     pipeline_v,
                     v_consumer_state,
                     mma_pv_fn,
@@ -762,6 +795,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 )
             else:
                 v_consumer_state = self.flush_last_pv(
+                    warp_group_idx,
                     pipeline_v,
                     v_consumer_state,
                     mma_pv_fn,
@@ -799,6 +833,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def compute_first_qk(
         self,
         n_block: Int32,
+        warp_group_idx: Int32,
         pipeline_k: pipeline.PipelineAsync,
         k_consumer_state,
         mma_qk_fn: Callable,
@@ -811,9 +846,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_k.consumer_wait(
             k_consumer_state, pipeline_k.consumer_try_wait(k_consumer_state)
         )
+        self.warp_scheduler_barrier_sync(warp_group_idx)
         acc_S = mma_qk_fn(B_idx=k_consumer_state.index, wg_wait=0)
         pipeline_k.consumer_release(k_consumer_state)
         k_consumer_state.advance()
+        self.warp_scheduler_barrier_arrive(warp_group_idx)
 
         if const_expr(apply_mask):
             mask_fn(acc_S=acc_S, n_block=n_block)
@@ -825,6 +862,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     def compute_overlapped_block(
         self,
         n_block: Int32,
+        warp_group_idx: Int32,
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
         k_consumer_state,
@@ -839,16 +877,19 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         is_first_pv: cutlass.Constexpr,
     ):
         """Overlap QK[current], softmax[current], and PV[previous]."""
-        # QK is committed first so wait_group(1) below makes its accumulator visible
-        # while leaving the newer PV group eligible to execute asynchronously.
+        # Wait for both operands before taking the WGMMA issue token, so a slow
+        # TMA stage cannot block the other consumer warpgroup behind this one.
         pipeline_k.consumer_wait(
             k_consumer_state, pipeline_k.consumer_try_wait(k_consumer_state)
         )
-        acc_S = mma_qk_fn(B_idx=k_consumer_state.index, wg_wait=-1)
-
         pipeline_v.consumer_wait(
             v_consumer_state, pipeline_v.consumer_try_wait(v_consumer_state)
         )
+
+        # QK is committed first so wait_group(1) below makes its accumulator visible
+        # while leaving the newer PV group eligible to execute asynchronously.
+        self.warp_scheduler_barrier_sync(warp_group_idx)
+        acc_S = mma_qk_fn(B_idx=k_consumer_state.index, wg_wait=-1)
         mma_pv_fn(
             B_idx=v_consumer_state.index,
             zero_init=is_first_pv,
@@ -856,9 +897,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         pipeline_k.consumer_release(k_consumer_state)
         k_consumer_state.advance()
+        self.warp_scheduler_barrier_arrive(warp_group_idx)
 
         # QK is complete, but PV can remain in flight while mask, exp, and row
-        # reductions consume acc_S on the CUDA cores/SFU.
+        # reductions consume acc_S on the CUDA cores/SFU. The other consumer WG
+        # now owns the issue token and can use the Tensor Cores during this phase.
         if const_expr(apply_mask):
             mask_fn(acc_S=acc_S, n_block=n_block)
         row_scale = softmax.online_softmax(acc_S, check_inf=True)
@@ -875,6 +918,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
     @cute.jit
     def flush_last_pv(
         self,
+        warp_group_idx: Int32,
         pipeline_v: pipeline.PipelineAsync,
         v_consumer_state,
         mma_pv_fn: Callable,
@@ -884,11 +928,14 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_v.consumer_wait(
             v_consumer_state, pipeline_v.consumer_try_wait(v_consumer_state)
         )
+        self.warp_scheduler_barrier_sync(warp_group_idx)
         mma_pv_fn(
             B_idx=v_consumer_state.index,
             zero_init=zero_init,
-            wg_wait=0,
+            wg_wait=-1,
         )
+        self.warp_scheduler_barrier_arrive(warp_group_idx)
+        warpgroup.wait_group(0)
         pipeline_v.consumer_release(v_consumer_state)
         v_consumer_state.advance()
         return v_consumer_state
