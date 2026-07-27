@@ -26,26 +26,16 @@
 # OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-"""Optimized Qwen3-32B Prefill and Decode attention for NVIDIA Hopper.
+"""Optimized Hopper CuTe DSL attention for Qwen3-32B.
 
-The CuTe DSL kernels fuse QK, online softmax, and PV with TMA transfers,
-warp-specialized Hopper WGMMA, BF16 inputs/outputs, and FP32 accumulators. The
-fixed target is B=1, S=131072, Hq=64, Hkv=8, D=128. Prefill uses a tuned
-N192/KV3 pipeline and omits unused LSE work. Decode packs each group of eight
-query heads into logical M rows, launches continuous split-KV work concurrently,
-and combines split outputs with FP32 log-sum-exp weights.
-
-This implementation is adapted from NVIDIA CUTLASS's Hopper FMHA CuTe DSL
-example and retains its BSD-3-Clause license. Run ``--help`` for correctness,
-full-length validation, and benchmark modes.
+Targets fixed B=1, Hq=64, Hkv=8, D=128 workloads: tuned causal Prefill
+and concurrent split-KV Pack-GQA Decode with FP32 LSE combination.
 """
 
-import argparse
 import math
 import os
 import sys
 import threading
-import time
 from typing import Type, Tuple, Optional, Sequence
 
 import cuda.bindings.driver as cuda
@@ -56,7 +46,6 @@ import cutlass.cute as cute
 import cutlass.cute.nvgpu.warpgroup as warpgroup
 import cutlass.utils as utils
 import cutlass.pipeline as pipeline
-from cutlass.pipeline import pipeline_init_arrive, pipeline_init_wait
 from cutlass._mlir.dialects import math as _math
 
 import cutlass.utils.hopper_helpers as sm90_utils
@@ -81,9 +70,7 @@ from contextlib import contextmanager
 import inspect as _inspect
 
 
-# Keep the original N128/KV5 baseline and the candidate configurations used in
-# H20 tuning. ``auto`` below selects only a candidate that passed small-shape,
-# sampled 128K, and interleaved 128K performance validation.
+# Presets retained from H20 tuning; auto selects the validated N192/KV3 winner.
 PREFILL_CONFIGS = {
     "n128-kv5": (128, 5),
     "n128-kv4": (128, 4),
@@ -91,9 +78,7 @@ PREFILL_CONFIGS = {
     "n160-kv4": (160, 4),
     "n192-kv3": (192, 3),
 }
-# N192/KV3 passed small-shape and sampled 128K correctness and was the most
-# stable H20 winner in an interleaved 128K A/B run (1977.91 ms median versus
-# 2000.12 ms for N128/KV5). The original N128/KV5 preset remains available.
+# N128/KV5 remains the Decode baseline and an explicit Prefill option.
 PREFILL_AUTO_CONFIG = "n192-kv3"
 DECODE_KERNEL_CONFIG = "n128-kv5"
 DEFAULT_DECODE_SPLIT_CANDIDATES = (8, 9, 10, 16, 18, 19, 32)
@@ -179,35 +164,7 @@ class HopperFusedMultiHeadAttentionForward:
         kv_stage: int = 5,
         write_lse: bool = True,
     ):
-        """Initializes the configuration for a Hopper Fused Multi-Head Attention (FMHA) kernel.
-
-        This configuration includes several key aspects:
-
-        1.  Data Type Settings:
-            - qk_acc_dtype: Data type for Q*K^T matrix multiplication accumulator
-            - pv_acc_dtype: Data type for P*V matrix multiplication accumulator
-
-        2.  MMA Instruction Settings:
-            - mma_tiler: The (M, N, K) shape of the MMA instruction unit
-            - qk_mma_tiler: MMA shape for Q*K^T computation
-            - pv_mma_tiler: MMA shape for P*V computation
-
-        3.  Kernel Execution Mode:
-            - is_persistent: Boolean indicating whether to use persistent kernel mode
-            - mask_type: Specifies the type of mask to use (no mask, residual mask, or causal mask)
-            - window_size_left/right: Sliding window parameters for attention masking
-
-        :param qk_acc_dtype: Data type for Q*K^T matrix multiplication accumulator
-        :type qk_acc_dtype: Type[cutlass.Numeric]
-        :param pv_acc_dtype: Data type for P*V matrix multiplication accumulator
-        :type pv_acc_dtype: Type[cutlass.Numeric]
-        :param mma_tiler: The (M, N, K) shape of the MMA instruction
-        :type mma_tiler: Tuple[int, int, int]
-        :param is_persistent: Whether to use persistent kernel mode
-        :type is_persistent: bool
-        :param mask_type: Type of mask to use
-        :type mask_type: fmha_utils.MaskEnum
-        """
+        """Configure Hopper warp groups, MMA tiles, stages, and LSE output."""
 
         self.num_mma_warp_groups = 2
         self.qk_acc_dtype = qk_acc_dtype
@@ -254,12 +211,9 @@ class HopperFusedMultiHeadAttentionForward:
         self.producer_warp_loadkv_id = 1
 
         self.num_regs_load = 40 - 2 * 8
-        num_load_warp_groups = 1
-        self.num_threads_per_warp_group = 128
-        max_threads_per_block = (
-            self.num_mma_warp_groups + num_load_warp_groups
+        self.threads_per_cta = (
+            self.num_mma_warp_groups + 1
         ) * self.num_threads_per_warp_group
-        self.threads_per_cta = max_threads_per_block
         self.num_regs_mma = 240
         self.buffer_align_bytes = 1024
 
@@ -571,68 +525,10 @@ class HopperFusedMultiHeadAttentionForward:
         o_smem_layout_staged: cute.ComposedLayout,
         tile_sched_params: fmha_utils.FmhaStaticTileSchedulerParams,
     ):
-        """The device kernel implementation of the Fused Multi-Head Attention for Hopper architecture.
+        """Run the warp-specialized Hopper FMHA device kernel.
 
-        This kernel coordinates multiple specialized warps to perform different phases of the FMHA computation:
-        1. Load warp group: Loads Q, K, V data from global memory to shared memory using TMA
-        2. Comput warps groups: Performs matrix multiplications (Q*K^T and P*V) using Hopper TensorCores,
-        then compute softmax normalization on attention scores with numerical stability.
-        Handle final output transformation and storage.
-
-        The kernel implements a complex pipeline with overlapping computation and memory operations,
-        using tensor memory access (TMA) for efficient data loading, warp specialization for different
-        computation phases, and optional attention masking for causal or residual attention patterns.
-
-        Key optimizations include:
-        - Warp group specialization for load, compute/epilogue phases
-        - Pipeline stages between different warps for overlapping computation and memory access
-        - Efficient shared memory layouts optimized for Hopper architecture
-        - Support for different precision data types and accumulation types
-        - Optional causal masking for autoregressive models
-        - Sliding window attention masking for efficient long sequence processing
-
-        :param qk_tiled_mma: Tiled MMA for Q*K^T matrix multiplication
-        :type qk_tiled_mma: cute.TiledMma
-        :param pv_tiled_mma: Tiled MMA for P*V matrix multiplication
-        :type pv_tiled_mma: cute.TiledMma
-        :param tma_atom_q: TMA copy atom for query tensor loading
-        :type tma_atom_q: cute.CopyAtom
-        :param mQ_qdl: Partitioned query tensor for TMA loading
-        :type mQ_qdl: cute.Tensor
-        :param tma_atom_k: TMA copy atom for key tensor loading
-        :type tma_atom_k: cute.CopyAtom
-        :param mK_kdl: Partitioned key tensor for TMA loading
-        :type mK_kdl: cute.Tensor
-        :param tma_atom_v: TMA copy atom for value tensor loading
-        :type tma_atom_v: cute.CopyAtom
-        :param mV_dkl: Partitioned value tensor for TMA loading
-        :type mV_dkl: cute.Tensor
-        :param tma_atom_o: TMA copy atom for output tensor storage
-        :type tma_atom_o: cute.CopyAtom
-        :param mO_qdl: Partitioned output tensor for TMA storage
-        :type mO_qdl: cute.Tensor
-        :param mLse_qdl: Tensor for lse
-        :type mLse_qdl: cute.Tensor
-        :param scale_softmax_log2: The log2 scale factor for softmax computation
-        :type scale_softmax_log2: cutlass.Float32
-        :param scale_softmax: The scale factor for softmax (currently unused)
-        :type scale_softmax: cutlass.Float32
-        :param scale_output: The scale factor for the final output
-        :type scale_output: cutlass.Float32
-        :param window_size_left: Left-side sliding window size for attention masking
-        :type window_size_left: Optional[cutlass.Int32]
-        :param window_size_right: Right-side sliding window size for attention masking
-        :type window_size_right: Optional[cutlass.Int32]
-        :param q_smem_layout_staged: Shared memory layout for query tensor with staging
-        :type q_smem_layout_staged: cute.ComposedLayout
-        :param k_smem_layout_staged: Shared memory layout for key tensor with staging
-        :type k_smem_layout_staged: cute.ComposedLayout
-        :param v_smem_layout_staged: Shared memory layout for value tensor with staging
-        :type v_smem_layout_staged: cute.ComposedLayout
-        :param o_smem_layout_staged: Shared memory layout for output tensor with staging
-        :type o_smem_layout_staged: cute.ComposedLayout
-        :param tile_sched_params: Scheduling parameters for work distribution across blocks
-        :type tile_sched_params: fmha_utils.FmhaStaticTileSchedulerParams
+        A load warp group feeds staged TMA Q/K/V pipelines while two math warp
+        groups execute WGMMA QK, online softmax, PV, optional LSE, and epilogue.
         """
 
         tidx, _, _ = cute.arch.thread_idx()
@@ -1594,31 +1490,7 @@ class HopperFusedMultiHeadAttentionForward:
 
     @cute.jit
     def tail(self, s_max, a_sum, acc_pv, tiled_mma_pv, scale_softmax, scale_output):
-        """
-        Final processing step for FMHA that computes log-sum-exp (LSE) and scales the output.
-
-        This function performs the following operations:
-        1. Reduces the attention sums across warps using butterfly shuffle
-        2. Computes the log-sum-exp (LSE) for numerical stability
-        3. Applies softmax scaling and output scaling to the accumulated values
-        4. Handles edge cases like zero sums and NaN values
-
-        :param s_max: Maximum attention scores for each position (for numerical stability)
-        :type s_max: cute.Tensor
-        :param a_sum: Sum of attention scores after softmax
-        :type a_sum: cute.Tensor
-        :param acc_pv: Accumulated P*V values from the attention computation
-        :type acc_pv: cute.ThrMma
-        :param tiled_mma_pv: Tiled MMA for P*V computation
-        :type tiled_mma_pv: cute.TiledMma
-        :param scale_softmax: Scaling factor for softmax computation
-        :type scale_softmax: cutlass.Float32
-        :param scale_output: Scaling factor for final output
-        :type scale_output: cutlass.Float32
-
-        :return: Log-sum-exp values for each position
-        :rtype: cute.Tensor
-        """
+        """Reduce softmax sums, compute LSE, and normalize the PV accumulator."""
         # Create tensor view of accumulated P*V values with M*N layout
         acc_pv_mn = cute.make_tensor(
             acc_pv.iterator, self.layout_acc_mn(tiled_mma_pv, acc_pv.layout)
@@ -1815,20 +1687,7 @@ class HopperFusedMultiHeadAttentionForward:
         smem_tile: tuple[int, int],
         mcast_dim: int,
     ) -> tuple[cute.CopyAtom, cute.Tensor]:
-        """Create TMA atoms and tensors for input tensors.
-
-        :param tensor: Input tensor (A or B)
-        :type tensor: cute.Tensor
-        :param smem_layout_staged: Shared memory layout for the tensor
-        :type smem_layout_staged: cute.ComposedLayout
-        :param smem_tile: Shared memory tile shape
-        :type smem_tile: Tuple[int, int]
-        :param mcast_dim: Multicast dimension
-        :type mcast_dim: int
-
-        :return: TMA atom and tensor
-        :rtype: Tuple[cute.CopyAtom, cute.Tensor]
-        """
+        """Build a staged global-to-shared TMA copy atom and tensor."""
         op = (
             cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp()
             if mcast_dim == 1
@@ -1859,42 +1718,7 @@ class HopperFusedMultiHeadAttentionForward:
         window_size: Tuple[int, int],
         iterations: int,
     ) -> Tuple[bool, str]:
-        """Check if the FMHA kernel can be implemented with the given parameters.
-
-        This method validates that the input parameters are compatible with the Hopper
-        Fused Multi-Head Attention implementation. It checks tensor shapes, data types,
-        window sizes, and other constraints to ensure the kernel can be successfully
-        compiled and executed.
-
-        :param q_shape: Query tensor shape (B, S_q, H, D) where B=batch size, S_q=query sequence length,
-                       H=number of heads, D=head dimension
-        :type q_shape: Tuple[int, int, int, int]
-        :param k_shape: Key tensor shape (B, S_k, H_k, D) where B=batch size, S_k=key sequence length,
-                       H_k=number of key heads, D=head dimension
-        :type k_shape: Tuple[int, int, int, int]
-        :param in_dtype: Input data type for query, key and value tensors
-        :type in_dtype: Type[cutlass.Numeric]
-        :param out_dtype: Output data type for attention output
-        :type out_dtype: Type[cutlass.Numeric]
-        :param qk_acc_dtype: Accumulator data type for query-key matrix multiplication
-        :type qk_acc_dtype: Type[cutlass.Numeric]
-        :param pv_acc_dtype: Accumulator data type for probability-value matrix multiplication
-        :type pv_acc_dtype: Type[cutlass.Numeric]
-        :param mma_tiler_mn: Matrix multiply accumulate tile shape (M, N)
-        :type mma_tiler_mn: Tuple[int, int]
-        :param is_persistent: Whether to use persistent kernel optimization
-        :type is_persistent: bool
-        :param scale_softmax: Attention score scaling factor
-        :type scale_softmax: float
-        :param window_size: Sliding window size (left, right) for attention masking
-        :type window_size: Tuple[int, int]
-        :param iterations: Number of iterations to run for performance testing
-        :type iterations: int
-
-        :return: Tuple of (can_implement, error_message) where can_implement is True if the kernel
-                 can be implemented, False otherwise, and error_message contains the reason for failure
-        :rtype: Tuple[bool, str]
-        """
+        """Validate shapes, dtypes, tiling, masking, and resource constraints."""
 
         # Unpack parameters
         b, s_q, h, d = q_shape
@@ -1964,460 +1788,6 @@ class HopperFusedMultiHeadAttentionForward:
             return False, "not supported persistent"
 
         return True, None
-
-
-def run(
-    q_shape: Tuple[int, int, int, int],
-    k_shape: Tuple[int, int, int, int],
-    in_dtype: Type[cutlass.Numeric],
-    out_dtype: Type[cutlass.Numeric],
-    qk_acc_dtype: Type[cutlass.Numeric],
-    pv_acc_dtype: Type[cutlass.Numeric],
-    mma_tiler_mn: Tuple[int, int],
-    is_persistent: bool,
-    is_causal: bool,
-    bottom_right_align: bool,
-    scale_q: float,
-    scale_k: float,
-    scale_v: float,
-    inv_scale_o: float,
-    scale_softmax: float,
-    window_size: Tuple[int, int],
-    tolerance: float,
-    warmup_iterations: int,
-    iterations: int,
-    skip_ref_check: bool,
-    use_cold_l2: bool = False,
-    execute_benchmark: bool = True,
-    input_pattern: str = "random",
-    kv_stage: int = 5,
-    write_lse: bool = False,
-    **kwargs,
-):
-    """Execute Fused Multi-Head Attention (FMHA) on Hopper architecture and validate results.
-
-    This function creates random input tensors for query, key, and value, then performs the
-    complete FMHA computation pipeline. It supports configurable data types, tiling parameters,
-    and various attention masking options. Results can be validated against a PyTorch reference
-    implementation or run multiple times for performance measurement.
-
-    The implementation leverages specialized tensor memory operations and efficient math
-    operations optimized for Hopper architecture, including pipelined computation stages
-    for maximum throughput.
-
-    :param q_shape: Query tensor shape (B, S_q, H, D) where B=batch size, S_q=query sequence length,
-                    H=number of heads, D=head dimension.
-                    If S_q is a tuple, it is the variable sequence length.
-    :type q_shape: Tuple[int, int, int, int] | Tuple[int, Tuple[int, ...], int, int]
-    :param k_shape: Key tensor shape (B, S_k, H_k, D) where B=batch size, S_k=key sequence length,
-                    H_k=number of key heads (H must be divisible by H_k), D=head dimension.
-                    If S_k is a tuple, it is the variable sequence length.
-    :type k_shape: Tuple[int, int, int, int] | Tuple[int, Tuple[int, ...], int, int]
-    :param in_dtype: Input data type for query, key and value tensors
-    :type in_dtype: Type[cutlass.Numeric]
-    :param out_dtype: Output data type for attention output
-    :type out_dtype: Type[cutlass.Numeric]
-    :param qk_acc_dtype: Accumulator data type for query-key matrix multiplication
-    :type qk_acc_dtype: Type[cutlass.Numeric]
-    :param pv_acc_dtype: Accumulator data type for probability-value matrix multiplication
-    :type pv_acc_dtype: Type[cutlass.Numeric]
-    :param mma_tiler_mn: Matrix multiply accumulate tile shape (M, N)
-    :type mma_tiler_mn: Tuple[int, int]
-    :param is_persistent: Whether to use persistent kernel optimization
-    :type is_persistent: bool
-    :param is_causal: Whether to apply causal masking
-    :type is_causal: bool
-    :param bottom_right_align: Whether to use bottom right align, under this settion, the end of q is aligned with the end of k.
-    :type bottom_right_align: bool
-    :param scale_q: Scaling factor for query tensor
-    :type scale_q: float
-    :param scale_k: Scaling factor for key tensor
-    :type scale_k: float
-    :param scale_v: Scaling factor for value tensor
-    :type scale_v: float
-    :param inv_scale_o: Inverse scaling factor for output tensor
-    :type inv_scale_o: float
-    :param scale_softmax: Attention score scaling factor (defaults to 1/sqrt(D) if set to 0)
-    :type scale_softmax: float
-    :param window_size: Sliding window size (left, right) for attention masking. Controls which positions each query can attend to. Negative values disable windowing.
-    :type window_size: Tuple[int, int]
-    :param tolerance: Maximum acceptable error for validation
-    :type tolerance: float
-    :param warmup_iterations: Number of warmup iterations
-    :type warmup_iterations: int
-    :param iterations: Number of iterations to run for performance testing
-    :type iterations: int
-    :param skip_ref_check: Skip validation against reference implementation
-    :type skip_ref_check: bool
-    :param use_cold_l2: Whether to use circular buffer strategy to ensure cold L2 cache
-    :type use_cold_l2: bool
-
-    :raises ValueError: If input shapes are incompatible or head dimension is unsupported
-    :raises RuntimeError: If GPU is unavailable for computation
-    :return: Execution time of the FMHA kernel in microseconds
-    :rtype: float
-    """
-    import torch
-    import cutlass.torch as cutlass_torch
-
-    print("Running Hopper SM90 FMHA test with:")
-    print(f"  q_shape: {q_shape}")
-    print(f"  k_shape: {k_shape}")
-    print(f"  in_dtype: {in_dtype}")
-    print(f"  out_dtype: {out_dtype}")
-    print(f"  qk_acc_dtype: {qk_acc_dtype}")
-    print(f"  pv_acc_dtype: {pv_acc_dtype}")
-    print(f"  mma_tiler_mn: {mma_tiler_mn}")
-    print(f"  is_persistent: {is_persistent}")
-    print(f"  is_causal: {is_causal}")
-    print(f"  bottom_right_align: {bottom_right_align}")
-    print(f"  scale_q: {scale_q}")
-    print(f"  scale_k: {scale_k}")
-    print(f"  scale_v: {scale_v}")
-    print(f"  inv_scale_o: {inv_scale_o}")
-    print(f"  scale_softmax: {scale_softmax}")
-    print(f"  window_size: {window_size}")
-    print(f"  tolerance: {tolerance}")
-    print(f"  skip_ref_check: {skip_ref_check}")
-    print(f"  use_cold_l2: {use_cold_l2}")
-    print(f"  kv_stage: {kv_stage}")
-    print(f"  write_lse: {write_lse}")
-
-    # Prepare pytorch tensors: Q, K, V (random from 0 to 2) and O (all zero)
-    if not torch.cuda.is_available():
-        raise RuntimeError("GPU is required to run this example!")
-    torch.cuda.reset_peak_memory_stats()
-
-    ret, msg = HopperFusedMultiHeadAttentionForward.can_implement(
-        q_shape,
-        k_shape,
-        in_dtype,
-        out_dtype,
-        qk_acc_dtype,
-        pv_acc_dtype,
-        mma_tiler_mn,
-        is_persistent,
-        scale_softmax,
-        window_size,
-        iterations,
-    )
-    if not ret:
-        raise TypeError(msg)
-
-    # Unpack parameters
-    b, s_q, h, d = q_shape
-    b_, s_k, h_k, d_ = k_shape
-    window_size_left, window_size_right = window_size
-    if window_size_left == -1:
-        window_size_left = None
-    if window_size_right == -1:
-        window_size_right = None
-
-    h_r = h // h_k
-
-    torch.manual_seed(1111)
-
-    def create_and_permute_tensor(
-        b, s, h_k, h_r, d, dtype, is_dynamic_layout=True, tensor_name=""
-    ):
-        # (b, s, h_k, h_r, d) -> (s, d, h_r, h_k, b)
-        # torch SPDA order is (h_k, h_r), then kernel is (h_r, h_k)
-        shape = (b, s, h_k, h_r, d)
-        permute_order = (1, 4, 3, 2, 0)
-        is_fp8 = dtype in {cutlass.Float8E4M3FN}
-        leading_dim = 1
-        if is_fp8 and tensor_name == "v":
-            permute_order = (4, 1, 3, 2, 0)
-            leading_dim = 0
-            shape = (b, d, h_k, h_r, s)
-
-        # torch does not support fp8 type
-        torch_dtype = cutlass.torch.dtype(dtype) if not is_fp8 else torch.int8
-
-        # Create dtype torch tensor (cpu)
-        torch_tensor_cpu = cutlass_torch.create_and_permute_torch_tensor(
-            shape,
-            torch_dtype,
-            permute_order=permute_order,
-            init_type=cutlass.torch.TensorInitType.RANDOM,
-            init_config=cutlass.torch.RandomInitConfig(
-                min_val=-2,
-                max_val=2,
-            ),
-        )
-        # Create dtype torch tensor (gpu)
-        torch_tensor_gpu = torch_tensor_cpu.cuda()
-
-        f32_torch_tensor = None
-        if not skip_ref_check or is_fp8:
-            f32_torch_tensor = torch_tensor_cpu.to(dtype=torch.float32)
-
-        # BF16 tensors already have the desired values and can be consumed directly.
-        cute_tensor = from_dlpack(torch_tensor_gpu, assumed_align=16)
-        cute_tensor.element_type = dtype
-        if is_dynamic_layout:
-            cute_tensor = cute_tensor.mark_layout_dynamic(leading_dim=leading_dim)
-        if f32_torch_tensor is not None:
-            cute_tensor = cutlass_torch.convert_cute_tensor(
-                f32_torch_tensor,
-                cute_tensor,
-                dtype,
-                is_dynamic_layout=is_dynamic_layout,
-            )
-
-        return f32_torch_tensor, cute_tensor, torch_tensor_gpu
-
-    q_ref, q_tensor, q_torch = create_and_permute_tensor(
-        b, s_q, h_k, h_r, d, in_dtype, is_dynamic_layout=True
-    )
-    k_ref, k_tensor, k_torch = create_and_permute_tensor(
-        b, s_k, h_k, 1, d, in_dtype, is_dynamic_layout=True
-    )
-    v_ref, v_tensor, v_torch = create_and_permute_tensor(
-        b, s_k, h_k, 1, d, in_dtype, is_dynamic_layout=True, tensor_name="v"
-    )
-    o_ref, o_tensor, o_torch = create_and_permute_tensor(
-        b, s_q, h_k, h_r, d, out_dtype, is_dynamic_layout=True
-    )
-    if write_lse:
-        lse_ref, lse_tensor, lse_torch = create_and_permute_tensor(
-            b, s_q, h_k, h_r, 1, qk_acc_dtype, is_dynamic_layout=True
-        )
-    else:
-        # CuTe currently requires the stable tensor argument in the callable
-        # signature.  The no-LSE specialization never dereferences this single
-        # FP32 element.
-        lse_ref = None
-        lse_torch = torch.empty((1, 1, 1, 1, 1), dtype=torch.float32, device="cuda")
-        lse_tensor = from_dlpack(lse_torch, assumed_align=16)
-        lse_tensor.element_type = cutlass.Float32
-        lse_tensor = lse_tensor.mark_layout_dynamic(leading_dim=1)
-
-    if input_pattern not in {"random", "prefix"}:
-        raise ValueError(f"unsupported input pattern: {input_pattern}")
-    if input_pattern == "prefix":
-        if not skip_ref_check:
-            raise ValueError("prefix input is only used by the full-length sampled check")
-        q_torch.zero_()
-        k_torch.zero_()
-        positions = (torch.arange(s_k, device=v_torch.device) % 17 - 8).float() / 8
-        kv_offsets = torch.arange(h_k, device=v_torch.device).float() / 4
-        values = positions[:, None, None, None, None] + kv_offsets[None, None, None, :, None]
-        v_torch.copy_(values.expand_as(v_torch))
-        o_torch.zero_()
-        if write_lse:
-            lse_torch.zero_()
-
-    mma_tiler = (*mma_tiler_mn, d)
-
-    mask_type = fmha_utils.MaskEnum.WINDOW_MASK
-    if bottom_right_align:
-        mask_type = fmha_utils.MaskEnum.WINDOW_MASK_INFERENCE
-    if is_causal:
-        window_size_right = 0
-    elif window_size_left is None and window_size_right is None:
-        if s_k % mma_tiler_mn[1] != 0:
-            mask_type = fmha_utils.MaskEnum.RESIDUAL_MASK
-
-    # To avoid mask out the whole row which results in NaN in softmax
-    def check_seqlen_valid(
-        s_q, s_k, window_size_left, window_size_right, bottom_right_align
-    ):
-        for i in range(s_q):
-            offset = 0 if not bottom_right_align else s_k - s_q
-
-            s_q_start = 0 if window_size_left is None else i + offset - window_size_left
-            s_q_end = (
-                s_q if window_size_right is None else i + offset + window_size_right
-            )
-            s_q_min = max(s_q_start, 0)
-            s_q_max = min(s_q_end, s_k)
-
-            if s_q_max - s_q_min == 0 and (i != 0 and i != s_q - 1):
-                return False
-        return True
-
-    need_check_seqlen_valid = (
-        window_size_left is not None or window_size_right is not None
-    )
-    if need_check_seqlen_valid and not check_seqlen_valid(
-        s_q,
-        s_k,
-        window_size_left,
-        window_size_right,
-        bottom_right_align,
-    ):
-        raise ValueError("sliding window doesn't support current setting")
-
-    fmha = HopperFusedMultiHeadAttentionForward(
-        qk_acc_dtype,
-        pv_acc_dtype,
-        mma_tiler,
-        is_persistent,
-        mask_type,
-        kv_stage=kv_stage,
-        write_lse=write_lse,
-    )
-
-    # Get current CUDA stream from PyTorch
-    torch_stream = torch.cuda.current_stream()
-    # Get the raw stream pointer as a CUstream
-    current_stream = cuda.CUstream(torch_stream.cuda_stream)
-
-    if scale_softmax == 0.0:  # default to 1/sqrt(head_dim)
-        scale_softmax = 1.0 / math.sqrt(q_shape[3])
-
-    scale_softmax = scale_q * scale_k * scale_softmax
-
-    LOG2_E = 1.4426950408889634074
-    scale_softmax_log2 = scale_softmax * LOG2_E
-    scale_output = scale_v * inv_scale_o
-
-    print("Compiling kernel with cute.compile ...")
-    start_time = time.time()
-    # compile fmha kernel
-    compiled_fmha = cute.compile(
-        fmha,
-        q_tensor,
-        k_tensor,
-        v_tensor,
-        o_tensor,
-        lse_tensor,
-        scale_softmax_log2,
-        scale_softmax,
-        scale_output,
-        (
-            window_size_left
-            if window_size_left is None
-            else cutlass.Int32(window_size_left)
-        ),
-        (
-            window_size_right
-            if window_size_right is None
-            else cutlass.Int32(window_size_right)
-        ),
-        current_stream,
-    )
-    compilation_time = time.time() - start_time
-    print(f"Compilation time: {compilation_time:.4f} seconds")
-
-    def invoke_compiled():
-        compiled_fmha(
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            o_tensor,
-            lse_tensor,
-            scale_softmax_log2,
-            scale_softmax,
-            scale_output,
-            (
-                window_size_left
-                if window_size_left is None
-                else cutlass.Int32(window_size_left)
-            ),
-            (
-                window_size_right
-                if window_size_right is None
-                else cutlass.Int32(window_size_right)
-            ),
-            current_stream,
-        )
-
-    def run_reference(q, k, v):
-        from reference_attention import attention_reference
-
-        if window_size_left is not None or window_size_right not in {None, 0}:
-            raise ValueError("the project reference only supports dense causal attention")
-        s_q_ref, d_ref, h_r_ref, h_k_ref, b_ref = q.shape
-        s_k_ref = k.shape[0]
-        q_bhsd = q.permute(4, 3, 2, 0, 1).contiguous().view(
-            b_ref, h_k_ref * h_r_ref, s_q_ref, d_ref
-        ).to(device=q_torch.device)
-        k_bhsd = k.permute(4, 3, 2, 0, 1).contiguous().view(
-            b_ref, h_k_ref, s_k_ref, d_ref
-        ).to(device=q_torch.device)
-        v_bhsd = v.permute(4, 3, 2, 0, 1).contiguous().view(
-            b_ref, h_k_ref, s_k_ref, d_ref
-        ).to(device=q_torch.device)
-        output_bhsd = attention_reference(
-            q_bhsd,
-            k_bhsd.repeat_interleave(h_r_ref, dim=1),
-            v_bhsd.repeat_interleave(h_r_ref, dim=1),
-            causal=is_causal,
-            softmax_scale=scale_softmax,
-        )
-        return (
-            output_bhsd.view(b_ref, h_k_ref, h_r_ref, s_q_ref, d_ref)
-            .permute(3, 4, 2, 1, 0)
-            .contiguous()
-            * scale_output
-        )
-
-    if not skip_ref_check:
-        invoke_compiled()
-
-        print("Verifying results with reference_attention.py...")
-        o_ref = run_reference(q_ref, k_ref, v_ref)
-
-        o_fp32_torch = o_torch.float()
-        ref_o_f32_torch = o_ref.float()
-
-        error = (o_fp32_torch - ref_o_f32_torch).abs()
-        print(
-            f"Reference error: max_abs={error.max().item():.6g}, "
-            f"mean_abs={error.mean().item():.6g}"
-        )
-        torch.testing.assert_close(
-            o_fp32_torch, ref_o_f32_torch, atol=tolerance, rtol=2e-02
-        )
-        print("Results verified successfully!")
-
-    if not execute_benchmark:
-        if skip_ref_check:
-            invoke_compiled()
-        torch.cuda.synchronize()
-        return {
-            "time_us": None,
-            "compilation_time_s": compilation_time,
-            "q": q_torch,
-            "k": k_torch,
-            "v": v_torch,
-            "output": o_torch,
-            "peak_memory_bytes": torch.cuda.max_memory_allocated(),
-        }
-
-    if use_cold_l2:
-        raise ValueError("cold-L2 benchmarking is not supported by this fixed workload")
-    for _ in range(warmup_iterations):
-        invoke_compiled()
-    torch.cuda.synchronize()
-    elapsed_us = []
-    for _ in range(iterations):
-        start_event = torch.cuda.Event(enable_timing=True)
-        end_event = torch.cuda.Event(enable_timing=True)
-        start_event.record()
-        invoke_compiled()
-        end_event.record()
-        end_event.synchronize()
-        elapsed_us.append(start_event.elapsed_time(end_event) * 1000)
-    elapsed_us.sort()
-    midpoint = len(elapsed_us) // 2
-    exec_time = (
-        elapsed_us[midpoint]
-        if len(elapsed_us) % 2
-        else (elapsed_us[midpoint - 1] + elapsed_us[midpoint]) / 2
-    )
-
-    return {
-        "time_us": exec_time,
-        "compilation_time_s": compilation_time,
-        "q": q_torch,
-        "k": k_torch,
-        "v": v_torch,
-        "output": o_torch,
-        "peak_memory_bytes": torch.cuda.max_memory_allocated(),
-    }
 
 
 QWEN_BATCH = 1
@@ -2547,11 +1917,7 @@ def _run_hopper_fmha(
     prefill_config: str,
     write_lse: bool,
 ):
-    """Launch one local Hopper WGMMA attention problem.
-
-    K/V may be strided sequence slices. TMA consumes their actual strides, so
-    decode does not copy or expand the KV cache.
-    """
+    """Launch one Hopper problem; Decode K/V may be zero-copy strided slices."""
     import torch
 
     config_name, block_n, kv_stage = _resolve_prefill_config(prefill_config)
@@ -2572,9 +1938,8 @@ def _run_hopper_fmha(
             )
             lse_kernel = lse_storage.permute(1, 4, 3, 2, 0)
         else:
-            # Optional tensor arguments are not reliable in this CuTe version.
-            # This one-element allocation preserves the signature; the
-            # write_lse=False specialization does not load or store it.
+            # Preserve the non-optional CuTe signature; this specialization
+            # never accesses the one-element dummy LSE tensor.
             lse_storage = torch.empty((1, 1, 1, 1, 1), dtype=torch.float32, device=q.device)
             lse_kernel = lse_storage
 
@@ -2612,6 +1977,19 @@ def _run_hopper_fmha(
         torch_stream = torch.cuda.current_stream(q.device)
         current_stream = cuda.CUstream(torch_stream.cuda_stream)
 
+        kernel_args = (
+            q_tensor,
+            k_tensor,
+            v_tensor,
+            o_tensor,
+            lse_tensor,
+            scale_softmax_log2,
+            sm_scale,
+            1.0,
+            window_size_left,
+            window_size_right,
+            current_stream,
+        )
         cache_key = (
             q.device.index,
             query_heads,
@@ -2641,35 +2019,10 @@ def _run_hopper_fmha(
                         kv_stage=kv_stage,
                         write_lse=write_lse,
                     )
-                    compiled_fmha = cute.compile(
-                        fmha,
-                        q_tensor,
-                        k_tensor,
-                        v_tensor,
-                        o_tensor,
-                        lse_tensor,
-                        scale_softmax_log2,
-                        sm_scale,
-                        1.0,
-                        window_size_left,
-                        window_size_right,
-                        current_stream,
-                    )
+                    compiled_fmha = cute.compile(fmha, *kernel_args)
                     _QWEN3_KERNEL_CACHE[cache_key] = compiled_fmha
 
-        compiled_fmha(
-            q_tensor,
-            k_tensor,
-            v_tensor,
-            o_tensor,
-            lse_tensor,
-            scale_softmax_log2,
-            sm_scale,
-            1.0,
-            window_size_left,
-            window_size_right,
-            current_stream,
-        )
+        compiled_fmha(*kernel_args)
         q.record_stream(torch_stream)
         k.record_stream(torch_stream)
         v.record_stream(torch_stream)
@@ -2681,12 +2034,7 @@ def _run_hopper_fmha(
 def qwen3_prefill_attention(
     q, k, v, *, causal=True, sm_scale=None, prefill_config="auto"
 ):
-    """Run Qwen3-32B prefill attention on contiguous BHSD tensors.
-
-    The public forward API returns O only. Its compiled kernel omits LSE log and
-    stores; a one-element dummy tensor remains solely because the current CuTe
-    callable signature cannot reliably use an Optional tensor.
-    """
+    """Run Prefill without materializing the unused LSE output."""
     _validate_qwen3_inputs(q, k, v, decode=False, causal=causal)
     sm_scale = _normalize_sm_scale(sm_scale)
     output, _ = _run_hopper_fmha(
@@ -2728,11 +2076,8 @@ def _select_decode_splits(
     candidates = _normalize_split_candidates(split_candidates)
     max_splits = max(1, math.ceil(seqlen / block_n))
     if num_splits is None or num_splits == 0:
-        # One Pack-GQA CTA handles each KV head, so a split contributes eight
-        # independent CTAs. Match FA3's wave-efficiency idea: find the best SM
-        # utilization, then choose the smallest split count reaching 85% of it.
-        # The target H20 has 78 SMs; keeping the value explicit also makes the
-        # fixed-workload decision deterministic across runs.
+        # Each split contributes eight CTAs. On the fixed 78-SM H20, choose the
+        # smallest candidate reaching 85% of the best wave efficiency.
         num_sms = 78
         valid = (1, *tuple(value for value in candidates if value <= max_splits))
         efficiencies = {
@@ -2770,12 +2115,7 @@ def _continuous_kv_ranges(
 
 
 def _combine_decode_partials(partial_outputs, partial_lses, *, output_dtype):
-    """Combine Pack-GQA split outputs with a stable FP32 LSE reduction.
-
-    Each partial output is laid out as ``[B, Hkv, ratio, D]``: the eight query
-    heads sharing one KV head are packed into the kernel's logical M dimension.
-    The local Hopper kernel returns LSE as ``[B, ratio, Hkv, 1]``.
-    """
+    """Combine Pack-GQA split outputs using stable FP32 LSE weights."""
     import torch
 
     o_partial = torch.stack([output.float() for output in partial_outputs], dim=0)
@@ -2803,12 +2143,7 @@ def _qwen3_decode_attention_impl(
     split_candidates: Sequence[int],
     return_stats: bool,
 ):
-    """Safe staged Hopper split-KV implementation.
-
-    This is deliberately isolated behind a replacement-friendly interface. A
-    future single-launch Pack-GQA kernel can replace this function without
-    changing qwen3_decode_attention or qwen3_attention.
-    """
+    """Run staged split-KV Decode behind the replaceable private interface."""
     import torch
 
     _, block_n, _ = _resolve_prefill_config(DECODE_KERNEL_CONFIG)
@@ -2817,10 +2152,8 @@ def _qwen3_decode_attention_impl(
     )
     ranges = _continuous_kv_ranges(k.shape[2], actual_splits, block_n=block_n)
 
-    # Pack the eight query heads belonging to each KV head into logical M rows.
-    # This changes the WGMMA workload from 64 mostly-empty query-head CTAs per
-    # split to 8 CTAs whose first eight rows are all useful, while K/V remain
-    # zero-copy strided views of the original cache.
+    # Pack each KV head's eight query heads into useful logical M rows while
+    # keeping K/V as zero-copy cache views.
     h_r = QWEN_QUERY_HEADS // QWEN_KV_HEADS
     q_packed = q.view(QWEN_BATCH, QWEN_KV_HEADS, h_r, QWEN_HEAD_DIM)
     partial_outputs = []
@@ -2831,9 +2164,8 @@ def _qwen3_decode_attention_impl(
             q_packed,
             k[:, :, begin:end, :],
             v[:, :, begin:end, :],
-            # Packed M rows are query heads, not sequence positions. Every row
-            # attends the complete continuous split for both public causal
-            # choices; global split combination restores full-cache attention.
+            # Packed rows are heads, so each row attends the complete split;
+            # the global combination restores full-cache attention.
             causal=False,
             bottom_right=False,
             sm_scale=sm_scale,
@@ -2852,8 +2184,7 @@ def _qwen3_decode_attention_impl(
             partial_lses.append(partial_lse)
         for stream in streams:
             caller_stream.wait_stream(stream)
-        # wait_stream establishes execution ordering but does not extend the
-        # caching allocator lifetime onto the consumer stream. Record both
+        # wait_stream orders execution but not allocator lifetime; record the
         # partial storages before the asynchronous combine reads them.
         for partial_output, partial_lse in zip(partial_outputs, partial_lses):
             partial_output.record_stream(caller_stream)
@@ -2887,12 +2218,7 @@ def qwen3_decode_attention(
     num_splits=0,
     split_candidates=DEFAULT_DECODE_SPLIT_CANDIDATES,
 ):
-    """Decode attention for q=[1,64,1,128], k/v=[1,8,S,128] BF16 CUDA.
-
-    For the fixed latest-token ``q_len=1`` contract, causal=True and
-    causal=False are equivalent and both visit the complete KV cache. Packed
-    query-head rows therefore run each continuous split without a sequence mask.
-    """
+    """Run latest-token Decode over the complete KV cache."""
     _validate_qwen3_inputs(q, k, v, decode=True, causal=causal)
     sm_scale = _normalize_sm_scale(sm_scale)
     return _qwen3_decode_attention_impl(
@@ -2940,573 +2266,13 @@ def qwen3_attention(
     )
 
 
-def run_qwen3_prefill(
-    seqlen: int,
-    *,
-    persistent: bool,
-    tolerance: float,
-    warmup: int,
-    iterations: int,
-    check_reference: bool,
-    benchmark: bool,
-    input_pattern: str = "random",
-    prefill_config: str = "auto",
-):
-    if seqlen <= 0:
-        raise ValueError("seqlen must be positive")
-    _, block_n, kv_stage = _resolve_prefill_config(prefill_config)
-    return run(
-        q_shape=(QWEN_BATCH, seqlen, QWEN_QUERY_HEADS, QWEN_HEAD_DIM),
-        k_shape=(QWEN_BATCH, seqlen, QWEN_KV_HEADS, QWEN_HEAD_DIM),
-        in_dtype=cutlass.BFloat16,
-        out_dtype=cutlass.BFloat16,
-        qk_acc_dtype=cutlass.Float32,
-        pv_acc_dtype=cutlass.Float32,
-        mma_tiler_mn=(64, block_n),
-        is_persistent=persistent,
-        is_causal=True,
-        bottom_right_align=False,
-        scale_q=1.0,
-        scale_k=1.0,
-        scale_v=1.0,
-        inv_scale_o=1.0,
-        scale_softmax=1.0 / math.sqrt(QWEN_HEAD_DIM),
-        window_size=(-1, -1),
-        tolerance=tolerance,
-        warmup_iterations=warmup,
-        iterations=iterations,
-        skip_ref_check=not check_reference,
-        use_cold_l2=False,
-        execute_benchmark=benchmark,
-        input_pattern=input_pattern,
-        kv_stage=kv_stage,
-        write_lse=False,
-    )
-
-
-def _decode_grouped_reference(q, k, v, sm_scale: float):
-    import torch
-
-    h_r = QWEN_QUERY_HEADS // QWEN_KV_HEADS
-    q_grouped = q.float().view(
-        QWEN_BATCH, QWEN_KV_HEADS, h_r, 1, QWEN_HEAD_DIM
-    )
-    scores = torch.einsum("bhgqd,bhkd->bhgqk", q_grouped, k.float()) * sm_scale
-    probabilities = torch.softmax(scores, dim=-1)
-    output = torch.einsum("bhgqk,bhkd->bhgqd", probabilities, v.float())
-    return output.reshape(QWEN_BATCH, QWEN_QUERY_HEADS, 1, QWEN_HEAD_DIM)
-
-
-def run_qwen3_decode(
-    seqlen: int,
-    *,
-    tolerance: float,
-    warmup: int,
-    iterations: int,
-    check_reference: bool,
-    benchmark: bool,
-    causal: bool,
-    num_splits: Optional[int],
-    split_candidates: Sequence[int],
-):
-    import torch
-
-    if seqlen <= 0:
-        raise ValueError("seqlen must be positive")
-    torch.manual_seed(1111)
-    device = torch.device("cuda", torch.cuda.current_device())
-    q = torch.randn(
-        (QWEN_BATCH, QWEN_QUERY_HEADS, 1, QWEN_HEAD_DIM),
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    k = torch.randn(
-        (QWEN_BATCH, QWEN_KV_HEADS, seqlen, QWEN_HEAD_DIM),
-        device=device,
-        dtype=torch.bfloat16,
-    )
-    v = torch.randn_like(k)
-    sm_scale = 1.0 / math.sqrt(QWEN_HEAD_DIM)
-    output, stats = _qwen3_decode_attention_impl(
-        q,
-        k,
-        v,
-        causal=causal,
-        sm_scale=sm_scale,
-        num_splits=num_splits,
-        split_candidates=split_candidates,
-        return_stats=True,
-    )
-
-    if check_reference:
-        reference = _decode_grouped_reference(q, k, v, sm_scale)
-        error = (output.float() - reference).abs()
-        print(
-            f"Decode S={seqlen} splits={stats['num_splits']} "
-            f"max_abs={error.max().item():.6g}, mean_abs={error.mean().item():.6g}"
-        )
-        torch.testing.assert_close(
-            output.float(), reference, atol=tolerance, rtol=2e-2
-        )
-
-    elapsed_us = None
-    if benchmark:
-        def invoke():
-            return _qwen3_decode_attention_impl(
-                q,
-                k,
-                v,
-                causal=causal,
-                sm_scale=sm_scale,
-                num_splits=num_splits,
-                split_candidates=split_candidates,
-                return_stats=False,
-            )
-
-        for _ in range(warmup):
-            output = invoke()
-        torch.cuda.synchronize()
-        samples = []
-        for _ in range(iterations):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            output = invoke()
-            end.record()
-            end.synchronize()
-            samples.append(start.elapsed_time(end) * 1000)
-        samples.sort()
-        midpoint = len(samples) // 2
-        elapsed_us = (
-            samples[midpoint]
-            if len(samples) % 2
-            else (samples[midpoint - 1] + samples[midpoint]) / 2
-        )
-
-    return {
-        "time_us": elapsed_us,
-        "q": q,
-        "k": k,
-        "v": v,
-        "output": output,
-        **stats,
-    }
-
-
-def check_full_length(result, seqlen: int, tolerance: float) -> None:
-    import torch
-
-    output = result["output"]
-    sample_positions = sorted(
-        {position for position in (0, 1, 127, 128, seqlen // 2, seqlen - 1) if position < seqlen}
-    )
-    total_error = 0.0
-    sample_count = 0
-    max_error = 0.0
-    for position in sample_positions:
-        count = position + 1
-        remainder = count % 17
-        position_sum = (remainder * (remainder - 1) / 2 - 8 * remainder) / 8
-        for kv_head in range(QWEN_KV_HEADS):
-            expected = position_sum / count + kv_head / 4
-            actual = output[position, :, :, kv_head, 0].float()
-            if not torch.isfinite(actual).all():
-                raise AssertionError(
-                    f"non-finite output at position={position}, kv_head={kv_head}"
-                )
-            error = (actual - expected).abs()
-            max_error = max(max_error, error.max().item())
-            total_error += error.sum().item()
-            sample_count += error.numel()
-    mean_error = total_error / sample_count
-    print(
-        f"128K sampled prefix-mean error: max_abs={max_error:.6g}, "
-        f"mean_abs={mean_error:.6g}"
-    )
-    if max_error > tolerance:
-        raise AssertionError(
-            f"full-length sampled error {max_error:.6g} exceeds {tolerance:.6g}"
-        )
-
-
-def causal_tflops(seqlen: int, time_us: float) -> float:
-    flops = (
-        QWEN_BATCH
-        * QWEN_QUERY_HEADS
-        * seqlen
-        * (seqlen + 1)
-        * (QWEN_HEAD_DIM + QWEN_HEAD_DIM)
-    )
-    return flops / (time_us * 1e-6) / 1e12
-
-
-def benchmark_fa3(result, warmup: int, iterations: int):
-    import statistics
-    import torch
-
-    hopper_path = "/dockerdata/linqihao/flash-attention/hopper"
-    if hopper_path not in sys.path:
-        sys.path.insert(0, hopper_path)
-    from flash_attn_interface import flash_attn_func
-
-    q_internal, k_internal, v_internal = result["q"], result["k"], result["v"]
-    seqlen = q_internal.shape[0]
-    q = q_internal.permute(4, 0, 3, 2, 1).reshape(
-        QWEN_BATCH, seqlen, QWEN_QUERY_HEADS, QWEN_HEAD_DIM
-    ).contiguous()
-    k = k_internal.permute(4, 0, 3, 2, 1).reshape(
-        QWEN_BATCH, seqlen, QWEN_KV_HEADS, QWEN_HEAD_DIM
-    ).contiguous()
-    v = v_internal.permute(4, 0, 3, 2, 1).reshape(
-        QWEN_BATCH, seqlen, QWEN_KV_HEADS, QWEN_HEAD_DIM
-    ).contiguous()
-
-    def invoke():
-        return flash_attn_func(
-            q,
-            k,
-            v,
-            softmax_scale=1.0 / math.sqrt(QWEN_HEAD_DIM),
-            causal=True,
-            num_splits=1,
-            pack_gqa=None,
-        )
-
-    with torch.inference_mode():
-        baseline_output = invoke()
-        for _ in range(warmup):
-            baseline_output = invoke()
-        torch.cuda.synchronize()
-        elapsed_us = []
-        for _ in range(iterations):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            baseline_output = invoke()
-            end.record()
-            end.synchronize()
-            elapsed_us.append(start.elapsed_time(end) * 1000)
-
-    local_output = result["output"]
-    max_sample_error = 0.0
-    sample_positions = sorted(
-        {position for position in (0, 127, seqlen // 2, seqlen - 1) if position < seqlen}
-    )
-    for position in sample_positions:
-        for query_head in (0, 7, 8, 63):
-            kv_head, ratio_head = divmod(query_head, QWEN_QUERY_HEADS // QWEN_KV_HEADS)
-            local = local_output[position, :, ratio_head, kv_head, 0].float()
-            baseline = baseline_output[0, position, query_head].float()
-            if not torch.isfinite(local).all() or not torch.isfinite(baseline).all():
-                raise AssertionError(
-                    f"non-finite FA3 comparison at position={position}, head={query_head}"
-                )
-            max_sample_error = max(
-                max_sample_error, (local - baseline).abs().max().item()
-            )
-    return statistics.median(elapsed_us), max_sample_error
-
-
-def benchmark_fa3_decode(result, warmup: int, iterations: int):
-    """Benchmark FA3 Decode with its automatic split and Pack-GQA heuristics."""
-    import statistics
-    import torch
-
-    hopper_path = "/dockerdata/linqihao/flash-attention/hopper"
-    if hopper_path not in sys.path:
-        sys.path.insert(0, hopper_path)
-    from flash_attn_interface import flash_attn_func
-
-    q = result["q"].transpose(1, 2).contiguous()
-    k = result["k"].transpose(1, 2).contiguous()
-    v = result["v"].transpose(1, 2).contiguous()
-
-    def invoke():
-        return flash_attn_func(
-            q,
-            k,
-            v,
-            softmax_scale=1.0 / math.sqrt(QWEN_HEAD_DIM),
-            causal=False,
-            num_splits=0,
-            pack_gqa=None,
-        )
-
-    with torch.inference_mode():
-        baseline_output = invoke()
-        for _ in range(warmup):
-            baseline_output = invoke()
-        torch.cuda.synchronize()
-        elapsed_us = []
-        for _ in range(iterations):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            baseline_output = invoke()
-            end.record()
-            end.synchronize()
-            elapsed_us.append(start.elapsed_time(end) * 1000)
-
-    local_output = result["output"].transpose(1, 2)
-    max_error = (local_output.float() - baseline_output.float()).abs().max().item()
-    return statistics.median(elapsed_us), max_error
-
-
-def benchmark_original_prefill(result, warmup: int, iterations: int):
-    import statistics
-    import torch
-    import implement_attention as original
-
-    q_internal, k_internal, v_internal = result["q"], result["k"], result["v"]
-    seqlen = q_internal.shape[0]
-    q = q_internal.permute(4, 3, 2, 0, 1).reshape(
-        QWEN_BATCH, QWEN_QUERY_HEADS, seqlen, QWEN_HEAD_DIM
-    ).contiguous()
-    k = k_internal.permute(4, 3, 2, 0, 1).reshape(
-        QWEN_BATCH, QWEN_KV_HEADS, seqlen, QWEN_HEAD_DIM
-    ).contiguous()
-    v = v_internal.permute(4, 3, 2, 0, 1).reshape(
-        QWEN_BATCH, QWEN_KV_HEADS, seqlen, QWEN_HEAD_DIM
-    ).contiguous()
-
-    def invoke():
-        return original.qwen3_prefill_attention(q, k, v, causal=True)
-
-    with torch.inference_mode():
-        baseline_output = invoke()
-        for _ in range(warmup):
-            baseline_output = invoke()
-        torch.cuda.synchronize()
-        elapsed_us = []
-        for _ in range(iterations):
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-            baseline_output = invoke()
-            end.record()
-            end.synchronize()
-            elapsed_us.append(start.elapsed_time(end) * 1000)
-
-    local_output = result["output"].permute(4, 3, 2, 0, 1).reshape_as(q)
-    max_error = (local_output.float() - baseline_output.float()).abs().max().item()
-    return statistics.median(elapsed_us), max_error
-
-
-def parse_seqlens(value: str):
-    try:
-        values = [int(item) for item in value.split(",")]
-    except ValueError as exc:
-        raise argparse.ArgumentTypeError("expected comma-separated integers") from exc
-    if not values or any(value <= 0 for value in values):
-        raise argparse.ArgumentTypeError("sequence lengths must be positive")
-    return values
-
-
-def parse_split_candidates(value: str):
-    try:
-        return _normalize_split_candidates(tuple(int(item) for item in value.split(",")))
-    except (TypeError, ValueError) as exc:
-        raise argparse.ArgumentTypeError(
-            "expected comma-separated positive split counts"
-        ) from exc
-
-
-def decode_tflops(seqlen: int, time_us: float) -> float:
-    flops = 4 * QWEN_BATCH * QWEN_QUERY_HEADS * seqlen * QWEN_HEAD_DIM
-    return flops / (time_us * 1e-6) / 1e12
-
-
 def main() -> None:
-    parser = argparse.ArgumentParser(
-        description="Qwen3-32B BF16 GQA prefill/decode attention on Hopper SM90"
-    )
-    parser.add_argument(
-        "--mode", choices=("correctness", "full-check", "benchmark"), default="correctness"
-    )
-    parser.add_argument(
-        "--phase", choices=("prefill", "decode", "both"), default="prefill"
-    )
-    parser.add_argument("--seqlen", type=int, default=QWEN_CONTEXT)
-    parser.add_argument("--seqlens", type=parse_seqlens, default=[128, 257, 1024])
-    parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--iterations", type=int, default=10)
-    parser.add_argument("--tolerance", type=float, default=5e-2)
-    parser.add_argument("--persistent", action="store_true")
-    parser.add_argument("--num-splits", type=int, default=0)
-    parser.add_argument(
-        "--split-candidates",
-        type=parse_split_candidates,
-        default=DEFAULT_DECODE_SPLIT_CANDIDATES,
-    )
-    parser.add_argument(
-        "--prefill-config",
-        choices=("auto", *PREFILL_CONFIGS),
-        default="auto",
-    )
-    parser.add_argument("--compare-fa3", action="store_true")
-    parser.add_argument("--compare-original", action="store_true")
-    args = parser.parse_args()
-
-    if args.warmup < 0 or args.iterations <= 0:
-        parser.error("--warmup must be non-negative and --iterations must be positive")
-    if args.tolerance <= 0:
-        parser.error("--tolerance must be positive")
-    if args.num_splits < 0:
-        parser.error("--num-splits must be non-negative")
-
-    run_prefill = args.phase in {"prefill", "both"}
-    run_decode = args.phase in {"decode", "both"}
-
-    if args.mode == "correctness":
-        if run_prefill:
-            for seqlen in args.seqlens:
-                run_qwen3_prefill(
-                    seqlen,
-                    persistent=args.persistent,
-                    tolerance=args.tolerance,
-                    warmup=0,
-                    iterations=1,
-                    check_reference=True,
-                    benchmark=False,
-                    prefill_config=args.prefill_config,
-                )
-        if run_decode:
-            for seqlen in args.seqlens:
-                split_requests = [1]
-                requested = args.num_splits if args.num_splits else 0
-                actual = _select_decode_splits(
-                    seqlen, requested, args.split_candidates
-                )
-                if actual != 1:
-                    split_requests.append(requested)
-                for causal in (False, True):
-                    for split_request in split_requests:
-                        run_qwen3_decode(
-                            seqlen,
-                            tolerance=args.tolerance,
-                            warmup=0,
-                            iterations=1,
-                            check_reference=True,
-                            benchmark=False,
-                            causal=causal,
-                            num_splits=split_request,
-                            split_candidates=args.split_candidates,
-                        )
-        print("Correctness checks passed")
-        return
-
-    if args.mode == "full-check":
-        if run_prefill:
-            result = run_qwen3_prefill(
-                args.seqlen,
-                persistent=args.persistent,
-                tolerance=args.tolerance,
-                warmup=0,
-                iterations=1,
-                check_reference=False,
-                benchmark=False,
-                input_pattern="prefix",
-                prefill_config=args.prefill_config,
-            )
-            check_full_length(result, args.seqlen, args.tolerance)
-            print("Prefill full-length sampled check passed")
-        if run_decode:
-            run_qwen3_decode(
-                args.seqlen,
-                tolerance=args.tolerance,
-                warmup=0,
-                iterations=1,
-                check_reference=True,
-                benchmark=False,
-                causal=True,
-                num_splits=args.num_splits,
-                split_candidates=args.split_candidates,
-            )
-            print("Decode full-length reference check passed")
-        return
-
-    if run_prefill:
-        result = run_qwen3_prefill(
-            args.seqlen,
-            persistent=args.persistent,
-            tolerance=args.tolerance,
-            warmup=args.warmup,
-            iterations=args.iterations,
-            check_reference=False,
-            benchmark=True,
-            prefill_config=args.prefill_config,
-        )
-        local_time_us = float(result["time_us"])
-        resolved_config, _, _ = _resolve_prefill_config(args.prefill_config)
-        print(
-            f"Prefill local CuTe ({resolved_config}): {local_time_us:.3f} us, "
-            f"{causal_tflops(args.seqlen, local_time_us):.3f} TFLOP/s, "
-            f"peak_memory={result['peak_memory_bytes'] / 2**30:.3f} GiB"
-        )
-        if args.compare_fa3:
-            fa3_time_us, sample_error = benchmark_fa3(
-                result, args.warmup, args.iterations
-            )
-            print(
-                f"FA3 pack_gqa=None: {fa3_time_us:.3f} us, "
-                f"{causal_tflops(args.seqlen, fa3_time_us):.3f} TFLOP/s"
-            )
-            print(
-                f"Speed ratio (FA3/local): {fa3_time_us / local_time_us:.4f}x, "
-                f"sample max_abs={sample_error:.6g}"
-            )
-            if sample_error > args.tolerance:
-                raise AssertionError(
-                    f"FA3 sample error {sample_error:.6g} exceeds {args.tolerance:.6g}"
-                )
-        if args.compare_original:
-            original_time_us, max_error = benchmark_original_prefill(
-                result, args.warmup, args.iterations
-            )
-            print(
-                f"Original prefill: {original_time_us:.3f} us, "
-                f"original/local={original_time_us / local_time_us:.4f}x, "
-                f"max_abs={max_error:.6g}"
-            )
-
-    if run_decode:
-        result = run_qwen3_decode(
-            args.seqlen,
-            tolerance=args.tolerance,
-            warmup=args.warmup,
-            iterations=args.iterations,
-            check_reference=False,
-            benchmark=True,
-            causal=True,
-            num_splits=args.num_splits,
-            split_candidates=args.split_candidates,
-        )
-        local_time_us = float(result["time_us"])
-        print(
-            f"Decode staged CuTe: {local_time_us:.3f} us, "
-            f"{decode_tflops(args.seqlen, local_time_us):.3f} TFLOP/s, "
-            f"splits={result['num_splits']}, "
-            f"partial_wgmma_launches={result['partial_wgmma_launches']}"
-        )
-        print(
-            "Decode path: 8 query heads are Pack-GQA M rows; independent KV "
-            "splits launch on concurrent CUDA streams, followed by FP32 LSE combine"
-        )
-        if args.compare_original:
-            print("Original decode comparison unavailable: implement_attention.py has no decode API")
-        if args.compare_fa3:
-            fa3_time_us, max_error = benchmark_fa3_decode(
-                result, args.warmup, args.iterations
-            )
-            print(
-                f"FA3 decode auto: {fa3_time_us:.3f} us, "
-                f"FA3/local={fa3_time_us / local_time_us:.4f}x, "
-                f"max_abs={max_error:.6g}"
-            )
-            if max_error > args.tolerance:
-                raise AssertionError(
-                    f"FA3 decode error {max_error:.6g} exceeds {args.tolerance:.6g}"
-                )
+    """CLI entry point; diagnostics live in the ``_attention_diagnostics`` module."""
+    try:
+        from . import _attention_diagnostics as _diag
+    except ImportError:
+        import _attention_diagnostics as _diag
+    _diag.main_optimized(sys.modules[__name__])
 
 
 if __name__ == "__main__":
