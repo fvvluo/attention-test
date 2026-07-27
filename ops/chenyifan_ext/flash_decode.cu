@@ -11,10 +11,13 @@
 namespace {
 
 constexpr int kHeadDim = 128;
-constexpr int kWarps = 8;
+constexpr int kWarps = 1;
 constexpr int kThreads = kWarps * 32;
 constexpr int kTokensPerTile = 32;
 constexpr int kKStride = kHeadDim + 8;
+constexpr int kVStride = kHeadDim + 8;
+constexpr int kQStride = kHeadDim + 8;
+constexpr int kPStride = kTokensPerTile + 8;
 constexpr int kMaxSplits = 64;
 constexpr int kMaxGroup = 8;   // max q-heads per kv-head (decode M dim), decoupled from kWarps
 
@@ -91,11 +94,11 @@ __global__ void decode_split_kernel(
     int kv_len,
     int splits,
     float scale) {
-    __shared__ __align__(16) __nv_bfloat16 s_q[16][kHeadDim];  // pad to 16 rows for mma M
+    __shared__ __align__(16) __nv_bfloat16 s_q[16][kQStride];  // 16 mma-M rows + bank padding
     __shared__ __align__(16) __nv_bfloat16 s_k[2][kTokensPerTile][kKStride];
-    __shared__ __align__(16) __nv_bfloat16 s_v[2][kTokensPerTile][kHeadDim];
+    __shared__ __align__(16) __nv_bfloat16 s_v[2][kTokensPerTile][kVStride];
     __shared__ float s_probs[kMaxGroup][kTokensPerTile];
-    __shared__ __align__(16) __nv_bfloat16 s_pbf[16][kTokensPerTile];  // P (bf16) for PV mma
+    __shared__ __align__(16) __nv_bfloat16 s_pbf[16][kPStride];  // P (bf16), padded for PV ldmatrix
     __shared__ float s_alpha[kMaxGroup];                               // per-head rescale
     __shared__ float s_row_max[kMaxGroup];
     __shared__ float s_row_sum[kMaxGroup];
@@ -129,13 +132,16 @@ __global__ void decode_split_kernel(
 
     const long long q_group_offset =
         (static_cast<long long>(b) * q_heads + kv_head * group) * kHeadDim;
-    constexpr int kQVectors = kWarps * kHeadDim / 8;      // 128 (rows 0..7)
-    constexpr int kQVectorsPad = 16 * kHeadDim / 8;       // 256 (rows 0..15)
-    if (tid < kQVectors) {
-        reinterpret_cast<uint4*>(s_q)[tid] =
-            reinterpret_cast<const uint4*>(q + q_group_offset)[tid];
-    } else if (tid < kQVectorsPad) {
-        reinterpret_cast<uint4*>(s_q)[tid] = make_uint4(0, 0, 0, 0);
+    constexpr int kQVecsPerRow = kHeadDim / 8;
+    constexpr int kQVectors = kMaxGroup * kQVecsPerRow;  // rows 0..7: real q heads
+    constexpr int kQVectorsPad = 16 * kQVecsPerRow;      // rows 8..15: mma zero pad
+    for (int vec = tid; vec < kQVectorsPad; vec += kThreads) {
+        const int row = vec / kQVecsPerRow;
+        const int vec_in_row = vec % kQVecsPerRow;
+        reinterpret_cast<uint4*>(&s_q[row][vec_in_row * 8])[0] =
+            vec < kQVectors
+                ? reinterpret_cast<const uint4*>(q + q_group_offset)[vec]
+                : make_uint4(0, 0, 0, 0);
     }
 
     const long long kv_head_offset =
@@ -152,7 +158,7 @@ __global__ void decode_split_kernel(
                 &s_k[0][token][vec_in_row * 8],
                 reinterpret_cast<const uint4*>(k + first_offset) + vec);
             cp_async_16(
-                reinterpret_cast<uint4*>(&s_v[0][0][0]) + vec,
+                &s_v[0][token][vec_in_row * 8],
                 reinterpret_cast<const uint4*>(v + first_offset) + vec);
         }
         cp_async_commit();
@@ -177,7 +183,7 @@ __global__ void decode_split_kernel(
                     &s_k[next_stage][token][vec_in_row * 8],
                     reinterpret_cast<const uint4*>(k + next_offset) + vec);
                 cp_async_16(
-                    reinterpret_cast<uint4*>(&s_v[next_stage][0][0]) + vec,
+                    &s_v[next_stage][token][vec_in_row * 8],
                     reinterpret_cast<const uint4*>(v + next_offset) + vec);
             }
             cp_async_commit();
@@ -415,7 +421,7 @@ torch::Tensor decode_forward(
     TORCH_CHECK(q.size(0) > 0 && q.size(1) > 0 && k.size(1) > 0 && k.size(2) > 0,
                 "batch, head counts, and kv_len must be positive");
     TORCH_CHECK(q.size(1) % k.size(1) == 0, "q_heads must be divisible by kv_heads");
-    TORCH_CHECK(q.size(1) / k.size(1) <= kWarps, "decode supports at most 8 q heads per kv head");
+    TORCH_CHECK(q.size(1) / k.size(1) <= kMaxGroup, "decode supports at most 8 q heads per kv head");
     TORCH_CHECK(k.size(2) % 128 == 0, "decode requires kv_len divisible by 128");
 
     auto q_contig = q.contiguous();
