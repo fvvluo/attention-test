@@ -16,6 +16,7 @@ constexpr int kThreads = kWarps * 32;
 constexpr int kTokensPerTile = 32;
 constexpr int kKStride = kHeadDim + 8;
 constexpr int kMaxSplits = 64;
+constexpr int kMaxGroup = 8;   // max q-heads per kv-head (decode M dim), decoupled from kWarps
 
 __device__ __forceinline__ float warp_sum(float x) {
     #pragma unroll
@@ -46,6 +47,37 @@ __device__ __forceinline__ void cp_async_wait() {
     asm volatile("cp.async.wait_group 0;\n" ::);
 }
 
+// D[16x8] += A[16x16] * B[16x8]^T ; A row-major, B col-major, bf16 in, f32 out.
+// Thread->fragment mapping per PTX ISA mma.m16n8k16.
+__device__ __forceinline__ void mma_m16n8k16(
+    float (&d)[4], const uint32_t (&a)[4], const uint32_t (&b)[2]) {
+    asm volatile(
+        "mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
+        : "+f"(d[0]), "+f"(d[1]), "+f"(d[2]), "+f"(d[3])
+        : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]),
+          "r"(b[0]), "r"(b[1]));
+}
+
+// ldmatrix.x4: load a 16x16 bf16 matrix tile from shared into 4 regs/thread
+// (row-major source), producing the A-operand fragment layout for m16n8k16.
+__device__ __forceinline__ void ldmatrix_x4(uint32_t (&r)[4], const void* smem_ptr) {
+    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x4.shared.b16 {%0,%1,%2,%3}, [%4];\n"
+        : "=r"(r[0]), "=r"(r[1]), "=r"(r[2]), "=r"(r[3])
+        : "r"(addr));
+}
+
+// ldmatrix.x2: load a 16x8 bf16 tile (B-operand fragment for m16n8k16).
+__device__ __forceinline__ void ldmatrix_x2(uint32_t (&r)[2], const void* smem_ptr) {
+    const unsigned addr = static_cast<unsigned>(__cvta_generic_to_shared(smem_ptr));
+    asm volatile(
+        "ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
+        : "=r"(r[0]), "=r"(r[1])
+        : "r"(addr));
+}
+
 __global__ void decode_split_kernel(
     const __nv_bfloat16* __restrict__ q,
     const __nv_bfloat16* __restrict__ k,
@@ -59,10 +91,14 @@ __global__ void decode_split_kernel(
     int kv_len,
     int splits,
     float scale) {
-    __shared__ __align__(16) __nv_bfloat16 s_q[kWarps][kHeadDim];
+    __shared__ __align__(16) __nv_bfloat16 s_q[16][kHeadDim];  // pad to 16 rows for mma M
     __shared__ __align__(16) __nv_bfloat16 s_k[2][kTokensPerTile][kKStride];
     __shared__ __align__(16) __nv_bfloat16 s_v[2][kTokensPerTile][kHeadDim];
-    __shared__ float s_probs[kWarps][kTokensPerTile];
+    __shared__ float s_probs[kMaxGroup][kTokensPerTile];
+    __shared__ __align__(16) __nv_bfloat16 s_pbf[16][kTokensPerTile];  // P (bf16) for PV mma
+    __shared__ float s_alpha[kMaxGroup];                               // per-head rescale
+    __shared__ float s_row_max[kMaxGroup];
+    __shared__ float s_row_sum[kMaxGroup];
 
     const int tid = threadIdx.x;
     const int warp = tid >> 5;
@@ -78,16 +114,28 @@ __global__ void decode_split_kernel(
     const int tile_begin = static_cast<int>((static_cast<long long>(tiles) * split) / splits);
     const int tile_end = static_cast<int>((static_cast<long long>(tiles) * (split + 1)) / splits);
 
-    float row_max = -INFINITY;
-    float row_sum = 0.0f;
-    float out[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // warp0 owns online softmax stats (per head) and the O accumulator.
+    if (warp == 0 && lane < kMaxGroup) {
+        s_row_max[lane] = -INFINITY;
+        s_row_sum[lane] = 0.0f;
+    }
+    // acc_o[16 n8-blocks over d=128][4 f32], persistent across tiles (warp0 only).
+    float acc_o[kHeadDim / 8][4];
+    #pragma unroll
+    for (int nb = 0; nb < kHeadDim / 8; ++nb) {
+        #pragma unroll
+        for (int r = 0; r < 4; ++r) acc_o[nb][r] = 0.0f;
+    }
 
     const long long q_group_offset =
         (static_cast<long long>(b) * q_heads + kv_head * group) * kHeadDim;
-    constexpr int kQVectors = kWarps * kHeadDim / 8;
+    constexpr int kQVectors = kWarps * kHeadDim / 8;      // 128 (rows 0..7)
+    constexpr int kQVectorsPad = 16 * kHeadDim / 8;       // 256 (rows 0..15)
     if (tid < kQVectors) {
         reinterpret_cast<uint4*>(s_q)[tid] =
             reinterpret_cast<const uint4*>(q + q_group_offset)[tid];
+    } else if (tid < kQVectorsPad) {
+        reinterpret_cast<uint4*>(s_q)[tid] = make_uint4(0, 0, 0, 0);
     }
 
     const long long kv_head_offset =
@@ -135,87 +183,165 @@ __global__ void decode_split_kernel(
             cp_async_commit();
         }
 
-        if (active) {
-            const int subgroup = lane >> 3;
-            const int subgroup_lane = lane & 7;
+        // ---- QK via tensor-core mma (warp 0 computes full 8x32 score) ----
+        // A = Q[16(head, 8 valid) x 16(dim)], B = K[16(token) x 16(dim)] col-major,
+        // D[m(head)][n(token)] += sum_d Q[m][d]*K[n][d].  Loop d over 8 k16 blocks,
+        // token over 4 n8 blocks (32 tokens). One warp owns the whole tile.
+        if (warp == 0) {
+            // acc[nblk][4]: 4 f32 per (m,n) fragment, per PTX m16n8k16 D-layout.
+            float acc[4][4];
             #pragma unroll
-            for (int token_base = 0; token_base < kTokensPerTile; token_base += 4) {
-                const int token = token_base + subgroup;
-                const int d = subgroup_lane * 16;
-                float dot = 0.0f;
+            for (int nb = 0; nb < 4; ++nb) {
                 #pragma unroll
-                for (int i = 0; i < 16; i += 2) {
-                    const float2 q_pair = __bfloat1622float2(
-                        *reinterpret_cast<const __nv_bfloat162*>(&s_q[warp][d + i]));
-                    const float2 k_pair = __bfloat1622float2(
-                        *reinterpret_cast<const __nv_bfloat162*>(&s_k[stage][token][d + i]));
-                    dot = fmaf(q_pair.x, k_pair.x, dot);
-                    dot = fmaf(q_pair.y, k_pair.y, dot);
-                }
+                for (int r = 0; r < 4; ++r) acc[nb][r] = 0.0f;
+            }
+            #pragma unroll
+            for (int kblk = 0; kblk < kHeadDim / 16; ++kblk) {
+                const int d0 = kblk * 16;
+                uint32_t a_frag[4];
+                // A source: row = lane%16 (head, only 0..7 valid, 8..15 zero-padded
+                // via s_q padding), col group = (lane/16)*8 within the 16-dim block.
+                const __nv_bfloat16* a_ptr = &s_q[lane % 16][d0 + (lane / 16) * 8];
+                ldmatrix_x4(a_frag, a_ptr);
                 #pragma unroll
-                for (int offset = 4; offset > 0; offset >>= 1) {
-                    dot += __shfl_down_sync(0xffffffff, dot, offset, 8);
+                for (int nb = 0; nb < 4; ++nb) {
+                    const int tok0 = nb * 8;
+                    uint32_t b_frag[2];
+                    // B source (col-major for mma): row = token, col = dim.
+                    // ldmatrix.x2 loads a 16x8 tile; provide per-lane row address.
+                    const __nv_bfloat16* b_ptr =
+                        &s_k[stage][tok0 + (lane % 8)][d0 + (lane / 8) * 8];
+                    ldmatrix_x2(b_frag, b_ptr);
+                    mma_m16n8k16(acc[nb], a_frag, b_frag);
                 }
-                if (subgroup_lane == 0) {
-                    s_probs[warp][token] = token < valid_tokens ? dot * scale : -INFINITY;
+            }
+            // Write scores to s_probs. D-fragment layout (m16n8k16):
+            //   c0,c1 -> row = group,    col = 2*(lane%4) + {0,1}
+            //   c2,c3 -> row = group+8,  col = 2*(lane%4) + {0,1}
+            // where group = lane/4. Only rows 0..7 (heads) are valid.
+            const int frag_group = lane / 4;
+            const int col_base = 2 * (lane % 4);
+            #pragma unroll
+            for (int nb = 0; nb < 4; ++nb) {
+                const int tok0 = nb * 8;
+                // c0,c1: row = frag_group (head 0..7); c2,c3: row = frag_group+8 (unused)
+                #pragma unroll
+                for (int c = 0; c < 2; ++c) {
+                    const int head = frag_group;         // rows 0..7 -> heads
+                    const int token = tok0 + col_base + c;
+                    if (head < group && token < kTokensPerTile) {
+                        s_probs[head][token] =
+                            token < valid_tokens ? acc[nb][c] * scale : -INFINITY;
+                    }
                 }
+            }
+        }
+        __syncthreads();
+
+        // ---- Online softmax (warp0, lanes 0..7 own one head row each) + PV mma ----
+        if (warp == 0) {
+            // 1) per-head online softmax over the 32-token tile; produce bf16 P.
+            if (lane < group) {
+                const int head = lane;
+                const float prev_max = s_row_max[head];
+                const float prev_sum = s_row_sum[head];
+                float tile_max = -INFINITY;
+                #pragma unroll
+                for (int t = 0; t < kTokensPerTile; ++t) {
+                    tile_max = fmaxf(tile_max, s_probs[head][t]);
+                }
+                const float new_max = fmaxf(prev_max, tile_max);
+                const float alpha =
+                    prev_max == -INFINITY ? 0.0f : __expf(prev_max - new_max);
+                float tile_sum = 0.0f;
+                #pragma unroll
+                for (int t = 0; t < kTokensPerTile; ++t) {
+                    const float p = __expf(s_probs[head][t] - new_max);
+                    tile_sum += p;
+                    s_pbf[head][t] = __float2bfloat16(p);
+                }
+                s_alpha[head] = alpha;
+                s_row_max[head] = new_max;
+                s_row_sum[head] = prev_sum * alpha + tile_sum;
+            }
+            // zero-pad P rows 8..15 (mma M padding).
+            if (lane >= group && lane < 16) {
+                #pragma unroll
+                for (int t = 0; t < kTokensPerTile; ++t) {
+                    s_pbf[lane][t] = __float2bfloat16(0.0f);
+                }
+            }
+            __syncwarp();
+
+            // 2) rescale persistent O accumulator by per-head alpha.
+            //    D-layout: acc_o[nb][0,1] -> head = lane/4 ; [2,3] -> head=lane/4+8 (unused)
+            const float alpha_h = s_alpha[lane / 4];
+            #pragma unroll
+            for (int nb = 0; nb < kHeadDim / 8; ++nb) {
+                acc_o[nb][0] *= alpha_h;
+                acc_o[nb][1] *= alpha_h;
             }
 
-            __syncwarp();
-            const float previous_max = __shfl_sync(0xffffffff, row_max, 0);
-            const float previous_sum = __shfl_sync(0xffffffff, row_sum, 0);
-            const float score = s_probs[warp][lane];
-            const float tile_max = warp_max(score);
-            const float new_max = fmaxf(previous_max, tile_max);
-            float alpha = 0.0f;
-            if (lane == 0) {
-                alpha = previous_max == -INFINITY ? 0.0f : __expf(previous_max - new_max);
-            }
-            alpha = __shfl_sync(0xffffffff, alpha, 0);
-            const float probability = __expf(score - new_max);
-            s_probs[warp][lane] = probability;
-            const float tile_sum = warp_sum(probability);
-            if (lane == 0) {
-                row_sum = previous_sum * alpha + tile_sum;
-                row_max = new_max;
-            }
-            __syncwarp();
-
+            // 3) PV mma: O[16(head) x 128(d)] += P[16 x 32(token)] @ V[32(token) x 128(d)]
+            //    A = P (row-major), B = V (col-major). token=32 -> 2 k16; d=128 -> 16 n8.
             #pragma unroll
-            for (int i = 0; i < 4; ++i) {
-                out[i] *= alpha;
-            }
-            #pragma unroll
-            for (int token = 0; token < kTokensPerTile; ++token) {
-                const float probability = s_probs[warp][token];
-                const int d = lane * 4;
-                const float2 v01 = __bfloat1622float2(
-                    *reinterpret_cast<const __nv_bfloat162*>(&s_v[stage][token][d]));
-                const float2 v23 = __bfloat1622float2(
-                    *reinterpret_cast<const __nv_bfloat162*>(&s_v[stage][token][d + 2]));
-                out[0] = fmaf(probability, v01.x, out[0]);
-                out[1] = fmaf(probability, v01.y, out[1]);
-                out[2] = fmaf(probability, v23.x, out[2]);
-                out[3] = fmaf(probability, v23.y, out[3]);
+            for (int kblk = 0; kblk < kTokensPerTile / 16; ++kblk) {
+                const int t0 = kblk * 16;
+                uint32_t a_frag[4];
+                // A source: row = lane%16 (head), col group = (lane/16)*8 within 16 tokens.
+                ldmatrix_x4(a_frag, &s_pbf[lane % 16][t0 + (lane / 16) * 8]);
+                #pragma unroll
+                for (int nb = 0; nb < kHeadDim / 8; ++nb) {
+                    const int d0 = nb * 8;
+                    uint32_t b_frag[2];
+                    // B col-major m16n8k16 (k=token, n=d). Per PTX B-fragment map:
+                    //   b0 -> rows {2*(lane%4), 2*(lane%4)+1}, col = lane/4
+                    //   b1 -> rows {2*(lane%4)+8, +9},         col = lane/4
+                    const int nrow = 2 * (lane % 4);
+                    const int ncol = lane / 4;   // 0..7 -> d within n8
+                    __nv_bfloat162 b0 = make_bfloat162(
+                        s_v[stage][t0 + nrow][d0 + ncol],
+                        s_v[stage][t0 + nrow + 1][d0 + ncol]);
+                    __nv_bfloat162 b1 = make_bfloat162(
+                        s_v[stage][t0 + nrow + 8][d0 + ncol],
+                        s_v[stage][t0 + nrow + 9][d0 + ncol]);
+                    b_frag[0] = *reinterpret_cast<const uint32_t*>(&b0);
+                    b_frag[1] = *reinterpret_cast<const uint32_t*>(&b1);
+                    mma_m16n8k16(acc_o[nb], a_frag, b_frag);
+                }
             }
         }
 
         if (next_tile < tile_end) {
             cp_async_wait();
             __syncthreads();
+        } else {
+            __syncthreads();
         }
     }
 
-    if (active) {
-        const long long stat_idx =
-            (static_cast<long long>(b) * q_heads + q_head) * splits + split;
-        if (lane == 0) {
-            partial_m[stat_idx] = row_max;
-            partial_l[stat_idx] = row_sum;
+    // ---- write partial results (warp0 holds acc_o) ----
+    if (warp == 0) {
+        const int frag_group = lane / 4;   // head for c0,c1
+        const int col_base = 2 * (lane % 4);
+        const int head = frag_group;
+        if (head < group) {
+            const int q_head_out = kv_head * group + head;
+            const long long stat_idx =
+                (static_cast<long long>(b) * q_heads + q_head_out) * splits + split;
+            const long long out_base = stat_idx * kHeadDim;
+            // acc_o[nb][0,1] -> d = nb*8 + col_base + {0,1}
+            #pragma unroll
+            for (int nb = 0; nb < kHeadDim / 8; ++nb) {
+                const int d0 = nb * 8 + col_base;
+                partial_o[out_base + d0 + 0] = acc_o[nb][0];
+                partial_o[out_base + d0 + 1] = acc_o[nb][1];
+            }
+            if (lane % 4 == 0) {
+                partial_m[stat_idx] = s_row_max[head];
+                partial_l[stat_idx] = s_row_sum[head];
+            }
         }
-        const long long out_idx = stat_idx * kHeadDim;
-        reinterpret_cast<float4*>(partial_o + out_idx)[lane] =
-            make_float4(out[0], out[1], out[2], out[3]);
     }
 }
 
