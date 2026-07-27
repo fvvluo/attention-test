@@ -1,8 +1,9 @@
 # ============================================================
-# 融合算子：按 q_len 路由 prefill / decode，得到完整 FlashAttention
+# 融合算子 v7：按 q_len 路由 prefill / decode，得到完整 FlashAttention
 #   q_len == 1  -> ops/_decode2.py 的 split-K flash-decoding kernel（Triton）
-#   q_len  > 1  -> ops/_prefill.py 的 Hopper SM90 FMHA kernel（CuTe DSL）
-# 只做"拼接/融合"，不修改任何已有文件（_prefill.py / _decode2.py 保持只读）。
+#   q_len  > 1  -> ops/_prefill2.py 的 Hopper SM90 FMHA kernel（CuTe DSL，
+#                  新优化版）
+# 只做"拼接/融合"，不修改任何已有文件（_prefill2.py / _decode2.py 保持只读）。
 # 全程 BHSD：
 #   q:  (b, q_heads,  q_len,  d)
 #   k/v:(b, kv_heads, kv_len, d)
@@ -19,7 +20,7 @@ from .base import register
 
 
 # ------------------------------------------------------------
-# 让 ops/_prefill.py 能 import：其 `from . import fmha_helpers` 会回退到
+# 让 ops/_prefill2.py 能 import：其 `from . import fmha_helpers` 会回退到
 # 顶层 `import fmha_helpers`，该模块住在 baseline 的 CuTeDSL utils 目录。
 # ------------------------------------------------------------
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -37,7 +38,7 @@ _CUTEDSL_UTILS = os.path.join(
 if os.path.isdir(_CUTEDSL_UTILS) and _CUTEDSL_UTILS not in sys.path:
     sys.path.insert(0, _CUTEDSL_UTILS)
 
-# _prefill.py 用 compute_grid(..., device_id=...) 调用，但 baseline 的
+# _prefill2.py 用 compute_grid(..., device_id=...) 调用，但 baseline 的
 # fmha_helpers.compute_grid 签名不含 device_id。包一层吞掉它再转调原实现
 # （单 GPU 下 device_id 恒为 0，忽略语义正确）。
 import fmha_helpers as _fmha_helpers  # noqa: E402
@@ -56,8 +57,8 @@ import cutlass.cute as cute  # noqa: E402
 from cutlass.cute.runtime import from_dlpack  # noqa: E402
 import cuda.bindings.driver as cuda  # noqa: E402
 
-from . import _prefill as _prefill_mod  # noqa: E402
-from . import _decode2 as _decode_mod  # noqa: E402  (新实现的 decode kernel)
+from . import _prefill2 as _prefill_mod  # noqa: E402  (新优化的 prefill kernel v2)
+from . import _decode2 as _decode_mod  # noqa: E402  (decode kernel v2)
 
 
 _TORCH_TO_CUTLASS = {
@@ -112,7 +113,7 @@ def _alloc_lse_cute(b, h_r, h_k, s_q, dtype_torch, device):
 
 
 # ------------------------------------------------------------
-# prefill 驱动（q_len > 1）：调用 _prefill.py 的 Hopper FMHA kernel
+# prefill 驱动（q_len > 1）：调用 _prefill2.py 的 Hopper FMHA kernel
 # ------------------------------------------------------------
 def _run_prefill(q, k, v, causal, sm_scale):
     b, h, s_q, d = q.shape
@@ -145,7 +146,7 @@ def _run_prefill(q, k, v, causal, sm_scale):
     v_cute, _v_buf = _make_cute_from_bhsd(v, h_k, 1, dtype_cutlass)
 
     if cached is None:
-        # mask 类型：复刻 _prefill.run 的逻辑
+        # mask 类型：复刻 _prefill2.run 的逻辑
         window_size_right = None
         mask_type = _fmha_helpers.MaskEnum.WINDOW_MASK
         if causal:
@@ -235,4 +236,4 @@ def attention(q, k, v, causal=True, sm_scale=None):
     return _run_prefill(q, k, v, causal, sm_scale)
 
 
-register("prefill_decode_fused (cute+triton)", attention)
+register("prefill_decode_fused7 (cute+triton)", attention)
