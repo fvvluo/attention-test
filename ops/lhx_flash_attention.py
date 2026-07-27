@@ -30,7 +30,7 @@
 #   [DONE] EXERCISE (1)  LPT tile scheduling            -> SingleTileLPTScheduler
 #   [DONE] EXERCISE (2)  Causal n-block skipping        -> skip invisible blocks; mask boundaries only
 #   [DONE] EXERCISE (3)  Warp specialization            -> 128-thread TMA WG + 256-thread MMA WGs
-#   [EASY] EXERCISE (4)  Register redistribution        -> setmaxnreg calls deleted
+#   [DONE] EXERCISE (4)  Register redistribution        -> producer 24, MMA consumers 240
 #   [MEDIUM] EXERCISE (5)  Intra-warpgroup overlap      -> QK and PV serialized in one iteration
 #   [HARD] EXERCISE (6)  Inter-warpgroup ping-pong      -> warp scheduler barriers deleted
 #
@@ -227,8 +227,12 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         self.num_Q_load_threads = self.num_producer_threads
         self.num_epilogue_threads = self.num_mma_threads
 
-        # EXERCISE (4): register redistribution is still deliberately disabled. The
-        # producer and consumer warpgroups retain the compiler's default allocation.
+        # Exercise 4: the 384-thread CTA starts with 168 registers/thread. Donate the
+        # producer WG's registers to the two accumulator-heavy consumer WGs:
+        # 24 + 2 * 240 = 504 = 3 * 168 warpgroup register units.
+        self.num_producer_regs = 24
+        self.num_mma_regs = 240
+        assert self.num_producer_regs + self.num_wg_mma * self.num_mma_regs <= 504
         self._setup_attributes()
 
         self.sQ_layout, self.sK_layout, self.sV_layout, self.sO_layout = [
@@ -398,6 +402,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         # selection and the TMA-O epilogue continue to use the global warp index.
         tidx, _, _ = cute.arch.thread_idx()
         if warp_idx < self.num_producer_threads // cute.arch.WARP_SIZE:
+            # All four producer warps must execute the warpgroup-level operation.
+            cute.arch.warpgroup_reg_dealloc(self.num_producer_regs)
             if warp_idx == 0:
                 self.load_mainloop(
                     mQ,
@@ -416,6 +422,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     TileSchedulerCls,
                 )
         else:
+            # Both complete WGMMA warpgroups raise their per-thread register ceiling.
+            cute.arch.warpgroup_reg_alloc(self.num_mma_regs)
             consumer_tidx = tidx - self.num_producer_threads
             self.compute_mainloop(
                 tiled_mma_qk,
