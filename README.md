@@ -1,26 +1,27 @@
 # FlashAttention 算子对比 Benchmark
 
 这是一个方便团队成员接入自定义 FlashAttention 算子、并与官方 baseline 对比正确性与
-性能的测试框架。baseline 按 FlashAttention-3 → FlashAttention-2 →
-PyTorch 官方 `torch.nn.functional.scaled_dot_product_attention` 优先级自动降级
-选取（具体降级条件见下方"输出说明"）。
+性能的测试框架。baseline 固定使用 `flash-attention-baseline` 提供的
+`flash_attn.cute.flash_attn_func`；脚本会优先路由到该目录并校验加载来源，避免与
+`flash-attention` 或 site-packages 中的同名实现冲突。
 
 ## ✅ 最终测试命令
 
 以下是本次评测实际使用的命令，**其余文档中出现的命令均为用法示例，非最终测试
-命令**：
+命令**。注意：`--gpu` 为必填参数，大家在命令后面加上 `--gpu <自己的GPU卡号>`
+（如 `--gpu 3`）再运行：
 
 ```bash
-python3 bench_attention.py --shapes 1x64x8x131072x128 --dtype bf16 --causal --warmup 10 --iters 50
+python3 bench_attention.py --shapes 1x64x8x131072x128 --dtype bf16 --causal --warmup 10 --iters 10
 ```
 
 - `--shapes 1x64x8x131072x128`：GQA，`batch=1, q_heads=64, kv_heads=8,
   seq_len=131072（128K）, head_dim=128`；
 - `--dtype bf16`；
 - `--causal`：开启因果掩码（当前默认值就是开启，这里显式指定）；
-- `--warmup 10 --iters 50`：10 次预热 + 50 次正式计时。
+- `--warmup 10 --iters 10`：10 次预热 + 10 次正式计时。
 - 序列长度 128K 属于长序列场景，prefill 阶段单次前向本身就要几秒，加上
-  60 次调用（10 warmup + 50 iters），baseline 部分预计要跑数分钟，运行期间
+  20 次调用（10 warmup + 10 iters），baseline 部分预计要跑数分钟，运行期间
   终端不会有中间输出，是正常现象（可另开窗口用 `nvidia-smi` 确认 GPU
   利用率来判断是否仍在计算，而非卡死）。
 
@@ -55,7 +56,7 @@ test/
       `ops/_example_flash_attention.py` 里的 `repeat_interleave` 用法）。
 - [ ] **3. 改注册名**：把文件末尾 `register("TODO_改成你的算子名字", attention)`
       的名字改成能一眼区分实现方式的唯一名字，例如 `"zhangsan_fa (triton)"`。
-- [ ] **4. 先查正确性**：运行 `python bench_attention.py --check-only`，
+- [ ] **4. 先查正确性**：运行 `python bench_attention.py --gpu 0 --check-only`，
       确认你的算子那一行显示 `PASS`（先保证对，再谈快）。
 - [ ] **5. 再看性能**：去掉 `--check-only` 正式跑一遍，对比你的算子和 baseline
       的耗时（ms）/ TFLOPS，以及 `vs baseline` 列（相对 baseline 的耗时占比），
@@ -239,13 +240,13 @@ mod = load_inline(name="flash_attn_zhangsan", cpp_sources=..., cuda_sources=...)
 nvidia-smi
 
 # 假设你分到了第 3 张卡（编号从 0 开始）
-python bench_attention.py --gpu 3 --shapes 1x8x1024x64
+python bench_attention.py --gpu 3 --shapes 1x8x1024x128
 ```
 
 也可以用等价的环境变量 `CUDA_VISIBLE_DEVICES` 指定：
 
 ```bash
-CUDA_VISIBLE_DEVICES=3 python bench_attention.py --shapes 1x8x1024x64
+CUDA_VISIBLE_DEVICES=3 python bench_attention.py --gpu 0 --shapes 1x8x1024x128
 ```
 
 团队内约定好各自固定使用哪个卡号（例如按人头分配 0~7），避免临时撞卡。
@@ -259,34 +260,34 @@ CUDA_VISIBLE_DEVICES=3 python bench_attention.py --shapes 1x8x1024x64
 cd test
 
 # 使用默认参数运行（两组形状，fp16，causal）
-python bench_attention.py
+python bench_attention.py --gpu 0
 
 # 自定义形状（batch x heads x seq_len x head_dim，逗号分隔多组）
-python bench_attention.py --shapes 1x8x1024x64,1x8x4096x64,2x16x2048x128
+python bench_attention.py --gpu 0 --shapes 1x8x1024x128,1x8x4096x128,2x16x2048x128
 
 # GQA：batch x q_heads x kv_heads x seq_len x head_dim（q_heads 必须是 kv_heads 的整数倍）
-python bench_attention.py --shapes 1x32x8x4096x128
+python bench_attention.py --gpu 0 --shapes 1x32x8x4096x128
 
-# 关闭因果掩码 + fp32
-python bench_attention.py --dtype fp32 --no-causal
+# bf16 + 关闭因果掩码
+python bench_attention.py --gpu 0 --dtype bf16 --no-causal
 
 # 只做正确性校验，不测速（适合先验证算子写对了没有）
-python bench_attention.py --check-only
+python bench_attention.py --gpu 0 --check-only
 
 # 调整 warmup / 迭代次数
-python bench_attention.py --warmup 10 --iters 50
+python bench_attention.py --gpu 0 --warmup 10 --iters 50
 
 # 只跑 decode 阶段（模拟 KV-Cache 访存场景，关注 GB/s）
-python bench_attention.py --phases decode
+python bench_attention.py --gpu 0 --phases decode
 ```
 
 ## 参数说明
 
 | 参数 | 说明 | 默认值 |
 | --- | --- | --- |
-| `--shapes` | 形状列表，逗号分隔，支持两种格式：标准 MHA 用 4 段 `batchxheadsxseq_lenxhead_dim`（q/kv head 数相同）；GQA 用 5 段 `batchxq_headsxkv_headsxseq_lenxhead_dim`（`q_heads` 必须是 `kv_heads` 的整数倍） | `1x8x1024x64,1x8x4096x64` |
-| `--gpu` | 指定使用的 GPU 卡号（多人共享一台机器时用来分卡，避免抢占同一张卡），等价于设置 `CUDA_VISIBLE_DEVICES` | 自动选择当前可见的第一张卡 |
-| `--dtype` | 计算数据类型，可选 `fp16` / `fp32` / `bf16` | `fp16` |
+| `--shapes` | 形状列表，逗号分隔，支持两种格式：标准 MHA 用 4 段 `batchxheadsxseq_lenxhead_dim`（q/kv head 数相同）；GQA 用 5 段 `batchxq_headsxkv_headsxseq_lenxhead_dim`（`q_heads` 必须是 `kv_heads` 的整数倍）；当前 baseline 要求 `head_dim=128` | `1x8x1024x128,1x8x4096x128` |
+| `--gpu` | 指定使用的 GPU 卡号（必填；多人共享一台机器时用来分卡，避免抢占同一张卡） | 无，必须显式指定 |
+| `--dtype` | 计算数据类型，可选 `fp16` / `bf16` | `fp16` |
 | `--causal` / `--no-causal` | 是否使用因果掩码（只看当前位置及之前的 token） | 开启 |
 | `--warmup` | 正式计时前的 warmup 迭代次数 | `5` |
 | `--iters` | 正式计时的迭代次数，取平均耗时 | `20` |
@@ -297,8 +298,8 @@ python bench_attention.py --phases decode
 
 对每个形状会打印一个对比表格，包含：
 
-- **baseline**：按 FlashAttention-3 → FlashAttention-2 → PyTorch 官方
-  `scaled_dot_product_attention` 优先级自动降级选出的参照实现，展示其耗时 / TFLOPS。
+- **baseline**：固定使用 `flash-attention-baseline` 提供的
+  `flash_attn.cute.flash_attn_func`，展示其耗时 / TFLOPS。
 - 每个已注册算子的：
   - 耗时（ms，真实测量）、估算 TFLOPS/GB·s（基于理论 FLOPs/字节数公式，仅供参考）
   - **相对 baseline 的耗时占比**（`vs baseline` 列，`baseline耗时 / 算子耗时 * 100%`，
@@ -306,7 +307,6 @@ python bench_attention.py --phases decode
   - 与 baseline 输出的**最大绝对误差**
   - 正确性校验结果（`PASS` / `FAIL`）：
     - fp16 / bf16 容差：绝对误差 ≤ 2e-2 或相对误差 ≤ 2e-2
-    - fp32 容差：绝对误差 ≤ 1e-4 或相对误差 ≤ 1e-4
   - 如果算子运行时抛异常（比如显存不足、shape 不支持），会标注为“运行失败”，
     不会影响其他算子继续测试。
 
@@ -317,10 +317,43 @@ decode（耗时/GB·s）两个阶段的表现，直观展示"prefill 拼算力�
 
 ## 环境要求
 
-- 只依赖 `torch`（建议 `torch>=2.1.0`），无需额外安装依赖。
-- 有 GPU 时自动使用 CUDA 并用 `torch.cuda.Event` 精确计时；
-  没有 GPU 时会自动降级到 CPU（用 `time.perf_counter()` 计时），
-  但此时性能数据仅供参考，不代表真实 GPU 性能。
+baseline 路径按**仓库相对路径**固定为
+`./flash-attention-baseline/flash_attn/cute`，不是机器相关的绝对路径。脚本会把它
+放到 `flash_attn` 子模块搜索路径首位，并校验实际加载文件；如果解析到
+`./flash-attention` 或 site-packages 中的另一份 `flash_attn.cute`，会直接报错，
+不会静默使用错误实现。
+
+在仓库根目录安装 baseline 及其依赖：
+
+```bash
+# CUDA 12.x
+python3 -m pip install -e "./flash-attention-baseline/flash_attn/cute"
+
+# CUDA 13.x
+python3 -m pip install -e "./flash-attention-baseline/flash_attn/cute[cu13]"
+```
+
+上述命令会根据 `flash-attention-baseline/flash_attn/cute/pyproject.toml` 自动安装：
+
+- `torch`
+- `einops`
+- `typing_extensions`
+- `nvidia-cutlass-dsl==4.6.0.dev0`（CUDA 13 使用对应的 `cu13` extra）
+- `apache-tvm-ffi>=0.1.12,<0.2`
+- `torch-c-dlpack-ext`
+- `quack-kernels>=0.5.3`
+
+安装后可检查实际路由：
+
+```bash
+python3 -c "import bench_attention; _, name = bench_attention.get_baseline_fn(); print(name)"
+```
+
+输出路径应位于
+`flash-attention-baseline/flash_attn/cute`。当前环境如果出现
+`No module named 'quack'`，说明尚未安装上述 baseline 依赖。
+
+- 需要 CUDA GPU，并使用 `torch.cuda.Event` 精确计时。
 - **多人共享同一台机器时**，务必通过 `--gpu` 参数或 `CUDA_VISIBLE_DEVICES`
   指定各自的 GPU 卡号再运行（见上方"多人共享 GPU 机器时必读"），避免抢卡
   导致结果不可信或 OOM。
