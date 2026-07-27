@@ -48,8 +48,24 @@ from .base import register
 # precedence if present and importable, so local dev still works; otherwise
 # we fall back to the vendored copy shipped in this branch.
 # ------------------------------------------------------------------
-def _ensure_paged_fa3():
-    # 1) try an already-importable external paged_fa3 (dev machine)
+def _load_vendored():
+    # Load ops/_paged_fa3 under the top-level name `paged_fa3` via a spec,
+    # so that the vendored modules' `from paged_fa3.xxx import ...` resolve.
+    here = os.path.dirname(os.path.abspath(__file__))
+    vendored = os.path.join(here, "_paged_fa3")
+    if not os.path.isdir(vendored):
+        return False
+    init_py = os.path.join(vendored, "__init__.py")
+    spec = importlib.util.spec_from_file_location(
+        "paged_fa3", init_py, submodule_search_locations=[vendored]
+    )
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["paged_fa3"] = mod
+    spec.loader.exec_module(mod)
+    return True
+
+
+def _load_external():
     for cand in (
         os.environ.get("PAGED_FA3_PATH"),
         "/dockerdata/linqihao/paged_fa3/python",
@@ -59,24 +75,25 @@ def _ensure_paged_fa3():
                 sys.path.insert(0, cand)
             try:
                 importlib.import_module("paged_fa3")
-                return
+                return True
             except Exception:
-                pass
-    # 2) fall back to the vendored copy in this branch (ops/_paged_fa3)
-    here = os.path.dirname(os.path.abspath(__file__))
-    vendored = os.path.join(here, "_paged_fa3")
-    if os.path.isdir(vendored):
-        # Load ops/_paged_fa3 under the top-level name `paged_fa3` via a spec,
-        # so that the vendored modules' `from paged_fa3.xxx import ...` resolve.
-        init_py = os.path.join(vendored, "__init__.py")
-        spec = importlib.util.spec_from_file_location(
-            "paged_fa3", init_py, submodule_search_locations=[vendored]
-        )
-        mod = importlib.util.module_from_spec(spec)
-        sys.modules["paged_fa3"] = mod
-        spec.loader.exec_module(mod)
-        return
-    raise ImportError("paged_fa3 kernels not found (neither external nor vendored)")
+                sys.modules.pop("paged_fa3", None)
+    return False
+
+
+def _ensure_paged_fa3():
+    # This branch is self-contained: the CuTe kernels are vendored in
+    # ops/_paged_fa3 and are the source of truth, so the vendored copy wins.
+    # This keeps the op immune to any divergent external checkout on the dev
+    # box (e.g. /dockerdata/linqihao/paged_fa3/python). Set
+    # FORCE_EXTERNAL_PAGED_FA3=1 to intentionally prefer an external checkout.
+    if os.environ.get("FORCE_EXTERNAL_PAGED_FA3") == "1":
+        if _load_external() or _load_vendored():
+            return
+    else:
+        if _load_vendored() or _load_external():
+            return
+    raise ImportError("paged_fa3 kernels not found (neither vendored nor external)")
 
 
 _ensure_paged_fa3()
