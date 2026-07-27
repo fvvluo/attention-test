@@ -45,12 +45,13 @@ class BlockInfo:
             n_idx_left = n_idx - self.window_size_left
             n_block_min = cutlass.max(n_idx_left // self.tile_n, 0)
         if cutlass.const_expr(self.is_split_kv):
-            # Balanced half-open partitioning keeps every split non-empty when
-            # num_splits <= num_n_blocks, unlike ceil-sized chunks whose final
-            # split can start past the original upper bound.
-            range_begin, range_size = n_block_min, n_block_max - n_block_min
-            n_block_min = range_begin + (range_size * split_idx) // num_splits
-            n_block_max = range_begin + (range_size * (split_idx + 1)) // num_splits
+            num_n_blocks_per_split = (
+                Int32(0)
+                if n_block_max <= n_block_min
+                else (n_block_max - n_block_min + num_splits - 1) // num_splits
+            )
+            n_block_min = n_block_min + split_idx * num_n_blocks_per_split
+            n_block_max = cutlass.min(n_block_min + num_n_blocks_per_split, n_block_max)
         return n_block_min, n_block_max
 
     @cute.jit

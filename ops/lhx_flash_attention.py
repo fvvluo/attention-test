@@ -65,9 +65,7 @@ from .lhx_cute.mask import AttentionMask
 from .lhx_cute.named_barrier import NamedBarrierFwd
 from .lhx_cute.softmax import Softmax
 from .lhx_cute.seqlen_info import SeqlenInfoQK
-from .lhx_cute.block_info import BlockInfo
 from .lhx_cute.block_sparsity import BlockSparseTensors  # signature only
-from .lhx_cute.flash_fwd_combine import FlashAttentionForwardCombine
 from .lhx_cute.utils import AuxData
 from .lhx_cute import pipeline as pipeline_custom
 from .lhx_cute.tile_scheduler import (
@@ -87,11 +85,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         intra_wg_overlap: bool = True,
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
-        is_split_kv: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
-        self.is_split_kv = is_split_kv
         assert mma_pv_is_rs and not paged_kv_non_tma, (
             "this de-optimized SM90 kernel only supports mma_pv_is_rs=True, "
             "paged_kv_non_tma=False"
@@ -114,8 +110,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             sm90_utils_basic.get_smem_layout_atom(LayoutEnum.ROW_MAJOR, self.dtype, self.tile_hdim),
             self.dtype,
         )
-        # The split specialization replaces sO with an FP32 layout after the base
-        # copy attributes are initialized; this placeholder keeps base setup unchanged.
         return atom, atom, atom, atom, None
 
     def _get_tiled_mma(self):
@@ -136,20 +130,11 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         return tiled_mma_qk, tiled_mma_pv
 
     def _get_shared_storage_cls(self):
-        # Split-KV writes FP32 partial O through the buffer that aliases sQ. Give
-        # that specialization a 64-KiB backing range; the non-split specialization
-        # keeps the original 32-KiB range and therefore its current occupancy.
-        q_storage_dtype = Float32 if self.is_split_kv else self.dtype
-        q_storage_layout = self.sO_layout if self.is_split_kv else self.sQ_layout
-        sQ_struct = cute.struct.Align[
-            cute.struct.MemRange[q_storage_dtype, cute.cosize(q_storage_layout)],
-            self.buffer_align_bytes,
-        ]
-        sK_struct, sV_struct = [
+        sQ_struct, sK_struct, sV_struct = [
             cute.struct.Align[
                 cute.struct.MemRange[self.dtype, cute.cosize(layout)], self.buffer_align_bytes
             ]
-            for layout in (self.sK_layout, self.sV_layout)
+            for layout in (self.sQ_layout, self.sK_layout, self.sV_layout)
         ]
         # 1 stage * 2 for Q (full + empty), num_stages * 2 each for K and V.
         mbar_Q_struct = cute.struct.MemRange[cutlass.Int64, 1 * 2]
@@ -210,38 +195,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
         ), "varlen, paged KV, local windows, sinks, block sparsity and score/mask mods were stripped"
 
-        if const_expr(self.is_split_kv):
-            if const_expr(not (mQ.element_type == mK.element_type == mV.element_type == self.dtype)):
-                raise TypeError("Q, K and V must match the configured fp16/bf16 dtype")
-            if const_expr(mO.element_type != Float32 or mLSE is None or mLSE.element_type != Float32):
-                raise TypeError("Split-KV partial O and LSE must be Float32")
-        else:
-            self._check_type(
-                mQ.element_type,
-                mK.element_type,
-                mV.element_type,
-                mO.element_type,
-                mLSE.element_type if const_expr(mLSE is not None) else None,
-                None,
-                None,
-                None,
-                None,
-            )
+        self._check_type(
+            mQ.element_type,
+            mK.element_type,
+            mV.element_type,
+            mO.element_type,
+            mLSE.element_type if const_expr(mLSE is not None) else None,
+            None,
+            None,
+            None,
+            None,
+        )
 
         mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
-        # Q/K/V: (b, s, h, d) -> (s, d, h, b).
-        mQ, mK, mV = [layout_utils.select(t, [1, 3, 2, 0]) for t in (mQ, mK, mV)]
-        if const_expr(self.is_split_kv):
-            # O partial: (split, b, s, h, d) -> (s, d, h, b, split)
-            # LSE partial: (split, b, h, s) -> (s, h, b, split)
-            mO = layout_utils.select(mO, [2, 4, 3, 1, 0])
-            mLSE = layout_utils.select(mLSE, [3, 2, 1, 0])
-            num_splits = mO.shape[4]
-        else:
-            mO = layout_utils.select(mO, [1, 3, 2, 0])
-            if const_expr(mLSE is not None):
-                mLSE = layout_utils.select(mLSE, [2, 1, 0])
-            num_splits = Int32(1)
+        # (b, s, h, d) -> (s, d, h, b)
+        mQ, mK, mV, mO = [layout_utils.select(t, [1, 3, 2, 0]) for t in (mQ, mK, mV, mO)]
+        if const_expr(mLSE is not None):
+            mLSE = layout_utils.select(mLSE, [2, 1, 0])
 
         tiled_mma_qk, tiled_mma_pv = self._get_tiled_mma()
         self.num_threads_per_warp_group = 128
@@ -265,21 +235,15 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         assert self.num_producer_regs + self.num_wg_mma * self.num_mma_regs <= 504
         self._setup_attributes()
 
-        self.sQ_layout, self.sK_layout, self.sV_layout = [
+        self.sQ_layout, self.sK_layout, self.sV_layout, self.sO_layout = [
             sm90_utils.make_smem_layout(self.dtype, LayoutEnum.ROW_MAJOR, shape, stage)
             for shape, stage in [
                 ((self.tile_m, self.tile_hdim), None),
                 ((self.tile_n, self.tile_hdim), self.num_stages),
                 ((self.tile_n, self.tile_hdimv), self.num_stages),
+                ((self.tile_m, self.tile_hdimv), None),
             ]
         ]
-        output_dtype = Float32 if self.is_split_kv else self.dtype
-        self.sO_layout = sm90_utils.make_smem_layout(
-            output_dtype,
-            LayoutEnum.ROW_MAJOR,
-            (self.tile_m, self.tile_hdimv),
-            None,
-        )
         SharedStorage = self._get_shared_storage_cls()
 
         # TMA atoms for Q/K/V (G2S) and O (S2G). No multicast (cluster is 1x1).
@@ -314,7 +278,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             cute.ceil_div(cute.size(mQ.shape[0]), self.tile_m),
             cute.size(mQ.shape[2]),
             cute.size(mQ.shape[3]),
-            num_splits,
+            1,  # num_splits
             cute.size(mK.shape[0]),
             mQ.shape[1],
             mV.shape[1],
@@ -323,7 +287,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             qhead_per_kvhead_packgqa=1,
             element_size=self.dtype.width // 8,
             is_persistent=False,
-            is_split_kv=self.is_split_kv,
             lpt=self.is_causal,
         )
         tile_sched_params = TileScheduler.to_underlying_arguments(tile_sched_args)
@@ -348,7 +311,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             self.gmem_tiled_copy_O,
             tiled_mma_qk,
             tiled_mma_pv,
-            num_splits,
             tile_sched_params,
             TileScheduler,
             SharedStorage,
@@ -380,7 +342,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         gmem_tiled_copy_O: cute.TiledCopy,
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
-        num_splits: Int32,
         tile_sched_params: ParamsBase,
         TileScheduler: cutlass.Constexpr[Callable],
         SharedStorage: cutlass.Constexpr[Callable],
@@ -421,26 +382,17 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
         pipeline_init_arrive(cluster_shape_mn=self.cluster_shape_mn, is_relaxed=True)
 
-        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner, dtype=self.dtype)
+        sQ = storage.sQ.get_tensor(sQ_layout.outer, swizzle=sQ_layout.inner)
         sK = storage.sK.get_tensor(sK_layout.outer, swizzle=sK_layout.inner)
         sV = storage.sV.get_tensor(sV_layout.outer, swizzle=sV_layout.inner)
         # Transpose view of V, i.e. (head_dim_v, tile_n), for the PV tiled mma
         sVt = layout_utils.transpose_view(sV)
-        output_dtype = Float32 if self.is_split_kv else self.dtype
-        sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=output_dtype)
+        sO = storage.sQ.get_tensor(sO_layout.outer, swizzle=sO_layout.inner, dtype=self.dtype)
 
         SeqlenInfoCls = partial(
             SeqlenInfoQK.create, seqlen_q_static=mQ.shape[0], seqlen_k_static=mK.shape[0]
         )
         AttentionMaskCls = partial(AttentionMask, self.tile_m, self.tile_n)
-        BlockInfoCls = partial(
-            BlockInfo,
-            self.tile_m,
-            self.tile_n,
-            self.is_causal,
-            False,
-            self.is_split_kv,
-        )
         TileSchedulerCls = partial(TileScheduler.create, tile_sched_params)
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
@@ -466,9 +418,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     pipeline_q,
                     pipeline_k,
                     pipeline_v,
-                    num_splits,
                     SeqlenInfoCls,
-                    BlockInfoCls,
                     TileSchedulerCls,
                 )
         else:
@@ -492,10 +442,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 consumer_tidx,
                 softmax_scale_log2,
                 softmax_scale,
-                num_splits,
                 SeqlenInfoCls,
                 AttentionMaskCls,
-                BlockInfoCls,
                 TileSchedulerCls,
             )
 
@@ -526,9 +474,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         pipeline_q: pipeline.PipelineAsync,
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
-        num_splits: Int32,
         SeqlenInfoCls: Callable,
-        BlockInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
         """Producer-only TMA loop for Q, K, and V."""
@@ -540,10 +486,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
 
         tile_scheduler = TileSchedulerCls()
-        block_info = BlockInfoCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             head_idx_kv = head_idx // self.qhead_per_kvhead
 
@@ -590,12 +535,16 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             )
             q_producer_state.advance()
 
-            # Producer and consumers must advance their K/V pipeline states for
-            # exactly the same split-local half-open block range.
-            n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx, num_splits
-            )
-            for n_tile in cutlass.range(n_block_max - n_block_min, unroll=1):
+            # Keep the producer's block range identical to the consumer's causal range.
+            n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+            if const_expr(self.is_causal):
+                causal_k_end = (
+                    (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q
+                )
+                n_block_max = cutlass.min(
+                    n_block_max, cute.ceil_div(causal_k_end, self.tile_n)
+                )
+            for n_tile in cutlass.range(n_block_max, unroll=1):
                 n_block = n_block_max - 1 - n_tile
                 load_K(n_block, kv_producer_state)
                 load_V(n_block, kv_producer_state)
@@ -654,10 +603,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         tidx: Int32,
         softmax_scale_log2: Float32,
         softmax_scale: Optional[Float32],
-        num_splits: Int32,
         SeqlenInfoCls: Callable,
         AttentionMaskCls: Callable,
-        BlockInfoCls: Callable,
         TileSchedulerCls: Callable,
     ):
         """Consumer-only QK, softmax, PV, and epilogue loop."""
@@ -701,10 +648,9 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
         )
 
         tile_scheduler = TileSchedulerCls()
-        block_info = BlockInfoCls()
         work_tile = tile_scheduler.initial_work_tile_info()
         while work_tile.is_valid_tile:
-            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            m_block, head_idx, batch_idx, _ = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
             mask = AttentionMaskCls(seqlen)
             # EXERCISE (2): mask_fn is only called for boundary blocks below.
@@ -721,12 +667,18 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                 mask_mod=None,
             )
 
-            # Crop the descending KV loop to this CTA's split-local range. The
-            # producer uses the same helper, which keeps all pipeline states aligned.
-            n_block_min, n_block_max = block_info.get_n_block_min_max(
-                seqlen, m_block, split_idx, num_splits
-            )
-            n_block_count = n_block_max - n_block_min
+            # EXERCISE (2): crop the descending KV loop at the causal right boundary.
+            # Causal attention is bottom-right aligned when Q/K lengths differ:
+            #   k_idx <= q_idx + seqlen_k - seqlen_q.
+            # The producer computes the same range in load_mainloop.
+            n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+            if const_expr(self.is_causal):
+                causal_k_end = (
+                    (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q
+                )
+                n_block_max = cutlass.min(
+                    n_block_max, cute.ceil_div(causal_k_end, self.tile_n)
+                )
 
             # Blocks [0, n_block_mask_start) are fully valid and skip apply_mask.
             # A causal block is fully valid iff its last K index is visible to the
@@ -758,7 +710,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
             # Steady state: QK[current] is the older WGMMA group and PV[previous]
             # is the newer group. The first PV initializes acc_O; later PVs accumulate.
-            if n_block_count > 1:
+            if n_block_max > 1:
                 n_block = n_block_max - 2
                 if n_block >= n_block_mask_start:
                     k_consumer_state, v_consumer_state = self.compute_overlapped_block(
@@ -795,7 +747,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                         is_first_pv=True,
                     )
 
-            for n_tile in cutlass.range(cutlass.max(n_block_count - 2, 0), unroll=1):
+            for n_tile in cutlass.range(cutlass.max(n_block_max - 2, 0), unroll=1):
                 n_block = n_block_max - 3 - n_tile
                 if n_block >= n_block_mask_start:
                     k_consumer_state, v_consumer_state = self.compute_overlapped_block(
@@ -833,7 +785,7 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     )
 
             # Epilogue: the last P fragment has no following QK iteration to carry it.
-            if n_block_count == 1:
+            if n_block_max == 1:
                 v_consumer_state = self.flush_last_pv(
                     warp_group_idx,
                     pipeline_v,
@@ -850,40 +802,23 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
                     zero_init=False,
                 )
 
-            # Normalize acc_O by row_sum and compute the natural-log LSE.
+            # Normalize acc_O by row_sum and compute the lse.
             softmax.rescale_O(acc_O, softmax.finalize())
-            if const_expr(self.is_split_kv):
-                self.epilogue_split_kv(
-                    acc_O,
-                    softmax.row_sum,
-                    mO,
-                    mLSE,
-                    sO,
-                    seqlen,
-                    tma_atom_O,
-                    tiled_mma_pv,
-                    tidx,
-                    m_block,
-                    head_idx,
-                    batch_idx,
-                    split_idx,
-                )
-            else:
-                self.epilogue(
-                    acc_O,
-                    softmax.row_sum,
-                    mO,
-                    mLSE,
-                    sO,
-                    seqlen,
-                    gmem_tiled_copy_O,
-                    tma_atom_O,
-                    tiled_mma_pv,
-                    tidx,
-                    m_block,
-                    head_idx,
-                    batch_idx,
-                )
+            self.epilogue(
+                acc_O,
+                softmax.row_sum,
+                mO,
+                mLSE,
+                sO,
+                seqlen,
+                gmem_tiled_copy_O,
+                tma_atom_O,
+                tiled_mma_pv,
+                tidx,
+                m_block,
+                head_idx,
+                batch_idx,
+            )
 
             # sO aliases sQ, so Q cannot be released until the epilogue has completed
             # its shared-memory staging and TMA store.
@@ -893,85 +828,6 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
-
-    @cute.jit
-    def epilogue_split_kv(
-        self,
-        acc_O: cute.Tensor,
-        lse: cute.Tensor,
-        mO: cute.Tensor,
-        mLSE: cute.Tensor,
-        sO: cute.Tensor,
-        seqlen: SeqlenInfoQK,
-        tma_atom_O: cute.CopyAtom,
-        tiled_mma: cute.TiledMma,
-        tidx: Int32,
-        m_block: Int32,
-        head_idx: Int32,
-        batch_idx: Int32,
-        split_idx: Int32,
-    ):
-        """Store normalized FP32 partial O/LSE for one KV split."""
-        rO = cute.make_fragment_like(acc_O, Float32)
-        rO.store(acc_O.load())
-
-        # All consumer threads must finish reading V before sV can be reused, and
-        # all must participate in the register-to-shared epilogue copy.
-        cute.arch.barrier(
-            barrier_id=int(NamedBarrierFwd.Epilogue),
-            number_of_threads=self.num_epilogue_threads,
-        )
-        smem_copy_atom_O = utils.get_smem_store_atom(
-            self.arch.major * 10 + self.arch.minor, Float32
-        )
-        smem_thr_copy_O = cute.make_tiled_copy_C(smem_copy_atom_O, tiled_mma).get_slice(tidx)
-        taccOrO = smem_thr_copy_O.retile(rO)
-        taccOsO = smem_thr_copy_O.partition_D(sO)
-        cute.copy(smem_copy_atom_O, taccOrO, taccOsO)
-
-        cO = cute.make_identity_tensor((self.tile_m, self.tile_hdimv))
-
-        # mLSE has internal layout (q, head, batch, split).
-        mLSE_cur = seqlen.offset_batch_Q(mLSE, batch_idx, dim=2)[None, head_idx, split_idx]
-        gLSE = cute.local_tile(mLSE_cur, (self.tile_m,), (m_block,))
-        gLSE_expanded_layout = cute.append(
-            gLSE.layout, cute.make_layout((self.tile_hdimv,), stride=(0,))
-        )
-        gLSE_expanded = cute.make_tensor(gLSE.iterator, gLSE_expanded_layout)
-        thr_mma = tiled_mma.get_slice(tidx)
-        taccOgLSE = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(gLSE_expanded))
-        taccOcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
-        t0accOcO = layout_utils.reshape_acc_to_mn(thr_mma.get_slice(0).partition_C(cO))
-        if taccOcO[0][1] == 0:
-            for m in cutlass.range(cute.size(taccOgLSE.shape[1]), unroll_full=True):
-                if (
-                    t0accOcO[m, 0][0]
-                    < seqlen.seqlen_q - m_block * self.tile_m - taccOcO[0][0]
-                ):
-                    taccOgLSE[m, 0] = lse[m]
-
-        # mO has internal layout (q, d, head, batch, split).
-        mO_cur = seqlen.offset_batch_Q(mO, batch_idx, dim=3)[
-            None, None, head_idx, split_idx
-        ]
-        cute.arch.fence_view_async_shared()
-        cute.arch.barrier_arrive(
-            barrier_id=int(NamedBarrierFwd.Epilogue),
-            number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE,
-        )
-        gO = cute.local_tile(mO_cur, (self.tile_m, self.tile_hdimv), (m_block, 0))
-        store_O, _, _ = copy_utils.tma_get_copy_fn(
-            tma_atom_O, 0, cute.make_layout(1), sO, gO, single_stage=True
-        )
-        warp_idx = cute.arch.make_warp_uniform(cute.arch.warp_idx())
-        if warp_idx == 4:
-            cute.arch.barrier(
-                barrier_id=int(NamedBarrierFwd.Epilogue),
-                number_of_threads=self.num_epilogue_threads + cute.arch.WARP_SIZE,
-            )
-            store_O()
-            cute.arch.cp_async_bulk_commit_group()
-            cute.arch.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit
     def compute_first_qk(
@@ -1094,89 +950,12 @@ _TORCH_TO_CUTE_DTYPE = {
     torch.bfloat16: cutlass.BFloat16,
 }
 
-# Forward cache distinguishes split/non-split specializations, but concrete split
-# counts remain dynamic. The combine cache is bucketed by its maximum split count.
+# JIT 编译缓存：(dtype, head_dim, qhead_per_kvhead, causal) -> 已编译内核。
+# batch / seqlen / heads 都标记为动态维度，同一配置下换形状不需要重新编译。
 _COMPILE_CACHE = {}
-_COMBINE_CACHE = {}
 
 
-def _select_decode_num_splits(q, k, causal, requested):
-    """Choose a small split count that improves CTA-wave utilization."""
-    batch, q_heads, q_len, _ = q.shape
-    kv_len = k.shape[2]
-    n_blocks = math.ceil(kv_len / 128)
-    is_supported_decode = q_len == 1 and not causal and kv_len > 0
-
-    if requested not in (None, 0):
-        if requested < 1:
-            raise ValueError(f"num_splits 必须是正整数、0 或 None，实际: {requested}")
-        if requested > 1 and not is_supported_decode:
-            raise ValueError("num_splits>1 第一版仅支持 q_len=1、causal=False 的 decode")
-        if requested > min(256, n_blocks):
-            raise ValueError(
-                f"num_splits={requested} 超过可用 KV blocks={n_blocks} 或上限 256"
-            )
-        return int(requested)
-
-    if not is_supported_decode or n_blocks <= 4:
-        return 1
-
-    num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
-    base_ctas = batch * q_heads
-    max_splits = min(16, 256, n_blocks)
-
-    def wave_efficiency(splits):
-        ctas = base_ctas * splits
-        waves = math.ceil(ctas / num_sms)
-        return ctas / (waves * num_sms)
-
-    efficiencies = [wave_efficiency(s) for s in range(1, max_splits + 1)]
-    best = max(efficiencies)
-    if best <= efficiencies[0] * 1.05:
-        return 1
-    target = best * 0.85
-    return next(s for s, efficiency in enumerate(efficiencies, 1) if efficiency >= target)
-
-
-def _run_splitkv_combine(out_partial, lse_partial, out):
-    num_splits = out_partial.shape[0]
-    log_max_splits = max(math.ceil(math.log2(num_splits)), 5)
-    key = (out.dtype, out.shape[-1], log_max_splits)
-    compiled = _COMBINE_CACHE.get(key)
-    lse_for_combine = lse_partial.transpose(-1, -2)
-    if compiled is None:
-        combine = FlashAttentionForwardCombine(
-            dtype=_TORCH_TO_CUTE_DTYPE[out.dtype],
-            dtype_partial=Float32,
-            head_dim=out.shape[-1],
-            tile_m=8,
-            k_block_size=128,
-            log_max_splits=log_max_splits,
-        )
-        if not combine.can_implement(
-            _TORCH_TO_CUTE_DTYPE[out.dtype],
-            Float32,
-            out.shape[-1],
-            8,
-            128,
-            log_max_splits,
-            256,
-        ):
-            raise RuntimeError("Split-KV combine configuration is unsupported")
-        compiled = cute.compile(
-            combine,
-            to_cute_tensor(out_partial),
-            to_cute_tensor(lse_for_combine),
-            to_cute_tensor(out),
-            None, None, None, None, None, None,
-            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
-            options="--enable-tvm-ffi",
-        )
-        _COMBINE_CACHE[key] = compiled
-    compiled(out_partial, lse_for_combine, out, None, None, None, None, None, None)
-
-
-def attention(q, k, v, causal=True, sm_scale=None, num_splits=None):
+def attention(q, k, v, causal=True, sm_scale=None):
     """SM90 (Hopper) CuTe DSL FlashAttention 前向，支持 GQA。
 
     Args:
@@ -1186,7 +965,6 @@ def attention(q, k, v, causal=True, sm_scale=None, num_splits=None):
             无需把 k/v repeat 到 q_heads）
         causal: 是否使用因果掩码
         sm_scale: softmax 缩放系数，默认为 1/sqrt(head_dim)
-        num_splits: decode Split-KV 数；None/0 自动选择，1 强制旧路径
 
     Returns:
         output: shape 与 q 相同，(batch, q_heads, q_len, head_dim)
@@ -1202,8 +980,6 @@ def attention(q, k, v, causal=True, sm_scale=None, num_splits=None):
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
     qhead_per_kvhead = q_heads // kv_heads
-    selected_splits = _select_decode_num_splits(q, k, bool(causal), num_splits)
-    is_split_kv = selected_splits > 1
 
     # 内核使用 BSHD 布局；benchmark 内部统一是 BHSD，这里转成 BSHD。
     # 与 baseline 的 maybe_contiguous 行为一致：只要 head_dim 维 stride 为 1，
@@ -1215,25 +991,10 @@ def attention(q, k, v, causal=True, sm_scale=None, num_splits=None):
     q_t = q_t if q_t.stride(-1) == 1 else q_t.contiguous()
     k_t = k_t if k_t.stride(-1) == 1 else k_t.contiguous()
     v_t = v_t if v_t.stride(-1) == 1 else v_t.contiguous()
-    # Final output is always BSHD. Split-KV additionally writes normalized FP32
-    # partial O/LSE, then combines them in a second kernel.
+    # 输出显式分配为 BSHD 连续布局，返回时再转置回 BHSD 视图（同 baseline）。
     o_t = torch.empty((batch, q_len, q_heads, head_dim), dtype=q.dtype, device=q.device)
-    if is_split_kv:
-        kernel_o = torch.empty(
-            (selected_splits, batch, q_len, q_heads, head_dim),
-            dtype=torch.float32,
-            device=q.device,
-        )
-        kernel_lse = torch.empty(
-            (selected_splits, batch, q_heads, q_len),
-            dtype=torch.float32,
-            device=q.device,
-        )
-    else:
-        kernel_o = o_t
-        kernel_lse = None
 
-    key = (q.dtype, head_dim, qhead_per_kvhead, bool(causal), is_split_kv)
+    key = (q.dtype, head_dim, qhead_per_kvhead, bool(causal))
     compiled = _COMPILE_CACHE.get(key)
     if compiled is None:
         fa_fwd = FlashAttentionForwardSm90(
@@ -1251,15 +1012,14 @@ def attention(q, k, v, causal=True, sm_scale=None, num_splits=None):
             Q_in_regs=False,
             intra_wg_overlap=True,
             mma_pv_is_rs=True,
-            is_split_kv=is_split_kv,
         )
         compiled = cute.compile(
             fa_fwd,
             to_cute_tensor(q_t),
             to_cute_tensor(k_t),
             to_cute_tensor(v_t),
-            to_cute_tensor(kernel_o),
-            to_cute_tensor(kernel_lse) if kernel_lse is not None else None,
+            to_cute_tensor(o_t),
+            None,  # mLSE
             sm_scale,
             None, None, None, None,  # cu_seqlens_q/k, seqused_q/k
             None,  # page_table
@@ -1273,8 +1033,8 @@ def attention(q, k, v, causal=True, sm_scale=None, num_splits=None):
         _COMPILE_CACHE[key] = compiled
 
     compiled(
-        q_t, k_t, v_t, kernel_o,
-        kernel_lse,
+        q_t, k_t, v_t, o_t,
+        None,  # mLSE
         sm_scale,
         None, None, None, None,
         None,
@@ -1283,8 +1043,6 @@ def attention(q, k, v, causal=True, sm_scale=None, num_splits=None):
         None,
         AuxData(),
     )
-    if is_split_kv:
-        _run_splitkv_combine(kernel_o, kernel_lse, o_t)
     return o_t.transpose(1, 2)
 
 
