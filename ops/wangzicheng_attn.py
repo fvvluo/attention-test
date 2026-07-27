@@ -22,7 +22,8 @@
 # 仅供参考，文件名以 "_" 开头不会被自动扫描注册），里面有完整的分块 + online softmax 算法示例。
 
 import torch
-from . import _wangzicheng_attn
+from . import _wzc_attn_prefill
+from . import _wzc_attn_decode
 
 from .base import register
 
@@ -43,8 +44,10 @@ def attention(q, k, v, causal=True, sm_scale=None):
     Returns:
         output: shape 与 q 相同，(batch, q_heads, seq_len, head_dim)
     """
-
-    return _wangzicheng_attn.run(q, k, v, causal, sm_scale)
+    if q.shape[2] < k.shape[2]:
+        return _wzc_attn_decode.run(q, k, v, sm_scale)
+    else:
+        return _wzc_attn_prefill.run(q, k, v, causal, sm_scale)
 
     raise NotImplementedError(
         "请把这个模板复制成新文件并实现你自己的 attention 算子，"
