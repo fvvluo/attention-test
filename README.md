@@ -7,21 +7,21 @@
 
 ## ✅ 最终测试命令
 
-以下是本次评测实际使用的命令，**其余文档中出现的命令均为用法示例，非最终测试
-命令**。注意：`--gpu` 为必填参数，大家在命令后面加上 `--gpu <自己的GPU卡号>`
-（如 `--gpu 3`）再运行：
+以下是最终 M128N128 stage-4 Prefill 版本的锁定测试命令，**其余文档中出现的命令
+均为用法示例，非最终测试命令**。`--gpu` 直接选择物理 GPU；当前使用 6 号卡：
 
 ```bash
-python3 bench_attention.py --shapes 1x64x8x131072x128 --dtype bf16 --causal --warmup 10 --iters 50
+python3 bench_attention.py --gpu 6 --shapes 1x64x8x131072x128 --dtype bf16 --causal --phases prefill --warmup 10 --iters 10
 ```
 
 - `--shapes 1x64x8x131072x128`：GQA，`batch=1, q_heads=64, kv_heads=8,
   seq_len=131072（128K）, head_dim=128`；
 - `--dtype bf16`；
 - `--causal`：开启因果掩码（当前默认值就是开启，这里显式指定）；
-- `--warmup 10 --iters 50`：10 次预热 + 50 次正式计时。
+- `--phases prefill`：最终 M128 算子只运行 Prefill；
+- `--warmup 10 --iters 10`：10 次预热 + 10 次正式计时。
 - 序列长度 128K 属于长序列场景，prefill 阶段单次前向本身就要几秒，加上
-  60 次调用（10 warmup + 50 iters），baseline 部分预计要跑数分钟，运行期间
+  20 次调用（10 warmup + 10 iters），baseline 部分预计要跑数分钟，运行期间
   终端不会有中间输出，是正常现象（可另开窗口用 `nvidia-smi` 确认 GPU
   利用率来判断是否仍在计算，而非卡死）。
 
@@ -29,13 +29,16 @@ python3 bench_attention.py --shapes 1x64x8x131072x128 --dtype bf16 --causal --wa
 
 ```
 test/
-├── README.md                       # 本文档
+├── README.md                                      # 本文档
+├── flash-attention-baseline/                      # 固定对比 baseline
 ├── ops/
-│   ├── __init__.py                 # 自动扫描并导入本目录下所有算子模块
-│   ├── base.py                     # 算子注册接口 register(name, fn)
-│   ├── _template.py                # 接入模板，复制改名即可开始写自己的算子
-│   └── _example_flash_attention.py # 示例算子：纯 PyTorch online-softmax FlashAttention（仅供参考，不会被自动扫描注册）
-└── bench_attention.py               # 主 benchmark 脚本
+│   ├── __init__.py                                # 自动扫描并导入本目录下所有算子模块
+│   ├── base.py                                    # 算子注册接口 register(name, fn)
+│   ├── cute_dsl_flash_attention_m128.py           # 最终 M128N128 stage-4 Prefill adapter
+│   ├── _cute_dsl_sm90_fmha_perf_m128_kernel.py    # 最终静态 128K CuTe DSL kernel
+│   ├── _template.py                               # 接入模板，复制改名即可开始写自己的算子
+│   └── _example_flash_attention.py                # 示例算子（不会被自动扫描注册）
+└── bench_attention.py                             # 主 benchmark 脚本
 ```
 
 ## 🚀 快速接入 TODO 清单（新成员从这里开始）

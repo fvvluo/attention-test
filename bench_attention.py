@@ -14,8 +14,8 @@ Prefill / Decode 说明：
                  去 attend 已缓存的 KV-Cache（访存密集，性能瓶颈是带宽而非算力）
     两个阶段会分别打印独立的对比表格（耗时 / TFLOPS / GB/s）。
 
-最终测试命令（本次评测实际使用的命令，非用法示例）：
-    python3 bench_attention.py --gpu 0 --shapes 1x64x8x131072x128 --dtype bf16 --causal --warmup 10 --iters 50
+最终测试命令（锁定的 M128N128 stage-4 Prefill 版本）：
+    python3 bench_attention.py --gpu 6 --shapes 1x64x8x131072x128 --dtype bf16 --causal --phases prefill --warmup 10 --iters 10
 
 用法示例（以下均为参数用法演示，非最终测试命令）：
     python bench_attention.py --gpu 0
