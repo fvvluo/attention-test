@@ -20,7 +20,7 @@ import cutlass  # noqa: E402
 import cutlass.cute as cute  # noqa: E402
 from cutlass.cute.runtime import from_dlpack  # noqa: E402
 
-from .ampere_flash_attention_gqa import FlashAttentionForwardAmpere  # noqa: E402
+from .ampere_flash_attention_gqa import FlashAttentionForwardAmpereStaticNoTail  # noqa: E402
 
 HEAD_DIM = 128
 M_BLOCK_SIZE = 128
@@ -81,7 +81,21 @@ def _validate_inputs(q, k, v, causal, sm_scale):
         scale = float(sm_scale)
         if not torch.isfinite(torch.tensor(scale)) or scale <= 0:
             raise ValueError("sm_scale 必须是有限正数")
+    _validate_shape_static(batch, num_q_heads, num_kv_heads, seq_len, head_dim, causal)
     return batch, num_q_heads, num_kv_heads, seq_len, head_dim, scale
+
+
+def _validate_shape_static(batch, q_heads, kv_heads, seq_len, head_dim, causal):
+    """额外校验 static-no-tail 路径的 shape 约束，不通过则抛出 ValueError。"""
+    FlashAttentionForwardAmpereStaticNoTail.validate_static_shape(
+        batch=batch,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        seq_len=seq_len,
+        head_dim=head_dim,
+        dtype=DTYPE_CUTLASS,
+        is_causal=causal,
+    )
 
 
 def _get_compiled(q, k, v, out, causal, sm_scale):
@@ -96,7 +110,7 @@ def _get_compiled(q, k, v, out, causal, sm_scale):
     )
     if key in _COMPILE_CACHE:
         return _COMPILE_CACHE[key]
-    kernel = FlashAttentionForwardAmpere(
+    kernel = FlashAttentionForwardAmpereStaticNoTail(
         HEAD_DIM, M_BLOCK_SIZE, N_BLOCK_SIZE, NUM_THREADS, causal
     )
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
