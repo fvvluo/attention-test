@@ -63,6 +63,7 @@ import math
 import torch
 import triton
 import triton.language as tl
+from .base import register
 
 
 class FlashAttentionForwardSm90(FlashAttentionForwardBase):
@@ -806,3 +807,6 @@ def attention(q, k, v, causal=True, sm_scale=None):
     else:
         _decode(q, k, v, out)           # decode: 原 Triton
     return out
+
+
+register("sunyichen_FA_cutedsl_sm90", attention)
