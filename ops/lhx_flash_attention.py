@@ -955,7 +955,7 @@ _TORCH_TO_CUTE_DTYPE = {
 _COMPILE_CACHE = {}
 
 
-def attention(q, k, v, causal=True, sm_scale=None):
+def _run_attention_sm90(q, k, v, causal=True, sm_scale=None):
     """SM90 (Hopper) CuTe DSL FlashAttention 前向，支持 GQA。
 
     Args:
@@ -1044,6 +1044,23 @@ def attention(q, k, v, causal=True, sm_scale=None):
         AuxData(),
     )
     return o_t.transpose(1, 2)
+
+
+def prefill_attention(q, k, v, causal=True, sm_scale=None):
+    """Prefill 入口；当前使用高吞吐 SM90 FlashAttention 内核。"""
+    return _run_attention_sm90(q, k, v, causal=causal, sm_scale=sm_scale)
+
+
+def decode_attention(q, k, v, causal=False, sm_scale=None):
+    """Decode 入口；暂时复用 prefill 内核，后续在此替换专用实现。"""
+    return _run_attention_sm90(q, k, v, causal=causal, sm_scale=sm_scale)
+
+
+def attention(q, k, v, causal=True, sm_scale=None):
+    """按输入形状分发 prefill/decode，保持 benchmark 统一接口。"""
+    if q.shape[2] == 1 and not bool(causal):
+        return decode_attention(q, k, v, causal=causal, sm_scale=sm_scale)
+    return prefill_attention(q, k, v, causal=causal, sm_scale=sm_scale)
 
 
 register("lhx_flash_attention (cute-dsl sm90)", attention)
