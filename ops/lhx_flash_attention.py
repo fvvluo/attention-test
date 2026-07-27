@@ -976,6 +976,8 @@ class GqaDecodeSm90:
         self.num_blocks = (kv_len + self.tile_n - 1) // self.tile_n
         self.num_splits = num_splits
         self.blocks_per_split = blocks_per_split
+        self.base_blocks_per_split = self.num_blocks // num_splits
+        self.long_splits = self.num_blocks % num_splits
         self.has_tail = kv_len % self.tile_n != 0
 
     @cute.jit
@@ -1192,8 +1194,18 @@ class GqaDecodeSm90:
             cKV = cute.make_identity_tensor((self.tile_n, self.head_dim))
             tKVcKV = gmem_thr_copy.partition_S(cKV)
 
+        # Balance non-divisible block counts across splits. The fixed upper loop
+        # bound keeps the long-context target fully unrolled; short splits execute
+        # one masked dummy tile instead of creating a partial GPU wave.
+        split_count = self.base_blocks_per_split
+        if split_idx < self.long_splits:
+            split_count += 1
+        first_n_block = (
+            split_idx * self.base_blocks_per_split
+            + cutlass.min(split_idx, self.long_splits)
+        )
+
         # Prologue: make K[0] visible before entering the steady-state pipeline.
-        first_n_block = split_idx * self.blocks_per_split
         if const_expr(self.has_tail):
             if first_n_block == self.num_blocks - 1:
                 tail_tokens = self.kv_len % self.tile_n
@@ -1226,18 +1238,25 @@ class GqaDecodeSm90:
             n_block = first_n_block + tile_idx
 
             # V[i] moves through the memory pipeline while QK and softmax use K[i].
-            if const_expr(self.has_tail):
-                if n_block == self.num_blocks - 1:
-                    tail_tokens = self.kv_len % self.tile_n
-                    for n in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
-                        if tKVcKV[0, n, 0][0] < tail_tokens:
-                            cute.copy(
-                                gmem_tiled_copy,
-                                tVgV[None, n, None, n_block],
-                                tVsV[None, n, None],
-                            )
-                        else:
-                            tVsV[None, n, None].fill(0.0)
+            if tile_idx < split_count:
+                if const_expr(self.has_tail):
+                    if n_block == self.num_blocks - 1:
+                        tail_tokens = self.kv_len % self.tile_n
+                        for n in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
+                            if tKVcKV[0, n, 0][0] < tail_tokens:
+                                cute.copy(
+                                    gmem_tiled_copy,
+                                    tVgV[None, n, None, n_block],
+                                    tVsV[None, n, None],
+                                )
+                            else:
+                                tVsV[None, n, None].fill(0.0)
+                    else:
+                        cute.copy(
+                            gmem_tiled_copy,
+                            tVgV[None, None, None, n_block],
+                            tVsV,
+                        )
                 else:
                     cute.copy(
                         gmem_tiled_copy,
@@ -1245,11 +1264,7 @@ class GqaDecodeSm90:
                         tVsV,
                     )
             else:
-                cute.copy(
-                    gmem_tiled_copy,
-                    tVgV[None, None, None, n_block],
-                    tVsV,
-                )
+                tVsV.fill(0.0)
             cute.arch.cp_async_commit_group()
 
             acc_S = cute.make_rmem_tensor(
@@ -1275,7 +1290,9 @@ class GqaDecodeSm90:
                     acc_S,
                 )
 
-            if const_expr(self.has_tail):
+            if tile_idx >= split_count:
+                layout_utils.reshape_acc_to_mn(acc_S).fill(-Float32.inf)
+            elif const_expr(self.has_tail):
                 if n_block == self.num_blocks - 1:
                     acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
                     cS = cute.make_identity_tensor((16, 16))
@@ -1304,18 +1321,25 @@ class GqaDecodeSm90:
             # K[i+1] loads into the independent K buffer while PV consumes V[i].
             if const_expr(tile_idx + 1 < self.blocks_per_split):
                 next_n_block = n_block + 1
-                if const_expr(self.has_tail):
-                    if next_n_block == self.num_blocks - 1:
-                        tail_tokens = self.kv_len % self.tile_n
-                        for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
-                            if tKVcKV[0, n, 0][0] < tail_tokens:
-                                cute.copy(
-                                    gmem_tiled_copy,
-                                    tKgK[None, n, None, next_n_block],
-                                    tKsK[None, n, None],
-                                )
-                            else:
-                                tKsK[None, n, None].fill(0.0)
+                if tile_idx + 1 < split_count:
+                    if const_expr(self.has_tail):
+                        if next_n_block == self.num_blocks - 1:
+                            tail_tokens = self.kv_len % self.tile_n
+                            for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                                if tKVcKV[0, n, 0][0] < tail_tokens:
+                                    cute.copy(
+                                        gmem_tiled_copy,
+                                        tKgK[None, n, None, next_n_block],
+                                        tKsK[None, n, None],
+                                    )
+                                else:
+                                    tKsK[None, n, None].fill(0.0)
+                        else:
+                            cute.copy(
+                                gmem_tiled_copy,
+                                tKgK[None, None, None, next_n_block],
+                                tKsK,
+                            )
                     else:
                         cute.copy(
                             gmem_tiled_copy,
@@ -1323,11 +1347,7 @@ class GqaDecodeSm90:
                             tKsK,
                         )
                 else:
-                    cute.copy(
-                        gmem_tiled_copy,
-                        tKgK[None, None, None, next_n_block],
-                        tKsK,
-                    )
+                    tKsK.fill(0.0)
                 cute.arch.cp_async_commit_group()
 
             for k_tile in cutlass.range_constexpr(cute.size(tOrP.shape[2])):
@@ -1556,23 +1576,19 @@ def _run_attention_sm90(q, k, v, causal=True, sm_scale=None):
     return o_t.transpose(1, 2)
 
 
-def _decode_split_config(batch, q_heads, kv_heads, kv_len):
-    """Choose a shape-derived compile-time configuration; no target-shape branch."""
+def _decode_split_config(batch, q_heads, kv_heads, kv_len, device):
+    """Choose four complete CTA waves for the current GPU when possible."""
     num_blocks = (kv_len + GqaDecodeSm90.tile_n - 1) // GqaDecodeSm90.tile_n
     q_ratio = q_heads // kv_heads
     q_groups = (q_ratio + GqaDecodeSm90.qheads_per_cta - 1) // GqaDecodeSm90.qheads_per_cta
     base_ctas = batch * kv_heads * q_groups
-    desired_splits = max(1, min(num_blocks, (256 + base_ctas - 1) // base_ctas))
-
-    # Exact division keeps every split's tile loop branch-free. The target workload
-    # naturally selects 32 splits: 1024 KV blocks / 32 blocks per split.
-    num_splits = 1
-    candidate = 1
-    while candidate <= desired_splits:
-        if num_blocks % candidate == 0:
-            num_splits = candidate
-        candidate *= 2
-    return num_splits, num_blocks // num_splits
+    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
+    target_ctas = sm_count * 4
+    num_splits = max(
+        1,
+        min(num_blocks, (target_ctas + base_ctas - 1) // base_ctas),
+    )
+    return num_splits, (num_blocks + num_splits - 1) // num_splits
 
 
 def _run_decode_sm90(q, k, v, sm_scale=None):
@@ -1593,7 +1609,7 @@ def _run_decode_sm90(q, k, v, sm_scale=None):
         sm_scale = 1.0 / math.sqrt(head_dim)
 
     num_splits, blocks_per_split = _decode_split_config(
-        batch, q_heads, kv_heads, kv_len
+        batch, q_heads, kv_heads, kv_len, q.device
     )
     q_t = q.transpose(1, 2)
     k_t = k.transpose(1, 2)
