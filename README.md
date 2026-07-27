@@ -12,16 +12,16 @@
 （如 `--gpu 3`）再运行：
 
 ```bash
-python3 bench_attention.py --shapes 1x64x8x131072x128 --dtype bf16 --causal --warmup 10 --iters 50
+python3 bench_attention.py --shapes 1x64x8x131072x128 --dtype bf16 --causal --warmup 10 --iters 10
 ```
 
 - `--shapes 1x64x8x131072x128`：GQA，`batch=1, q_heads=64, kv_heads=8,
   seq_len=131072（128K）, head_dim=128`；
 - `--dtype bf16`；
 - `--causal`：开启因果掩码（当前默认值就是开启，这里显式指定）；
-- `--warmup 10 --iters 50`：10 次预热 + 50 次正式计时。
+- `--warmup 10 --iters 10`：10 次预热 + 10 次正式计时。
 - 序列长度 128K 属于长序列场景，prefill 阶段单次前向本身就要几秒，加上
-  60 次调用（10 warmup + 50 iters），baseline 部分预计要跑数分钟，运行期间
+  20 次调用（10 warmup + 10 iters），baseline 部分预计要跑数分钟，运行期间
   终端不会有中间输出，是正常现象（可另开窗口用 `nvidia-smi` 确认 GPU
   利用率来判断是否仍在计算，而非卡死）。
 
