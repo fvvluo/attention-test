@@ -2,7 +2,7 @@ import torch
 
 import cutlass.cute as cute
 
-def benchmark_kernel(kernel, *args, warmup: int = 10, iterations: int = 100) -> float:
+def benchmark_kernel(kernel, *args, warmup: int = 20, iterations: int = 100) -> float:
     for _ in range(warmup):
         kernel(*args)
 

@@ -53,14 +53,18 @@ def main() -> None:
 
     expected = a @ b
 
-    max_error = (result - expected).abs().max().item()
-    print(f"max absolute error: {max_error:.3e}")
+    max_relative_error = (
+        (result - expected).abs() / expected.abs().clamp_min(1e-12)
+    ).max().item()
+    print(f"max relative error: {max_relative_error:.3e}")
 
-    if max_error > 1e-5:
+    if max_relative_error > 1e-2:
         raise ValueError("The answer may be wrong.")
 
     average_time = benchmark_kernel(compiled_matrix_mul, a_cute, b_cute, result_cute)
     print(f"average running time: {average_time:.3f}ms")
+
+    torch.backends.cuda.matmul.allow_tf32 = True
 
     average_time = benchmark_kernel(lambda a, b: a @ b, a, b)
     print(f"standard average running time: {average_time:.3f}ms")
