@@ -15,11 +15,7 @@ Prefill / Decode 说明：
     两个阶段会分别打印独立的对比表格（耗时 / TFLOPS / GB/s）。
 
 最终测试命令（本次评测实际使用的命令，非用法示例）：
-    python3 bench_attention.py --gpu 0 --shapes 1x64x8x131072x128 --dtype bf16 --causal \
-        --prefill-warmup 10 --prefill-iters 10 --decode-warmup 100 --decode-iters 100
-    （prefill 用 10+10；decode 单次耗时极小，用 100+100 降低测量噪声，
-     总耗时几乎不变，因为总时间由 prefill 主导。--warmup/--iters 仍作为
-     未单独指定阶段时的全局默认值。）
+    python3 bench_attention.py --gpu 0 --shapes 1x64x8x131072x128 --dtype bf16 --causal --prefill-warmup 10 --prefill-iters 10 --decode-warmup 100 --decode-iters 100
 
 用法示例（以下均为参数用法演示，非最终测试命令）：
     python bench_attention.py --gpu 0
@@ -121,43 +117,10 @@ def parse_args():
         default=True,
         help="是否使用因果掩码（仅作用于 prefill 阶段，默认开启，用 --no-causal 关闭）",
     )
-    parser.add_argument(
-        "--warmup",
-        type=int,
-        default=5,
-        help="正式计时前的 warmup 次数（全局默认；阶段未单独指定时使用）",
-    )
-    parser.add_argument(
-        "--iters",
-        type=int,
-        default=20,
-        help="正式计时的迭代次数（全局默认；阶段未单独指定时使用）",
-    )
-    parser.add_argument(
-        "--prefill-warmup",
-        type=int,
-        default=None,
-        help="prefill 阶段单独的 warmup 次数；不指定时回落到 --warmup",
-    )
-    parser.add_argument(
-        "--prefill-iters",
-        type=int,
-        default=None,
-        help="prefill 阶段单独的计时迭代次数；不指定时回落到 --iters",
-    )
-    parser.add_argument(
-        "--decode-warmup",
-        type=int,
-        default=None,
-        help="decode 阶段单独的 warmup 次数；不指定时回落到 --warmup。"
-        "decode 单次耗时远小于 prefill，可用更大的次数降低测量噪声",
-    )
-    parser.add_argument(
-        "--decode-iters",
-        type=int,
-        default=None,
-        help="decode 阶段单独的计时迭代次数；不指定时回落到 --iters",
-    )
+    parser.add_argument("--prefill-warmup", type=int, default=10, help="prefill 阶段正式计时前的 warmup 次数")
+    parser.add_argument("--prefill-iters", type=int, default=10, help="prefill 阶段正式计时的迭代次数")
+    parser.add_argument("--decode-warmup", type=int, default=100, help="decode 阶段正式计时前的 warmup 次数")
+    parser.add_argument("--decode-iters", type=int, default=100, help="decode 阶段正式计时的迭代次数")
     parser.add_argument(
         "--check-only",
         action="store_true",
@@ -586,19 +549,16 @@ def main():
             if phase == "prefill":
                 q_len, kv_len = seq_len, seq_len
                 phase_causal = args.causal
-                # 阶段专用参数优先，未指定时回落到全局 --warmup / --iters。
-                phase_warmup = args.prefill_warmup if args.prefill_warmup is not None else args.warmup
-                phase_iters = args.prefill_iters if args.prefill_iters is not None else args.iters
+                phase_warmup = args.prefill_warmup
+                phase_iters = args.prefill_iters
             else:  # decode
                 q_len, kv_len = 1, seq_len
                 # decode 阶段新 token 天然位于序列末尾，能 attend 到全部已缓存的
                 # kv，等价于非因果；这里显式关闭 causal，避免部分朴素实现在
                 # q_len != kv_len 时对绝对位置的因果掩码处理出错。
                 phase_causal = False
-                # decode 单次耗时远小于 prefill，允许单独指定更大的 warmup/iters
-                # 以降低测量噪声；未指定时回落到全局 --warmup / --iters。
-                phase_warmup = args.decode_warmup if args.decode_warmup is not None else args.warmup
-                phase_iters = args.decode_iters if args.decode_iters is not None else args.iters
+                phase_warmup = args.decode_warmup
+                phase_iters = args.decode_iters
 
             q, k, v = make_inputs(batch, q_heads, kv_heads, q_len, kv_len, head_dim, dtype, device)
             sm_scale = None  # 使用默认缩放 1/sqrt(head_dim)
