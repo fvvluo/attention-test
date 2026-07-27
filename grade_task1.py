@@ -16,8 +16,8 @@ from datetime import datetime
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_DIR = SCRIPT_DIR
 
-CSV_FILENAME = os.path.join(SCRIPT_DIR, "attention_leaderboard.csv")
-LOG_FILENAME = os.path.join(SCRIPT_DIR, "attn_sentinel.log")
+CSV_FILENAME = os.path.join(os.dirname(SCRIPT_DIR), "attention_leaderboard.csv")
+LOG_FILENAME = os.path.join(os.dirname(SCRIPT_DIR), "attn_sentinel.log")
 
 POLL_INTERVAL_SECONDS = 60
 
@@ -157,10 +157,10 @@ def main():
                 continue
 
             # =========================================================================
-            # NEW: Pull authoritative benchmarking & grading files from origin/main
+            # NEW: Pull authoritative benchmarking & grading files from main
             # =========================================================================
-            print("   Forcing use of authoritative grade/bench scripts from origin/main...")
-            overwrite_out = run_shell("git checkout origin/main -- bench_attention.py grade_task1.py")
+            print("   Forcing use of authoritative grade/bench scripts from main...")
+            overwrite_out = run_shell("git checkout main -- bench_attention.py grade_task1.py")
             if "error:" in overwrite_out.lower() or "fatal:" in overwrite_out.lower():
                 # Note: if the files are in a subfolder like 'tests/', adjust the paths above.
                 logging.error(f"Failed to checkout authoritative files from main. Reason:\n{overwrite_out}")
