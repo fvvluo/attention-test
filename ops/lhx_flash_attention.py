@@ -1192,37 +1192,65 @@ class GqaDecodeSm90:
             cKV = cute.make_identity_tensor((self.tile_n, self.head_dim))
             tKVcKV = gmem_thr_copy.partition_S(cKV)
 
-        for tile_idx in cutlass.range_constexpr(self.blocks_per_split):
-            n_block = split_idx * self.blocks_per_split + tile_idx
+        # Prologue: make K[0] visible before entering the steady-state pipeline.
+        first_n_block = split_idx * self.blocks_per_split
+        if const_expr(self.has_tail):
+            if first_n_block == self.num_blocks - 1:
+                tail_tokens = self.kv_len % self.tile_n
+                for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                    if tKVcKV[0, n, 0][0] < tail_tokens:
+                        cute.copy(
+                            gmem_tiled_copy,
+                            tKgK[None, n, None, first_n_block],
+                            tKsK[None, n, None],
+                        )
+                    else:
+                        tKsK[None, n, None].fill(0.0)
+            else:
+                cute.copy(
+                    gmem_tiled_copy,
+                    tKgK[None, None, None, first_n_block],
+                    tKsK,
+                )
+        else:
+            cute.copy(
+                gmem_tiled_copy,
+                tKgK[None, None, None, first_n_block],
+                tKsK,
+            )
+        cute.arch.cp_async_commit_group()
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
 
-            # One cooperative global read of K for all Q rows in this group.
+        for tile_idx in cutlass.range_constexpr(self.blocks_per_split):
+            n_block = first_n_block + tile_idx
+
+            # V[i] moves through the memory pipeline while QK and softmax use K[i].
             if const_expr(self.has_tail):
                 if n_block == self.num_blocks - 1:
                     tail_tokens = self.kv_len % self.tile_n
-                    for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                    for n in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
                         if tKVcKV[0, n, 0][0] < tail_tokens:
                             cute.copy(
                                 gmem_tiled_copy,
-                                tKgK[None, n, None, n_block],
-                                tKsK[None, n, None],
+                                tVgV[None, n, None, n_block],
+                                tVsV[None, n, None],
                             )
                         else:
-                            tKsK[None, n, None].fill(0.0)
+                            tVsV[None, n, None].fill(0.0)
                 else:
                     cute.copy(
                         gmem_tiled_copy,
-                        tKgK[None, None, None, n_block],
-                        tKsK,
+                        tVgV[None, None, None, n_block],
+                        tVsV,
                     )
             else:
                 cute.copy(
                     gmem_tiled_copy,
-                    tKgK[None, None, None, n_block],
-                    tKsK,
+                    tVgV[None, None, None, n_block],
+                    tVsV,
                 )
             cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
-            cute.arch.barrier()
 
             acc_S = cute.make_rmem_tensor(
                 thr_mma.partition_shape_C((16, 16)), Float32
@@ -1269,34 +1297,38 @@ class GqaDecodeSm90:
             rP.store(acc_S.load().to(self.dtype))
             tOrP = layout_utils.reshape_acc_to_frgA(rP)
 
-            # K is no longer live. Load V once and reuse it across all Q rows.
-            if const_expr(self.has_tail):
-                if n_block == self.num_blocks - 1:
-                    tail_tokens = self.kv_len % self.tile_n
-                    for n in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
-                        if tKVcKV[0, n, 0][0] < tail_tokens:
-                            cute.copy(
-                                gmem_tiled_copy,
-                                tVgV[None, n, None, n_block],
-                                tVsV[None, n, None],
-                            )
-                        else:
-                            tVsV[None, n, None].fill(0.0)
+            # V[i] must be visible before PV consumes it.
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+
+            # K[i+1] loads into the independent K buffer while PV consumes V[i].
+            if const_expr(tile_idx + 1 < self.blocks_per_split):
+                next_n_block = n_block + 1
+                if const_expr(self.has_tail):
+                    if next_n_block == self.num_blocks - 1:
+                        tail_tokens = self.kv_len % self.tile_n
+                        for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                            if tKVcKV[0, n, 0][0] < tail_tokens:
+                                cute.copy(
+                                    gmem_tiled_copy,
+                                    tKgK[None, n, None, next_n_block],
+                                    tKsK[None, n, None],
+                                )
+                            else:
+                                tKsK[None, n, None].fill(0.0)
+                    else:
+                        cute.copy(
+                            gmem_tiled_copy,
+                            tKgK[None, None, None, next_n_block],
+                            tKsK,
+                        )
                 else:
                     cute.copy(
                         gmem_tiled_copy,
-                        tVgV[None, None, None, n_block],
-                        tVsV,
+                        tKgK[None, None, None, next_n_block],
+                        tKsK,
                     )
-            else:
-                cute.copy(
-                    gmem_tiled_copy,
-                    tVgV[None, None, None, n_block],
-                    tVsV,
-                )
-            cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
-            cute.arch.barrier()
+                cute.arch.cp_async_commit_group()
 
             for k_tile in cutlass.range_constexpr(cute.size(tOrP.shape[2])):
                 cute.copy(
@@ -1311,6 +1343,12 @@ class GqaDecodeSm90:
                     tOrVt[None, None, k_tile],
                     acc_O,
                 )
+
+            if const_expr(tile_idx + 1 < self.blocks_per_split):
+                cute.arch.cp_async_wait_group(0)
+                # Also prevents an early warp from overwriting V while a late warp
+                # is still finishing the current PV operation.
+                cute.arch.barrier()
 
         # Convert each warp's state to normalized O plus LSE. These compose with
         # the simple exp(LSE_i - LSE_max) rule in both reduction levels.
