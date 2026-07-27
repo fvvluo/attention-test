@@ -960,7 +960,7 @@ def cute_attention(q, k, v, sm_scale=None, is_causal=False,
             # ON by default; _FP8_PREFILL=0 disables for A/B vs the bf16 path.
             if (os.environ.get("_FP8_PREFILL", "1") == "1"
                     and can_use_fp8_prefill(q, k, v, is_causal)):
-                ncorr = int(os.environ.get("_FP8_NCORR", "4096"))
+                ncorr = int(os.environ.get("_FP8_NCORR", "8192"))
                 return fp8_hybrid_attention(q, k, v, sm_scale=sm_scale,
                                             is_causal=is_causal, ncorr=ncorr)
             if can_use_fmha_ref(q, k, v, is_causal):

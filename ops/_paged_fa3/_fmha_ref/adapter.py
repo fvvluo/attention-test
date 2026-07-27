@@ -181,8 +181,9 @@ def fmha_ref_attention(q, k, v, sm_scale=None, is_causal=False,
 #
 # Fix (hybrid): run the whole thing in FP8, then RECOMPUTE the first NCORR causal
 # query rows in bf16 (an NCORR x NCORR attention -- negligible vs S^2) and
-# overwrite them. NCORR=4096 gives a ~2.7x accuracy margin at S=131072 (worst
-# sampled bulk-edge error ~7.4e-3 << 2e-2) at sub-1% net cost.
+# overwrite them. Multi-seed 128K diagnostics found the vulnerable band extends
+# to row ~7800 (seed-0 worst at row 5485); NCORR=8192 removes it, while the
+# observed max error beyond row 8192 stayed <=1.27e-2, at about 1% net cost.
 #
 # FP8 V LAYOUT: q/k/o stay s/d-major (leading_dim=1). V (fp8) must be d-major:
 # storage laid out (B,D,Hkv,1,S) contiguous, viewed as (S,D,1,Hkv,B) with
@@ -266,7 +267,7 @@ def _bf16_correct_early(q, k, v, o, ncorr, sm_scale):
 
 
 def fp8_hybrid_attention(q, k, v, sm_scale=None, is_causal=True,
-                         mma_tiler_mn=(64, 256), ncorr=4096, is_persistent=False):
+                         mma_tiler_mn=(64, 256), ncorr=8192, is_persistent=False):
     """q,k,v: [B,S,H,D] bf16 cuda, causal. Returns o [B,Sq,Hq,D] bf16.
     FP8 bulk + bf16 correction of the first `ncorr` query rows."""
     B, Sq, Hq, D = q.shape
