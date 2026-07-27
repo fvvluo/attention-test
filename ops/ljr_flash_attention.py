@@ -26,6 +26,7 @@ def _get_fa_cls():
         _ensure_baseline_routed()
         import cuda.bindings.driver as cuda
         from flash_attn.cute.utils import AuxData
+        # 载入本仓库自己的 kernel 文件（内部会 import 已路由的 flash_attn.cute.* 叶子构件）
         import importlib.util, os
         kpath = os.path.join(os.path.dirname(__file__), "mc_attention", "flash_attention_fa3_kernel.py")
         spec = importlib.util.spec_from_file_location("ljr_fa3_kernel", kpath)
@@ -53,11 +54,22 @@ def attention(q, k, v, causal=True, sm_scale=None):
     FA = _get_fa_cls()
     orig_dtype = q.dtype
 
-    # (b, h, s, d) -> (b, s, h, d)，连续化为 bf16
-    q_bshd = q.transpose(1, 2).contiguous().to(torch.bfloat16)
-    k_bshd = k.transpose(1, 2).contiguous().to(torch.bfloat16)
-    v_bshd = v.transpose(1, 2).contiguous().to(torch.bfloat16)
-    o_bshd = torch.empty_like(q_bshd)
+    # 零拷贝接口：kernel 逻辑上要 (b, s, h, d)，但内部用 TMA 按 stride 读，
+    # 允许任意 stride。benchmark 传入 (b, h, s, d)，head_dim 已连续；只需 transpose(1,2)
+    # 得到 (b, s, h, d) 的 *view*（不 .contiguous()），省掉每次 4 次大张量拷贝。
+    # dtype 已是 bf16 时不再 .to()（避免拷贝）。
+    def _prep(x):
+        if x.dtype != torch.bfloat16:
+            x = x.to(torch.bfloat16)
+        return x.transpose(1, 2)  # (b,h,s,d) -> (b,s,h,d) view，d 仍连续
+
+    q_bshd = _prep(q)
+    k_bshd = _prep(k)
+    v_bshd = _prep(v)
+    # 输出按 (b,s,h,d) 连续分配，返回时 transpose 回 (b,h,s,d)
+    o_bshd = torch.empty(
+        (batch, q_len, q_heads, head_dim), device=q.device, dtype=torch.bfloat16
+    )
 
     q_t = from_dlpack(q_bshd, assumed_align=16)
     k_t = from_dlpack(k_bshd, assumed_align=16)
@@ -87,7 +99,7 @@ def attention(q, k, v, causal=True, sm_scale=None):
         None, None, None, None, None, None, None, None, None, aux,
         _CUDA_STREAM,
     )
-    return o_bshd.transpose(1, 2).to(orig_dtype)
+    return o_bshd.transpose(1, 2).to(orig_dtype)  # (b,s,h,d) -> (b,h,s,d)
 
 
 register("ljr_flash_attention_fa3", attention)
