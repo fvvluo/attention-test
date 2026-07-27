@@ -47,7 +47,7 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
-from cutlass.cute.nvgpu import cpasync, warpgroup
+from cutlass.cute.nvgpu import cpasync, warp, warpgroup
 from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 from cutlass import pipeline
@@ -942,6 +942,477 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 
 
 # ---------------------------------------------------------------------------
+# GQA decode for H20 (SM90), JIT-specialized by workload configuration
+# ---------------------------------------------------------------------------
+
+
+class GqaDecodeSm90:
+    """Split-KV decode; generic shapes use the same target-optimized mapping."""
+
+    tile_n = 128
+    qheads_per_cta = 8
+    head_dim = 128
+    num_threads = 256
+
+    def __init__(
+        self,
+        dtype,
+        batch_size: int,
+        q_heads: int,
+        kv_heads: int,
+        kv_len: int,
+        num_splits: int,
+        blocks_per_split: int,
+    ):
+        self.dtype = dtype
+        self.batch_size = batch_size
+        self.q_heads = q_heads
+        self.kv_heads = kv_heads
+        self.kv_len = kv_len
+        self.qheads_per_kvhead = q_heads // kv_heads
+        self.q_groups = (
+            self.qheads_per_kvhead + self.qheads_per_cta - 1
+        ) // self.qheads_per_cta
+        self.num_blocks = (kv_len + self.tile_n - 1) // self.tile_n
+        self.num_splits = num_splits
+        self.blocks_per_split = blocks_per_split
+        self.has_tail = kv_len % self.tile_n != 0
+
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,          # (B, 1, QH, 128), BSHD
+        mK: cute.Tensor,          # (B, KV, KVH, 128), BSHD
+        mV: cute.Tensor,
+        mPartialO: cute.Tensor,   # (B, splits, QH, 128), FP32
+        mPartialLSE: cute.Tensor, # (B, splits, QH), FP32
+        mO: cute.Tensor,          # (B, 1, QH, 128), BSHD
+        softmax_scale: Float32,
+        stream: cuda.CUstream = None,
+    ):
+        assert mQ.element_type == self.dtype
+        assert mK.element_type == self.dtype
+        assert mV.element_type == self.dtype
+        assert mO.element_type == self.dtype
+        assert mPartialO.element_type == Float32
+        assert mPartialLSE.element_type == Float32
+
+        mQ, mK, mV, mO = [assume_tensor_aligned(t) for t in (mQ, mK, mV, mO)]
+        mPartialO, mPartialLSE = [
+            assume_tensor_aligned(t) for t in (mPartialO, mPartialLSE)
+        ]
+
+        dtype = self.dtype
+        smem_atom = cute.make_composed_layout(
+            cute.make_swizzle(3, 3, 3),
+            0,
+            cute.make_layout((8, 64), stride=(64, 1)),
+        )
+        sQ_layout = cute.tile_to_shape(smem_atom, (16, self.head_dim), (0, 1))
+        sKV_layout = cute.tile_to_shape(
+            smem_atom, (self.tile_n, self.head_dim), (0, 1)
+        )
+        sWarpO_layout = cute.make_layout(
+            (8, 16, self.head_dim),
+            stride=(16 * self.head_dim, self.head_dim, 1),
+        )
+        sWarpLSE_layout = cute.make_layout((8, 16), stride=(16, 1))
+
+        @cute.struct
+        class SharedStorage:
+            sQ: cute.struct.Align[
+                cute.struct.MemRange[dtype, cute.cosize(sQ_layout)], 1024
+            ]
+            sK: cute.struct.Align[
+                cute.struct.MemRange[dtype, cute.cosize(sKV_layout)], 1024
+            ]
+            sV: cute.struct.Align[
+                cute.struct.MemRange[dtype, cute.cosize(sKV_layout)], 1024
+            ]
+            sWarpO: cute.struct.Align[
+                cute.struct.MemRange[Float32, cute.cosize(sWarpO_layout)], 1024
+            ]
+            sWarpLSE: cute.struct.Align[
+                cute.struct.MemRange[Float32, cute.cosize(sWarpLSE_layout)], 128
+            ]
+
+        # 16 rows x 128 columns are copied by 256 threads, 16 B per thread.
+        copy_atom = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            dtype,
+            num_bits_per_copy=128,
+        )
+        copy_threads = cute.make_layout((16, 16), stride=(16, 1))
+        copy_values = cute.make_layout((1, 8))
+        gmem_tiled_copy = cute.make_tiled_copy_tv(
+            copy_atom, copy_threads, copy_values
+        )
+
+        # One independent m16n8k16 MMA warp. Each CTA instantiates eight copies,
+        # one for each 16-token slice of the shared 128-token KV tile.
+        tiled_mma = cute.make_tiled_mma(
+            warp.MmaF16BF16Op(dtype, Float32, (16, 8, 16)),
+            (1, 1, 1),
+            permutation_mnk=(16, 16, 16),
+        )
+
+        scale_log2 = softmax_scale * math.log2(math.e)
+        self.main_kernel(
+            mQ,
+            mK,
+            mV,
+            mPartialO,
+            mPartialLSE,
+            scale_log2,
+            sQ_layout,
+            sKV_layout,
+            sWarpO_layout,
+            sWarpLSE_layout,
+            gmem_tiled_copy,
+            tiled_mma,
+            SharedStorage,
+        ).launch(
+            grid=(self.num_splits, self.kv_heads * self.q_groups, self.batch_size),
+            block=[self.num_threads, 1, 1],
+            stream=stream,
+            min_blocks_per_mp=1,
+        )
+        self.reduce_kernel(mPartialO, mPartialLSE, mO).launch(
+            grid=(self.q_heads, self.batch_size, 1),
+            block=[self.head_dim, 1, 1],
+            stream=stream,
+        )
+
+    @cute.kernel
+    def main_kernel(
+        self,
+        mQ: cute.Tensor,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        mPartialO: cute.Tensor,
+        mPartialLSE: cute.Tensor,
+        scale_log2: Float32,
+        sQ_layout: cute.ComposedLayout,
+        sKV_layout: cute.ComposedLayout,
+        sWarpO_layout: cute.Layout,
+        sWarpLSE_layout: cute.Layout,
+        gmem_tiled_copy: cute.TiledCopy,
+        tiled_mma: cute.TiledMma,
+        SharedStorage: cutlass.Constexpr,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        split_idx, head_group_idx, batch_idx = cute.arch.block_idx()
+        kv_head = head_group_idx // self.q_groups
+        q_group = head_group_idx % self.q_groups
+        q_head_base = (
+            kv_head * self.qheads_per_kvhead + q_group * self.qheads_per_cta
+        )
+        warp_idx = cute.arch.make_warp_uniform(tidx // 32)
+        lane_idx = tidx % 32
+
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        sQ = storage.sQ.get_tensor(sQ_layout)
+        sK = storage.sK.get_tensor(sKV_layout)
+        sV = storage.sV.get_tensor(sKV_layout)
+        sWarpO = storage.sWarpO.get_tensor(sWarpO_layout)
+        sWarpLSE = storage.sWarpLSE.get_tensor(sWarpLSE_layout)
+
+        # Eight Q rows share a KV head. A final short GQA group is zero padded;
+        # divisible-by-eight ratios compile without this boundary branch.
+        if tidx < 128:
+            q_row = tidx // 16
+            q_head = q_head_base + q_row
+            d0 = (tidx % 16) * 8
+            for j in cutlass.range_constexpr(8):
+                if const_expr(self.qheads_per_kvhead % self.qheads_per_cta == 0):
+                    sQ[q_row, d0 + j] = mQ[batch_idx, 0, q_head, d0 + j]
+                else:
+                    if q_head < (kv_head + 1) * self.qheads_per_kvhead:
+                        sQ[q_row, d0 + j] = mQ[batch_idx, 0, q_head, d0 + j]
+                    else:
+                        sQ[q_row, d0 + j] = self.dtype(0.0)
+                sQ[q_row + 8, d0 + j] = self.dtype(0.0)
+        cute.arch.barrier()
+
+        # Every warp sees the same Q tile and a disjoint 16-token K/V slice.
+        sK_warp = cute.local_tile(sK, (16, self.head_dim), (warp_idx, 0))
+        sV_warp = cute.local_tile(sV, (16, self.head_dim), (warp_idx, 0))
+        sVt_warp = layout_utils.transpose_view(sV_warp)
+        thr_mma = tiled_mma.get_slice(lane_idx)
+
+        smem_copy_qk = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4),
+            self.dtype,
+        )
+        smem_copy_v = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4),
+            self.dtype,
+        )
+        copy_q = cute.make_tiled_copy_A(smem_copy_qk, tiled_mma).get_slice(lane_idx)
+        copy_k = cute.make_tiled_copy_B(smem_copy_qk, tiled_mma).get_slice(lane_idx)
+        copy_v = cute.make_tiled_copy_B(smem_copy_v, tiled_mma).get_slice(lane_idx)
+
+        tSsQ = copy_q.partition_S(sQ)
+        tSsK = copy_k.partition_S(sK_warp)
+        tOsVt = copy_v.partition_S(sVt_warp)
+        tSrQ = thr_mma.make_fragment_A(thr_mma.partition_A(sQ))
+        tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK_warp))
+        tOrVt = thr_mma.make_fragment_B(thr_mma.partition_B(sVt_warp))
+        tSrQ_copy = copy_q.retile(tSrQ)
+        tSrK_copy = copy_k.retile(tSrK)
+        tOrVt_copy = copy_v.retile(tOrVt)
+
+        acc_O = cute.make_rmem_tensor(
+            thr_mma.partition_shape_C((16, self.head_dim)), Float32
+        )
+        acc_O.fill(0.0)
+        softmax = Softmax.create(
+            scale_log2,
+            num_rows=acc_O.shape[0][0] * acc_O.shape[1],
+        )
+        softmax.reset()
+
+        gK = cute.local_tile(
+            mK[batch_idx, None, kv_head, None],
+            (self.tile_n, self.head_dim),
+            (None, 0),
+        )
+        gV = cute.local_tile(
+            mV[batch_idx, None, kv_head, None],
+            (self.tile_n, self.head_dim),
+            (None, 0),
+        )
+        gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
+        tKgK = gmem_thr_copy.partition_S(gK)
+        tVgV = gmem_thr_copy.partition_S(gV)
+        tKsK = gmem_thr_copy.partition_D(sK)
+        tVsV = gmem_thr_copy.partition_D(sV)
+        if const_expr(self.has_tail):
+            cKV = cute.make_identity_tensor((self.tile_n, self.head_dim))
+            tKVcKV = gmem_thr_copy.partition_S(cKV)
+
+        for tile_idx in cutlass.range_constexpr(self.blocks_per_split):
+            n_block = split_idx * self.blocks_per_split + tile_idx
+
+            # One cooperative global read of K for all Q rows in this group.
+            if const_expr(self.has_tail):
+                if n_block == self.num_blocks - 1:
+                    tail_tokens = self.kv_len % self.tile_n
+                    for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
+                        if tKVcKV[0, n, 0][0] < tail_tokens:
+                            cute.copy(
+                                gmem_tiled_copy,
+                                tKgK[None, n, None, n_block],
+                                tKsK[None, n, None],
+                            )
+                        else:
+                            tKsK[None, n, None].fill(0.0)
+                else:
+                    cute.copy(
+                        gmem_tiled_copy,
+                        tKgK[None, None, None, n_block],
+                        tKsK,
+                    )
+            else:
+                cute.copy(
+                    gmem_tiled_copy,
+                    tKgK[None, None, None, n_block],
+                    tKsK,
+                )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+
+            acc_S = cute.make_rmem_tensor(
+                thr_mma.partition_shape_C((16, 16)), Float32
+            )
+            acc_S.fill(0.0)
+            for k_tile in cutlass.range_constexpr(cute.size(tSsQ.shape[2])):
+                cute.copy(
+                    smem_copy_qk,
+                    tSsQ[None, None, k_tile],
+                    tSrQ_copy[None, None, k_tile],
+                )
+                cute.copy(
+                    smem_copy_qk,
+                    tSsK[None, None, k_tile],
+                    tSrK_copy[None, None, k_tile],
+                )
+                cute.gemm(
+                    tiled_mma,
+                    acc_S,
+                    tSrQ[None, None, k_tile],
+                    tSrK[None, None, k_tile],
+                    acc_S,
+                )
+
+            if const_expr(self.has_tail):
+                if n_block == self.num_blocks - 1:
+                    acc_S_mn = layout_utils.reshape_acc_to_mn(acc_S)
+                    cS = cute.make_identity_tensor((16, 16))
+                    tScS = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cS))
+                    tail_tokens = self.kv_len % self.tile_n
+                    for row in cutlass.range_constexpr(cute.size(acc_S_mn.shape[0])):
+                        for col in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
+                            token_in_tile = warp_idx * 16 + tScS[0, col][1]
+                            if token_in_tile >= tail_tokens:
+                                acc_S_mn[row, col] = -Float32.inf
+
+            row_scale = softmax.online_softmax(
+                acc_S,
+                is_first=(tile_idx == 0),
+                check_inf=self.has_tail,
+            )
+            softmax.rescale_O(acc_O, row_scale)
+            rP = cute.make_fragment_like(acc_S, self.dtype)
+            rP.store(acc_S.load().to(self.dtype))
+            tOrP = layout_utils.reshape_acc_to_frgA(rP)
+
+            # K is no longer live. Load V once and reuse it across all Q rows.
+            if const_expr(self.has_tail):
+                if n_block == self.num_blocks - 1:
+                    tail_tokens = self.kv_len % self.tile_n
+                    for n in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
+                        if tKVcKV[0, n, 0][0] < tail_tokens:
+                            cute.copy(
+                                gmem_tiled_copy,
+                                tVgV[None, n, None, n_block],
+                                tVsV[None, n, None],
+                            )
+                        else:
+                            tVsV[None, n, None].fill(0.0)
+                else:
+                    cute.copy(
+                        gmem_tiled_copy,
+                        tVgV[None, None, None, n_block],
+                        tVsV,
+                    )
+            else:
+                cute.copy(
+                    gmem_tiled_copy,
+                    tVgV[None, None, None, n_block],
+                    tVsV,
+                )
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+
+            for k_tile in cutlass.range_constexpr(cute.size(tOrP.shape[2])):
+                cute.copy(
+                    smem_copy_v,
+                    tOsVt[None, None, k_tile],
+                    tOrVt_copy[None, None, k_tile],
+                )
+                cute.gemm(
+                    tiled_mma,
+                    acc_O,
+                    tOrP[None, None, k_tile],
+                    tOrVt[None, None, k_tile],
+                    acc_O,
+                )
+
+        # Convert each warp's state to normalized O plus LSE. These compose with
+        # the simple exp(LSE_i - LSE_max) rule in both reduction levels.
+        final_scale = softmax.finalize()
+        softmax.rescale_O(acc_O, final_scale)
+
+        sWarpO_cur = sWarpO[warp_idx, None, None]
+        store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32)
+        store_o = cute.make_tiled_copy_C(store_atom, tiled_mma).get_slice(lane_idx)
+        tOrO = store_o.retile(acc_O)
+        tOsO = store_o.partition_D(sWarpO_cur)
+        cute.copy(store_atom, tOrO, tOsO)
+
+        # Expand a 1-D LSE row with zero column stride so partition_C provides
+        # exactly the same row ownership as the MMA accumulator.
+        sLSE_cur = sWarpLSE[warp_idx, None]
+        sLSE_expanded = cute.make_tensor(
+            sLSE_cur.iterator,
+            cute.append(
+                sLSE_cur.layout,
+                cute.make_layout((self.head_dim,), stride=(0,)),
+            ),
+        )
+        tLsLSE = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(sLSE_expanded))
+        cO = cute.make_identity_tensor((16, self.head_dim))
+        tLcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
+        if tLcO[0][1] == 0:
+            for row in cutlass.range_constexpr(cute.size(softmax.row_sum)):
+                tLsLSE[row, 0] = softmax.row_sum[row]
+        cute.arch.barrier()
+
+        # Reassign one warp to each valid Q row and merge the eight token-slice
+        # partials produced by the original worker warps.
+        q_row = warp_idx
+        q_head = q_head_base + q_row
+        lse_max = -Float32.inf
+        for src_warp in cutlass.range_constexpr(8):
+            lse_max = cute.arch.fmax(lse_max, sWarpLSE[src_warp, q_row])
+        weight_sum = Float32(0.0)
+        for src_warp in cutlass.range_constexpr(8):
+            weight_sum += cute.math.exp2(
+                (sWarpLSE[src_warp, q_row] - lse_max) * math.log2(math.e),
+                fastmath=True,
+            )
+
+        for d_iter in cutlass.range_constexpr(4):
+            d = lane_idx + d_iter * 32
+            out = Float32(0.0)
+            for src_warp in cutlass.range_constexpr(8):
+                weight = cute.math.exp2(
+                    (sWarpLSE[src_warp, q_row] - lse_max) * math.log2(math.e),
+                    fastmath=True,
+                )
+                out += sWarpO[src_warp, q_row, d] * weight
+            out = out * cute.arch.rcp_approx(weight_sum)
+            if const_expr(self.qheads_per_kvhead % self.qheads_per_cta == 0):
+                mPartialO[batch_idx, split_idx, q_head, d] = out
+            else:
+                if q_head < (kv_head + 1) * self.qheads_per_kvhead:
+                    mPartialO[batch_idx, split_idx, q_head, d] = out
+
+        if lane_idx == 0:
+            lse = lse_max + cute.math.log2(weight_sum, fastmath=True) * math.log(2.0)
+            if const_expr(self.qheads_per_kvhead % self.qheads_per_cta == 0):
+                mPartialLSE[batch_idx, split_idx, q_head] = lse
+            else:
+                if q_head < (kv_head + 1) * self.qheads_per_kvhead:
+                    mPartialLSE[batch_idx, split_idx, q_head] = lse
+
+    @cute.kernel
+    def reduce_kernel(
+        self,
+        mPartialO: cute.Tensor,
+        mPartialLSE: cute.Tensor,
+        mO: cute.Tensor,
+    ):
+        d, _, _ = cute.arch.thread_idx()
+        q_head, batch_idx, _ = cute.arch.block_idx()
+
+        lse_max = -Float32.inf
+        for split_idx in cutlass.range_constexpr(self.num_splits):
+            lse_max = cute.arch.fmax(
+                lse_max, mPartialLSE[batch_idx, split_idx, q_head]
+            )
+
+        weight_sum = Float32(0.0)
+        out = Float32(0.0)
+        for split_idx in cutlass.range_constexpr(self.num_splits):
+            weight = cute.math.exp2(
+                (mPartialLSE[batch_idx, split_idx, q_head] - lse_max)
+                * math.log2(math.e),
+                fastmath=True,
+            )
+            weight_sum += weight
+            out += mPartialO[batch_idx, split_idx, q_head, d] * weight
+
+        mO[batch_idx, 0, q_head, d] = (
+            out * cute.arch.rcp_approx(weight_sum)
+        ).to(self.dtype)
+
+
+# ---------------------------------------------------------------------------
 # ops 接口封装：把上面的 CuTe DSL 内核包成 benchmark 约定的函数签名
 # ---------------------------------------------------------------------------
 
@@ -953,6 +1424,7 @@ _TORCH_TO_CUTE_DTYPE = {
 # JIT 编译缓存：(dtype, head_dim, qhead_per_kvhead, causal) -> 已编译内核。
 # batch / seqlen / heads 都标记为动态维度，同一配置下换形状不需要重新编译。
 _COMPILE_CACHE = {}
+_DECODE_COMPILE_CACHE = {}
 
 
 def _run_attention_sm90(q, k, v, causal=True, sm_scale=None):
@@ -1046,14 +1518,117 @@ def _run_attention_sm90(q, k, v, causal=True, sm_scale=None):
     return o_t.transpose(1, 2)
 
 
+def _decode_split_config(batch, q_heads, kv_heads, kv_len):
+    """Choose a shape-derived compile-time configuration; no target-shape branch."""
+    num_blocks = (kv_len + GqaDecodeSm90.tile_n - 1) // GqaDecodeSm90.tile_n
+    q_ratio = q_heads // kv_heads
+    q_groups = (q_ratio + GqaDecodeSm90.qheads_per_cta - 1) // GqaDecodeSm90.qheads_per_cta
+    base_ctas = batch * kv_heads * q_groups
+    desired_splits = max(1, min(num_blocks, (256 + base_ctas - 1) // base_ctas))
+
+    # Exact division keeps every split's tile loop branch-free. The target workload
+    # naturally selects 32 splits: 1024 KV blocks / 32 blocks per split.
+    num_splits = 1
+    candidate = 1
+    while candidate <= desired_splits:
+        if num_blocks % candidate == 0:
+            num_splits = candidate
+        candidate *= 2
+    return num_splits, num_blocks // num_splits
+
+
+def _run_decode_sm90(q, k, v, sm_scale=None):
+    """Run the JIT-specialized split-KV GQA decode kernel."""
+    batch, q_heads, q_len, head_dim = q.shape
+    kv_heads, kv_len = k.shape[1], k.shape[2]
+    if kv_len <= 0:
+        raise ValueError("decode kernel requires kv_len > 0")
+    if q_len != 1 or head_dim != 128 or k.shape[-1] != 128 or v.shape[-1] != 128:
+        raise ValueError("decode kernel requires q_len=1 and head_dim=128")
+    if k.shape != v.shape or k.shape[0] != batch:
+        raise ValueError("K/V shapes must match Q batch and each other")
+    if q.dtype not in _TORCH_TO_CUTE_DTYPE or k.dtype != q.dtype or v.dtype != q.dtype:
+        raise ValueError("decode kernel requires matching fp16 or bf16 Q/K/V")
+    if q_heads % kv_heads != 0:
+        raise ValueError(f"q_heads={q_heads} must be divisible by kv_heads={kv_heads}")
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(head_dim)
+
+    num_splits, blocks_per_split = _decode_split_config(
+        batch, q_heads, kv_heads, kv_len
+    )
+    q_t = q.transpose(1, 2)
+    k_t = k.transpose(1, 2)
+    v_t = v.transpose(1, 2)
+    q_t = q_t if q_t.stride(-1) == 1 else q_t.contiguous()
+    k_t = k_t if k_t.stride(-1) == 1 else k_t.contiguous()
+    v_t = v_t if v_t.stride(-1) == 1 else v_t.contiguous()
+
+    partial_o = torch.empty(
+        (batch, num_splits, q_heads, head_dim),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    partial_lse = torch.empty(
+        (batch, num_splits, q_heads),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    o_t = torch.empty(
+        (batch, 1, q_heads, head_dim), dtype=q.dtype, device=q.device
+    )
+
+    key = (
+        q.dtype,
+        batch,
+        q_heads,
+        kv_heads,
+        kv_len,
+        num_splits,
+        blocks_per_split,
+        q_t.stride(),
+        k_t.stride(),
+        v_t.stride(),
+    )
+    compiled = _DECODE_COMPILE_CACHE.get(key)
+    if compiled is None:
+        decode = GqaDecodeSm90(
+            _TORCH_TO_CUTE_DTYPE[q.dtype],
+            batch,
+            q_heads,
+            kv_heads,
+            kv_len,
+            num_splits,
+            blocks_per_split,
+        )
+        compiled = cute.compile(
+            decode,
+            to_cute_tensor(q_t),
+            to_cute_tensor(k_t),
+            to_cute_tensor(v_t),
+            to_cute_tensor(partial_o),
+            to_cute_tensor(partial_lse),
+            to_cute_tensor(o_t),
+            sm_scale,
+            cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
+            options="--enable-tvm-ffi",
+        )
+        _DECODE_COMPILE_CACHE[key] = compiled
+
+    compiled(q_t, k_t, v_t, partial_o, partial_lse, o_t, sm_scale)
+    return o_t.transpose(1, 2)
+
+
 def prefill_attention(q, k, v, causal=True, sm_scale=None):
     """Prefill 入口；当前使用高吞吐 SM90 FlashAttention 内核。"""
     return _run_attention_sm90(q, k, v, causal=causal, sm_scale=sm_scale)
 
 
 def decode_attention(q, k, v, causal=False, sm_scale=None):
-    """Decode 入口；暂时复用 prefill 内核，后续在此替换专用实现。"""
-    return _run_attention_sm90(q, k, v, causal=causal, sm_scale=sm_scale)
+    """Decode 入口；所有支持的 non-causal q_len=1 shape 使用新 kernel。"""
+    if bool(causal):
+        return _run_attention_sm90(q, k, v, causal=True, sm_scale=sm_scale)
+    return _run_decode_sm90(q, k, v, sm_scale=sm_scale)
 
 
 def attention(q, k, v, causal=True, sm_scale=None):
