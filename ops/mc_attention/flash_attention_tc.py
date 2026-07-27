@@ -1,17 +1,3 @@
-"""Tensor-Core 版 FlashAttention：QK^T 与 P@V 都走 warp 级 bf16 MMA，多 warp/CTA。
-
-并行划分：
-  - 一个 CTA = NUM_WARPS 个 warp，沿 query 行方向切：warp w 负责第 w 组 BLOCK_M 行 query。
-    一个 CTA 共覆盖 CTA_M = NUM_WARPS * BLOCK_M 行 query 的一个 (batch,head) 切片。
-  - K/V 每个 key tile 只加载一份到 smem，被 CTA 内所有 warp 复用（沿 head_dim/BLOCK_N 协作载入）。
-  - 每个 warp 独立跑自己的 QK^T (TC) -> online-softmax -> P@V (TC)，
-    S/P/O/running-stat 按 warp 分区（smem 加一维 [NUM_WARPS, ...]）。
-  - grid = (ceil(q_len / CTA_M), BH)，block = NUM_WARPS * 32 线程。
-
-数学与标量 tiled 版一致，仅把两次 matmul 换成 tensor core，并提升占用率。
-张量约定：3D (BH, seq, head_dim)，输入 bf16，输出 fp32。head_dim 需为 MMA_K=16 的整数倍。
-"""
-
 import cutlass
 import cutlass.cute as cute
 from cutlass.utils import SmemAllocator

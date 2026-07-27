@@ -1,1 +1,1 @@
-from mc_attention.simple import attention
+from .simple import attention

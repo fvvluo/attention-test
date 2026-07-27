@@ -1,9 +1,3 @@
-# ljr 的 tensor-core 版 FlashAttention 接入
-#
-# 调用 mc_attention/flash_attention_tc.py（QK^T 与 P@V 都用 warp bf16 MMA、多 warp/CTA）。
-# 与 ljr_flash_attention.py 接入方式一致，只是底层 kernel 换成 tensor core 版。
-# kernel 原生吃 bf16、输出 fp32；本文件负责 4D->3D、GQA repeat、编译缓存。
-
 import importlib.util
 import math
 import os
