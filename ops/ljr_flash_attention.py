@@ -219,7 +219,7 @@ def _get_decode_cuda_ext():
         from torch.utils.cpp_extension import load
         src = os.path.join(os.path.dirname(__file__), "mc_attention", "flash_attention_decode.cu")
         _DECODE_CUDA_EXT = load(
-            name="flash_attention_decode",
+            name="ljr_flash_decode_cuda",
             sources=[src],
             verbose=False,
             extra_cuda_cflags=["-O3", "--use_fast_math",

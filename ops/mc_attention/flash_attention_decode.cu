@@ -71,7 +71,7 @@ __device__ __forceinline__ void ldmatrix_x2(uint32_t (&r)[2], const void* p) {
 
 // ============================ split kernel ============================
 // grid = (splits, kv_heads, batch)，block = 32（1 warp）。
-__global__ __launch_bounds__(kThreads, 16) void decode_split_kernel(
+__global__ __launch_bounds__(kThreads, 8) void decode_split_kernel(
     const __nv_bfloat16* __restrict__ q,   // (b, q_heads, 1, D)
     const __nv_bfloat16* __restrict__ k,   // (b, kv_heads, kv_len, D)
     const __nv_bfloat16* __restrict__ v,
