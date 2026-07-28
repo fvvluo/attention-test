@@ -20,14 +20,53 @@ from .base import register
 
 from cutlass import cute
 import math
+
+# ============================================================================
+# 目标形状最优配置:
+#   q :  (1, 64, 131072, 128)   -> batch=1, q_heads=64, seq_len=131072, head_dim=128
+#   k/v: (1,  8, 131072, 128)   -> batch=1, kv_heads=8, seq_len=131072, head_dim=128
+#
+# 路由: seq_len_q(131072) >= BLOCK_M -> prefill_kernel (计算受限, causal)
+#       seq_len_q==1(自回归生成)         -> decode_kernel  (KV 带宽受限, seq_len_kv=131072)
+#       group_size = q_heads/kv_heads = 64/8 = 8 (GQA, 每8个q head共享1个kv head)
+#       head_dim=128 == HEAD_DIM, 无需改动
+#
+# 性能要点:
+#   prefill: 1024 个 KV 块的内循环, 需足够深的流水线隐藏 TMA 延迟 -> STAGES=3
+#            (通过 O 复用 Q 的共享内存区释放 32KB, 使 STAGES=3 也能落进 228KB)
+#   decode : 单 query 对 131072 长度 KV 做 reduction, 属带宽/延迟受限,
+#            必须把 KV 切成足够多的分片并行 (原固定 4 分片严重欠并行) -> 自适应分片
+# ============================================================================
+
+# 一个 CTA 内 8 个 warp (2 个 warpgroup):
+#   MMA-M 方向 8*16 = 128 = BLOCK_M, 一次 MMA 即覆盖整块 M, 消除多趟 M 迭代,
+#   拉满 Tensor Core 利用率 (长序列 causal 场景为计算受限, 这是主要收益点)。
 WARPS_PER_CTA=8
+
+# 大 tile 保持 128x128: 长序列下算术强度高, 大 tile 最大化 MMA 效率;
+# 128 也与 HEAD_DIM / WARPS_PER_CTA*16 对齐, 无边角浪费。
 BLOCK_M=128
 BLOCK_N=128
 HEAD_DIM=128
 INV_SQRT_D=1.0/math.sqrt(float(HEAD_DIM))
-PIPELINE_STAGES=2
-DECODE_CTAS_PER_KV_DEFAULT = 4
+
+# 共享内存预算 (SM100, fp16, 单 CTA 上限约 228KB):
+#   单个 K/V tile = BLOCK_N*HEAD_DIM*2B = 32KB
+#   O 只在收尾写出, Q 在循环前就已读入寄存器 rQ, 二者生命周期不重叠,
+#   因此让 O 复用 Q 的共享内存区 (见 prefill_kernel), 省下 32KB:
+#     Q/O(32) + K(STAGES*32) + V(STAGES*32)
+#     STAGES=3 -> 32 + 96 + 96 = 224KB <= 228KB (放得下, 且流水线更深)。
+#   3 级流水 (2 个在途预取) 能更好地隐藏 1024 次 KV 加载的 TMA 延迟。
+PIPELINE_STAGES=3
+
+# decode 每个 KV 分片(CTA)的块大小; 128 块 = 一次 TMA 载入的 KV 行数。
 DECODE_BLOCK_KV=128
+# decode 的 KV 分割上限: 单条 query 面对 131072(=1024块) KV 时, 固定 4 分片会让
+# 每个 CTA 串行处理 256 块, 临界路径极长。提高到 64 分片 -> 每 CTA 仅 16 块,
+# 大幅缩短 decode 延迟; reduce 阶段只需合并 64 个部分结果, 开销可忽略。
+DECODE_MAX_SPLITS = 64
+# 兼容旧引用: 短 KV 时的最小分片数下限。
+DECODE_CTAS_PER_KV_DEFAULT = 4
 NEG_INF=-float('inf')
 ZERO=0.0
 
@@ -298,8 +337,9 @@ def prefill_kernel(Q_gmem,K_gmem,V_gmem,O_gmem,L_gmem,M_gmem,causal:bool=False,
     )
     smem_V = cute.make_tensor(smem_base+smem_V_offset,smem_V_2stage)
 
-    smem_O_offset=cute.round_up(smem_V_offset+cute.cosize(smem_V_2stage),128)
-    smem_O = cute.make_tensor(smem_base+smem_O_offset, sO_layout)
+    # O 复用 Q 的共享内存区: Q 在 KV 循环前已读入寄存器 rQ, 之后其 smem 不再被使用;
+    # O 只在收尾阶段写出。二者生命周期不重叠, 复用可省 32KB, 从而支持 STAGES=3。
+    smem_O = cute.make_tensor(smem_base, sO_layout)
 
     num_q_blocks = int(cute.size(Q_gmem, 0)) // BLOCK_M
     num_kv_blocks = int(cute.size(K_gmem, 0)) // BLOCK_N
@@ -325,6 +365,11 @@ def prefill_kernel(Q_gmem,K_gmem,V_gmem,O_gmem,L_gmem,M_gmem,causal:bool=False,
         reg_l=_make_row_fragment(tiled_mma, ZERO)
         reg_o=cute.make_fragment_like(tiled_mma.make_fragment_C(),
         dtype=cute.float32,init=ZERO)
+
+        # O 与 Q 复用同一 smem 区: 覆盖 Q 之前必须等待上一轮 O 的 TMA store 读完该区域,
+        # 否则新 Q 会覆盖尚未存完的 O (WAR 冒险)。首轮无在途 store, 该等待为空操作。
+        cute.tma_store_wait()
+        cute.synchronize()
 
         cute.copy(copy_g2s_Q, tgQ, smem_Q)
         cute.tma_store_fence()
@@ -842,9 +887,12 @@ def _run_single_head(Q_bh, K_bh, V_bh, O_bh,
                        O_bh, L_bh, M_bh,
                        causal=causal, sm_scale=sm_scale)
 
-    else:  # decode
+    else:  # decode: 单 query 对超长 KV 做 reduction, 带宽/延迟受限
         kv_blocks = (seq_len_kv + DECODE_BLOCK_KV - 1) // DECODE_BLOCK_KV
-        num_decode_ctas = min(kv_blocks, DECODE_CTAS_PER_KV_DEFAULT)
+        # 自适应 KV 分割: 尽量多分片以缩短每个 CTA 的临界路径, 上限 DECODE_MAX_SPLITS。
+        # 例: seq_len_kv=131072 -> kv_blocks=1024 -> 64 分片, 每 CTA 仅 16 块
+        #     (原来固定 4 分片时每 CTA 需串行 256 块, 延迟高 16 倍)。
+        num_decode_ctas = min(kv_blocks, DECODE_MAX_SPLITS)
 
         partial_O_gmem = _alloc_gmem(cute.Shape[num_decode_ctas, head_dim])
         partial_L_gmem = _alloc_gmem(cute.Shape[num_decode_ctas])
@@ -858,7 +906,7 @@ def _run_single_head(Q_bh, K_bh, V_bh, O_bh,
                              O_bh, L_bh, M_bh, num_decode_ctas)
 
 
-def attention(q, k, v, causal=True, sm_scale=None):
+def flash_attention(q, k, v, causal=True, sm_scale=None):
     # q: (batch, q_heads, seq_len, head_dim)
     # k, v: (batch, kv_heads, seq_len, head_dim)，q_heads 必须是 kv_heads 的整数倍
     # 输出 shape 与 q 相同: (batch, q_heads, seq_len, head_dim)
@@ -899,7 +947,30 @@ def attention(q, k, v, causal=True, sm_scale=None):
 
     return O_gmem
 
-        
+
+def run_target_shape(causal=True):
+    # 针对目标形状构造 q/k/v 并执行 FlashAttention:
+    #   q :  (1, 64, 131072, 128)
+    #   k/v: (1,  8, 131072, 128)   (kv_heads=8, GQA, group_size=8)
+    BATCH = 1
+    Q_HEADS = 64
+    KV_HEADS = 8
+    SEQ_LEN = 131072
+    HD = 128
+
+    # 半精度输入 (与内核 MMA 的 F16 A/B 操作数一致)
+    q = _alloc_gmem(cute.Shape[BATCH, Q_HEADS, SEQ_LEN, HD], dtype=cute.float16)
+    k = _alloc_gmem(cute.Shape[BATCH, KV_HEADS, SEQ_LEN, HD], dtype=cute.float16)
+    v = _alloc_gmem(cute.Shape[BATCH, KV_HEADS, SEQ_LEN, HD], dtype=cute.float16)
+
+    # sm_scale 默认 1/sqrt(head_dim); causal 默认 True (长序列因果注意力)
+    o = flash_attention(q, k, v, causal=causal)
+    return o
+
+
+if __name__ == '__main__':
+    run_target_shape(causal=True)
+
 
 
 
