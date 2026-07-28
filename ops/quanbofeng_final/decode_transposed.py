@@ -77,7 +77,8 @@ TILE_KV = 256      # 每次主循环处理的 kv 行数（大 tile 减少 softma
 STAGES = 1         # K 的 TMA 环形缓冲级数（大 tile 下单级即可，省 SMEM）
 DEF_VSTAGES = 1    # V 的环形缓冲级数
 THREADS = 256      # 128 生产者 + 128 消费者（各一个 warpgroup）
-DEF_SPLITS = 39    # 默认 split 数
+DEF_SPLITS = 9     # 默认 split 数（items=72≈78SM，每CTA独占近整个head，
+                   # partial往返极小+combine极轻+DRAM读局部性好 -> 3586 vs sp39 的 3452）
 
 
 def _acc_as_mn(acc):
