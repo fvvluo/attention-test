@@ -210,8 +210,8 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
             # mO: (num_splits, b, s_q, h, d) -> (s_q, d, h, b, num_splits)，
             #    split 维放末尾；mainloop 内按 split_idx 切片得 (s_q,d,h,b) 后再 pack_gqa。
             mO = layout_utils.select(mO, [2, 4, 3, 1, 0])
-            # mLSE: (num_splits, b, s_q, h) -> (h, s_q, b, num_splits)，
-            #    切片得 (h,s_q,b) 后再 pack_gqa（head_idx=1），与 base 一致。
+            # mLSE: (num_splits, b, h, s_q) -> (s_q, h, b, num_splits)，
+            #    切片得 (s_q,h,b)（head 在 index 1）后再 pack_gqa（head_idx=1），与 base 一致。
             mLSE = layout_utils.select(mLSE, [3, 2, 1, 0])
         else:
             mO = layout_utils.select(mO, [1, 3, 2, 0])  # (s_q,d,h,b)
@@ -224,7 +224,10 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
         self.num_threads_per_warp_group = 128
         self.num_mma_threads = tiled_mma_qk.size
         self.num_wg_mma = self.num_mma_threads // self.num_threads_per_warp_group
-        assert self.num_wg_mma == 2
+        # decode kernel 支持 1 或 2 个 MMA warpgroup：
+        #   tile_m=128 -> atom_layout (2,1,1) -> 2 wg（256 线程，与 prefill 一致）；
+        #   tile_m=64  -> atom_layout (1,1,1) -> 1 wg（128 线程，smem 减半以提 occupancy）。
+        assert self.num_wg_mma in (1, 2), "tile_m 必须是 64 或 128"
 
         # EXERCISE (3): no warp specialization.
         # The same threads that run the WGMMAs also issue the TMA loads, sharing a single program counter.
@@ -586,47 +589,48 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
                 n_block_min = split_idx * blocks_per_split
                 n_block_max = cutlass.min(n_block_min + blocks_per_split, n_block_total)
 
-            # Q 加载：pack_gqa 走 cp.async（所有 mma 线程参与），加载到 sQ 后同步。
-            # Q 极小（qhead_per_kvhead 行），直接同步加载即可，无需流水。
-            pack_gqa_q.load_Q(mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q)
-            cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
-            cute.arch.barrier()  # 确保 sQ 对所有消费 QK 的线程可见
+            # 空 split 防护：num_splits 不整除 n_block_total 时，尾部可能出现
+            # n_block_min >= n_block_max 的空 split。此时不遍历任何 KV，重置 softmax
+            # （row_sum=0 -> finalize 写 lse=-inf）并清零 acc_O，epilogue 写出 O=0/LSE=-inf，
+            # PyTorch 合并端用 nan_to_num 把 -inf 权重归零，保证正确。
+            has_work = n_block_max > n_block_min
+            if has_work:
+                # Q 加载：pack_gqa 走 cp.async（所有 mma 线程参与），加载到 sQ 后同步。
+                # Q 极小（qhead_per_kvhead 行），直接同步加载即可，无需流水。
+                pack_gqa_q.load_Q(mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q)
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(0)
+                cute.arch.barrier()  # 确保 sQ 对所有消费 QK 的线程可见
 
-            # EXERCISE (5) 已加回：intra-warpgroup GEMM overlap（软件流水）。
-            # 结构：每次迭代把「本块 QK 结果做 softmax + 转 P」与「上一块 PV 仍在飞行」重叠，
-            # 并在发射本块 PV（wg_wait=-1，不等）后立刻发射下一块 QK（wg_wait=-1），让
-            # 下一块 QK 与本块 PV 在 tensor core 上并发。等待点后移到真正消费数据之前：
-            #   - QK 结果在 softmax 前 wait；
-            #   - PV 结果（acc_O）在下一块 rescale_O / 最终 epilogue 前 wait。
-            kv_producer_state, kv_consumer_state = self.mainloop_overlap(
-                n_block_min,
-                n_block_max,
-                warp_idx,
-                load_K,
-                load_V,
-                pipeline_k,
-                pipeline_v,
-                kv_producer_state,
-                kv_consumer_state,
-                mma_qk_fn,
-                mma_pv_fn,
-                acc_O,
-                tOrP,
-                softmax,
-                mask_fn,
-            )
-
-            # Q 已同步消费完（sQ 不再复用），无需释放。
+                kv_producer_state, kv_consumer_state = self.mainloop_overlap(
+                    n_block_min,
+                    n_block_max,
+                    warp_idx,
+                    load_K,
+                    load_V,
+                    pipeline_k,
+                    pipeline_v,
+                    kv_producer_state,
+                    kv_consumer_state,
+                    mma_qk_fn,
+                    mma_pv_fn,
+                    acc_O,
+                    tOrP,
+                    softmax,
+                    mask_fn,
+                )
+            else:
+                softmax.reset()      # row_max=-inf, row_sum=0 -> finalize 得 lse=-inf
+                acc_O.fill(0.0)
 
             # Split-KV：切到本 split 的 partial-O / partial-LSE 分片后再 pack_gqa。
             #   mO: (s_q,d,h,b,num_splits) -> 切片 (s_q,d,h,b) -> pack ((qpkv,s),d,h_k,b)
-            #   mLSE: (h,s_q,b,num_splits) -> 切片 (h,s_q,b) -> pack ((qpkv,s),h_k,b)
+            #   mLSE: (s_q,h,b,num_splits) -> 切片 (s_q,h,b) -> pack ((qpkv,s),h_k,b)
             # 非-split：入口已 pack_gqa，直接用。
             if const_expr(is_split_kv):
-                # 切片前的 h 维是 q_heads；pack 后头数为 nheads_kv = q_heads // qhead_per_kvhead。
+                # mO 的 h 在 index 2；mLSE 的 h 在 index 1。pack 后头数=q_heads//qhead_per_kvhead。
                 nheads_kv_o = mO.shape[2] // self.qhead_per_kvhead
-                nheads_kv_lse = mLSE.shape[0] // self.qhead_per_kvhead
+                nheads_kv_lse = mLSE.shape[1] // self.qhead_per_kvhead
                 mO_epi = pack_gqa_layout(
                     mO[None, None, None, None, split_idx],
                     self.qhead_per_kvhead, nheads_kv_o, head_idx=2,
