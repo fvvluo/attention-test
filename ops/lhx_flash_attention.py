@@ -1248,6 +1248,10 @@ class GqaDecodeSm90:
         # KV tile. split_count is CTA-uniform and differs by at most one.
         for tile_idx in cutlass.range(split_count, unroll=1):
             n_block = first_n_block + tile_idx
+            # tile_idx and split_count are both CTA-uniform, so has_next is a
+            # CTA-uniform runtime bool and the barrier/wait_group calls guarded
+            # by it below execute consistently across every warp.
+            has_next = tile_idx + 1 < split_count
 
             # V[i] moves through the memory pipeline while QK and softmax use K[i].
             if const_expr(self.has_tail):
@@ -1306,28 +1310,13 @@ class GqaDecodeSm90:
                             if token_in_tile >= tail_tokens:
                                 acc_S_mn[row, col] = -Float32.inf
 
-            # The reset state (-inf, 0) makes the general update valid for tile 0,
-            # avoiding a separately unrolled first-iteration body.
-            row_scale = softmax.online_softmax(
-                acc_S,
-                is_first=False,
-                check_inf=self.has_tail,
-            )
-            acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
-            for row in cutlass.range_constexpr(cute.size(row_scale)):
-                acc_O_mn[row, None].store(
-                    acc_O_mn[row, None].load() * row_scale[row]
-                )
-            rP = cute.make_fragment_like(acc_S, self.dtype)
-            rP.store(acc_S.load().to(self.dtype))
-            tOrP = layout_utils.reshape_acc_to_frgA(rP)
+            # K[i+1] reuses the same sK buffer as K[i]. All four warps read
+            # disjoint 16-token slices of sK during the QK loop above, so this
+            # CTA barrier (not a warp-local sync) must fire before any warp is
+            # allowed to start overwriting sK with K[i+1].
+            if has_next:
+                cute.arch.barrier()
 
-            # V[i] must be visible before PV consumes it.
-            cute.arch.cp_async_wait_group(0)
-            cute.arch.barrier()
-
-            # K[i+1] loads into the independent K buffer while PV consumes V[i].
-            if tile_idx + 1 < split_count:
                 next_n_block = n_block + 1
                 if const_expr(self.has_tail):
                     if next_n_block == self.num_blocks - 1:
@@ -1355,6 +1344,33 @@ class GqaDecodeSm90:
                     )
                 cute.arch.cp_async_commit_group()
 
+            # The reset state (-inf, 0) makes the general update valid for tile 0,
+            # avoiding a separately unrolled first-iteration body.
+            row_scale = softmax.online_softmax(
+                acc_S,
+                is_first=False,
+                check_inf=self.has_tail,
+            )
+            acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
+            for row in cutlass.range_constexpr(cute.size(row_scale)):
+                acc_O_mn[row, None].store(
+                    acc_O_mn[row, None].load() * row_scale[row]
+                )
+            rP = cute.make_fragment_like(acc_S, self.dtype)
+            rP.store(acc_S.load().to(self.dtype))
+            tOrP = layout_utils.reshape_acc_to_frgA(rP)
+
+            # Wait only for the older V[i] group; when K[i+1] was just issued it
+            # is the newer group and is allowed to remain outstanding here.
+            # With no K[i+1] outstanding there is only one group in flight, so
+            # wait_group(1) would not guarantee V[i] is done and wait_group(0)
+            # must be used instead.
+            if has_next:
+                cute.arch.cp_async_wait_group(1)
+            else:
+                cute.arch.cp_async_wait_group(0)
+            cute.arch.barrier()
+
             for k_tile in cutlass.range_constexpr(cute.size(tOrP.shape[2])):
                 cute.copy(
                     smem_copy_v,
@@ -1369,10 +1385,10 @@ class GqaDecodeSm90:
                     acc_O,
                 )
 
-            if tile_idx + 1 < split_count:
+            # K[i+1] must be complete and visible to every warp before the next
+            # iteration's QK step is allowed to read sK.
+            if has_next:
                 cute.arch.cp_async_wait_group(0)
-                # Also prevents an early warp from overwriting V while a late warp
-                # is still finishing the current PV operation.
                 cute.arch.barrier()
 
         # All warps have finished the final PV before K/V storage is repurposed.
