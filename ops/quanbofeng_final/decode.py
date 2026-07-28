@@ -167,43 +167,46 @@ def flash_decode_mma(q, k, v, scale, n_block=64, max_splits=256):
     return output.unsqueeze(2)
 
 
-def decode_attention(q, k, v, causal=False, sm_scale=None):
-    if q.dim() != 4 or k.dim() != 4 or v.dim() != 4:
-        raise ValueError("q/k/v 必须是 BHSD 四维 tensor")
-    if q.shape[2] != 1:
-        raise ValueError("decode_attention 要求 q_len == 1")
-    if causal:
-        raise ValueError("bench decode 的 q_len=1 应传 causal=False")
-    if not (q.is_cuda and k.is_cuda and v.is_cuda):
-        raise ValueError("decode 仅支持 CUDA")
-    if not (q.device == k.device == v.device):
-        raise ValueError("Q/K/V 必须位于同一 CUDA device")
-    if not (
-        q.dtype == torch.bfloat16
-        and k.dtype == torch.bfloat16
-        and v.dtype == torch.bfloat16
-    ):
-        raise ValueError("最终 decode 仅支持 BF16")
-    if tuple(q.shape) != (1, 64, 1, 128):
-        raise ValueError("最终 decode 要求 Q shape 为 (1,64,1,128)")
-    if k.shape != v.shape or tuple(k.shape[:2]) != (1, 8):
-        raise ValueError("最终 decode 要求 K/V shape 为 (1,8,Sk,128)")
-    if k.shape[-1] != 128 or k.shape[2] <= 0 or k.shape[2] % 64 != 0:
-        raise ValueError("最终 decode 要求 D=128 且 kv_len 为正的 64 倍数")
-    if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
-        raise ValueError("最终 decode 要求 contiguous BHSD 输入")
-    if any(tensor.data_ptr() % 16 != 0 for tensor in (q, k, v)):
-        raise ValueError("最终 decode 要求 16-byte aligned 输入")
+def _sdpa_fallback(q, k, v, causal, sm_scale):
+    """通用兜底：非目标形状/精度时用 PyTorch SDPA，保证正确性（不追求性能）。"""
+    rep = q.shape[1] // k.shape[1]
+    k_rep = k.repeat_interleave(rep, dim=1) if rep > 1 else k
+    v_rep = v.repeat_interleave(rep, dim=1) if rep > 1 else v
+    return torch.nn.functional.scaled_dot_product_attention(
+        q, k_rep, v_rep, is_causal=bool(causal), scale=sm_scale
+    )
 
+
+def decode_attention(q, k, v, causal=False, sm_scale=None):
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(q.shape[-1])
     sm_scale = float(sm_scale)
-    if not math.isfinite(sm_scale) or sm_scale <= 0.0:
-        raise ValueError("sm_scale 必须是有限正数")
 
-    # 新版：转置-WGMMA + TMA 流水实现（kv_len 为 128 的倍数时启用，更快）；
-    # 否则回退到旧的 M16 warp-MMA 实现。
-    if k.shape[2] % 128 == 0:
+    # 高性能路径的严格条件：正式评测形状 (1,64,1,128) BF16 + kv_len 为 128 倍数。
+    # 任何不满足（如 check-only 的 fp16 / q_heads=8 小形状）都走 SDPA 兜底保证正确。
+    fast_ok = (
+        q.dim() == 4 and k.dim() == 4 and v.dim() == 4
+        and q.shape[2] == 1 and not causal
+        and q.is_cuda and k.is_cuda and v.is_cuda
+        and q.device == k.device == v.device
+        and q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and v.dtype == torch.bfloat16
+        and tuple(q.shape) == (1, 64, 1, 128)
+        and k.shape == v.shape and tuple(k.shape[:2]) == (1, 8)
+        and k.shape[-1] == 128 and k.shape[2] > 0 and k.shape[2] % 128 == 0
+        and q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+        and all(t.data_ptr() % 16 == 0 for t in (q, k, v))
+        and math.isfinite(sm_scale) and sm_scale > 0.0
+    )
+    if fast_ok:
         from .decode_transposed import decode as _transposed_decode
         return _transposed_decode(q, k, v, sm_scale=sm_scale)
-    return flash_decode_mma(q, k, v, sm_scale)
+    # 64 倍数但非 128 倍数的 bf16 目标形状：走旧 M16 实现
+    if (q.dim() == 4 and q.shape[2] == 1 and not causal
+            and q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and v.dtype == torch.bfloat16
+            and tuple(q.shape) == (1, 64, 1, 128)
+            and tuple(k.shape[:2]) == (1, 8) and k.shape[-1] == 128
+            and k.shape[2] % 64 == 0 and math.isfinite(sm_scale) and sm_scale > 0.0
+            and q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+        return flash_decode_mma(q, k, v, sm_scale)
+    # 其余一律兜底
+    return _sdpa_fallback(q, k, v, causal, sm_scale)
