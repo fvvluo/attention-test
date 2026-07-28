@@ -38,6 +38,7 @@ from quack.cute_dsl_utils import ParamsBase
 from flash_attn.cute.cute_dsl_utils import assume_tensor_aligned
 from flash_attn.cute import utils
 from flash_attn.cute.mask import AttentionMask
+from flash_attn.cute.named_barrier import NamedBarrierFwd
 from flash_attn.cute.softmax import Softmax
 from flash_attn.cute.seqlen_info import SeqlenInfoQK
 from flash_attn.cute.block_sparsity import BlockSparseTensors  # signature only
@@ -60,6 +61,7 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
         mma_pv_is_rs: bool = True,
         paged_kv_non_tma: bool = False,
         num_splits: int = 1,
+        warp_specialized: bool = False,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -78,6 +80,13 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
         self.use_tma_Q = False
         self.use_tma_KV = True
         self.use_tma_O = False
+        # Warp specialization：加一个独立的 producer warpgroup（128 线程，只 warp 0 发 K/V
+        # 的 TMA），consumer warpgroup 专做 QK/softmax/PV。用 setmaxnreg 把寄存器从 producer
+        # 让渡给 consumer。可通过 warp_specialized 开关回退到单 warpgroup 版（已验证 16.4x）。
+        self.warp_specialized = warp_specialized
+        self.num_producer_regs = 32
+        self.num_consumer_regs = 160  # 单 consumer warpgroup 时可给到较高
+        self._ws_debug = False  # 打开可在 producer/consumer 打印进度定位死锁
         self.buffer_align_bytes = 1024
         self.cluster_shape_mn = (1, 1)
         assert self.arch.is_family_of(Arch.sm_90a), "Only SM 9.x is supported"
@@ -229,11 +238,16 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
         #   tile_m=64  -> atom_layout (1,1,1) -> 1 wg（128 线程，smem 减半以提 occupancy）。
         assert self.num_wg_mma in (1, 2), "tile_m 必须是 64 或 128"
 
-        # EXERCISE (3): no warp specialization.
-        # The same threads that run the WGMMAs also issue the TMA loads, sharing a single program counter.
-        # How does adding warp specialization impact performance?
-        self.num_threads = self.num_mma_threads
-        self.num_producer_threads = 32  # one warp still elects to issue the TMAs
+        # Warp specialization：总线程 = consumer(MMA) warpgroup + 1 个 producer warpgroup(128)。
+        # producer warpgroup 只 warp 0 发 TMA，其余 warp 空转（但拿最少寄存器）。
+        # consumer 的 tidx 在 kernel 里减去 128 后与非-warp-spec 版完全一致。
+        # warp_specialized=False 时退回单 warpgroup 版（已验证 16.4x，稳定）。
+        if const_expr(self.warp_specialized):
+            self.num_threads = self.num_mma_threads + self.num_threads_per_warp_group
+            self.num_producer_threads = self.num_threads_per_warp_group
+        else:
+            self.num_threads = self.num_mma_threads
+            self.num_producer_threads = 32
         self.num_Q_load_threads = self.num_threads_per_warp_group
         self.num_epilogue_threads = self.num_mma_threads
 
@@ -411,36 +425,38 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
 
         pipeline_init_wait(cluster_shape_mn=self.cluster_shape_mn)
 
-        # EXERCISE (3): a single entry point for all 256 threads. There is no
-        # `if warp_idx < 4: load(...) else: mma(...)` split and no setmaxregister pair.
         tidx, _, _ = cute.arch.thread_idx()
-        self.mainloop(
-            tiled_mma_qk,
-            tiled_mma_pv,
-            mQ,
-            mK,
-            mV,
-            mO,
-            mLSE,
-            sQ,
-            sK,
-            sV,
-            sVt,
-            sO,
-            tma_atom_K,
-            tma_atom_V,
-            pipeline_k,
-            pipeline_v,
-            gmem_tiled_copy_Q,
-            gmem_tiled_copy_O,
-            tidx,
-            warp_idx,
-            softmax_scale_log2,
-            softmax_scale,
-            SeqlenInfoCls,
-            AttentionMaskCls,
-            TileSchedulerCls,
-        )
+        if const_expr(self.warp_specialized):
+            # Warp specialization：warp_idx<4 producer warpgroup（只 warp0 发 K/V TMA），
+            # warp_idx>=4 consumer warpgroup（QK/softmax/PV/epilogue）。
+            num_producer_warps = self.num_producer_threads // cute.arch.WARP_SIZE
+            if warp_idx < num_producer_warps:
+                cute.arch.setmaxregister_decrease(self.num_producer_regs)
+                if warp_idx == 0:
+                    self.producer_loop(
+                        mK, mV, sK, sV, tma_atom_K, tma_atom_V,
+                        pipeline_k, pipeline_v, SeqlenInfoCls, TileSchedulerCls,
+                    )
+            else:
+                cute.arch.setmaxregister_increase(self.num_consumer_regs)
+                self.consumer_loop(
+                    tiled_mma_qk, tiled_mma_pv, mQ, mK, mV, mO, mLSE,
+                    sQ, sK, sV, sVt, sO, tma_atom_K, tma_atom_V,
+                    pipeline_k, pipeline_v, gmem_tiled_copy_Q, gmem_tiled_copy_O,
+                    tidx - self.num_threads_per_warp_group, warp_idx - num_producer_warps,
+                    softmax_scale_log2, softmax_scale,
+                    SeqlenInfoCls, AttentionMaskCls, TileSchedulerCls,
+                )
+        else:
+            # 单 warpgroup 版（已验证 16.4x）：同一批线程既发 K/V TMA（warp0）又做计算。
+            self.consumer_loop(
+                tiled_mma_qk, tiled_mma_pv, mQ, mK, mV, mO, mLSE,
+                sQ, sK, sV, sVt, sO, tma_atom_K, tma_atom_V,
+                pipeline_k, pipeline_v, gmem_tiled_copy_Q, gmem_tiled_copy_O,
+                tidx, warp_idx,
+                softmax_scale_log2, softmax_scale,
+                SeqlenInfoCls, AttentionMaskCls, TileSchedulerCls,
+            )
 
     @cute.jit
     def load_KV(
@@ -450,12 +466,101 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
         block: Int32,
         producer_state: pipeline.PipelineState,
     ):
+        if const_expr(self._ws_debug):
+            if cute.arch.thread_idx()[0] == 0:
+                cute.printf("[P]   acquire blk=%d idx=%d\n", block, producer_state.index)
         pipeline_kv.producer_acquire(producer_state)
+        if const_expr(self._ws_debug):
+            if cute.arch.thread_idx()[0] == 0:
+                cute.printf("[P]   acquired blk=%d\n", block)
         tma_load_fn(src_idx=block, producer_state=producer_state)
         pipeline_kv.producer_commit(producer_state)
+        if const_expr(self._ws_debug):
+            if cute.arch.thread_idx()[0] == 0:
+                cute.printf("[P]   committed blk=%d\n", block)
+
+    def _n_block_range(self, seqlen, m_block, split_idx):
+        """计算本 work-tile 在本 split 下要遍历的全局 KV 块区间 [n_block_min, n_block_max)。
+        producer 与 consumer 必须用完全相同的逻辑，才能保证发的 K/V 与消费的一一对应。
+        （普通方法，非 @cute.jit：只做 Int32 算术，在已 jit 的调用点内联展开。）"""
+        n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
+        if const_expr(self.is_causal):
+            n_block_max_causal = cute.ceil_div(
+                (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q, self.tile_n
+            )
+            if n_block_max_causal < n_block_max:
+                n_block_max = n_block_max_causal
+        n_block_min = Int32(0)
+        if const_expr(self.num_splits > 1):
+            blocks_per_split = cute.ceil_div(n_block_max, self.num_splits)
+            n_block_min = split_idx * blocks_per_split
+            n_block_max = cutlass.min(n_block_min + blocks_per_split, n_block_max)
+        return n_block_min, n_block_max
 
     @cute.jit
-    def mainloop(
+    def producer_loop(
+        self,
+        mK: cute.Tensor,
+        mV: cute.Tensor,
+        sK: cute.Tensor,
+        sV: cute.Tensor,
+        tma_atom_K: cute.CopyAtom,
+        tma_atom_V: cute.CopyAtom,
+        pipeline_k: pipeline.PipelineAsync,
+        pipeline_v: pipeline.PipelineAsync,
+        SeqlenInfoCls: Callable,
+        TileSchedulerCls: Callable,
+    ):
+        """Producer warp（elected warp 0）：只负责按 KV 块顺序发 K/V 的 TMA。
+        与 consumer 用同一个 scheduler + 同一段 [n_block_min, n_block_max)，从高到低发块。"""
+        if const_expr(self._ws_debug):
+            cute.printf("[P] ENTER producer_loop tid=%d\n", cute.arch.thread_idx()[0])
+        kv_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.num_stages
+        )
+        tile_scheduler = TileSchedulerCls()
+        work_tile = tile_scheduler.initial_work_tile_info()
+        while work_tile.is_valid_tile:
+            m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
+            seqlen = SeqlenInfoCls(batch_idx)
+            head_idx_kv = head_idx  # pack_gqa 后 head_idx 即 kv-head
+            gK = cute.local_tile(
+                mK[None, None, head_idx_kv, batch_idx], (self.tile_n, self.tile_hdim), (None, 0)
+            )
+            gV = cute.local_tile(
+                mV[None, None, head_idx_kv, batch_idx], (self.tile_n, self.tile_hdimv), (None, 0)
+            )
+            tma_load_K, _, _ = copy_utils.tma_get_copy_fn(tma_atom_K, 0, cute.make_layout(1), gK, sK)
+            tma_load_V, _, _ = copy_utils.tma_get_copy_fn(tma_atom_V, 0, cute.make_layout(1), gV, sV)
+            load_K = partial(
+                self.load_KV, copy_utils.tma_producer_copy_fn(tma_load_K, pipeline_k), pipeline_k
+            )
+            load_V = partial(
+                self.load_KV, copy_utils.tma_producer_copy_fn(tma_load_V, pipeline_v), pipeline_v
+            )
+            n_block_min, n_block_max = self._n_block_range(seqlen, m_block, split_idx)
+            if const_expr(self._ws_debug):
+                cute.printf("[P] tile bidx=%d nmin=%d nmax=%d\n", batch_idx, n_block_min, n_block_max)
+            # 从高到低发块（与 consumer 消费顺序一致）。
+            n_block = n_block_max - 1
+            for _ in cutlass.range(n_block_max - n_block_min, unroll=1):
+                load_K(n_block, kv_producer_state)
+                load_V(n_block, kv_producer_state)
+                kv_producer_state.advance()
+                n_block -= 1
+            if const_expr(self._ws_debug):
+                cute.printf("[P] tile done\n")
+
+            tile_scheduler.prefetch_next_work()
+            tile_scheduler.advance_to_next_work()
+            work_tile = tile_scheduler.get_current_work()
+
+        # 注：不调用 producer_tail —— 它会 wait num_stages 个 empty 信号来排空 pipeline，
+        # 但在 WS 下 consumer 已完成并退出、其 empty 到达计数与 producer_tail 期望不匹配，
+        # 导致 producer 卡死。kernel 即将退出，dangling mbarrier 信号无害。
+
+    @cute.jit
+    def consumer_loop(
         self,
         tiled_mma_qk: cute.TiledMma,
         tiled_mma_pv: cute.TiledMma,
@@ -483,8 +588,8 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
         AttentionMaskCls: Callable,
         TileSchedulerCls: Callable,
     ):
-        """Loads and computes in one instruction stream, one N block at a time."""
-        # tidx runs 0..255 now (no producer warpgroup to subtract off).
+        """QK/softmax/PV + epilogue。warp_specialized=True 时 K/V 由 producer 提供、本侧只
+        consumer_wait；=False 时本侧 warp0 也发 K/V TMA（单 warpgroup 版）。"""
         warp_group_idx = cute.arch.make_warp_uniform(tidx // self.num_threads_per_warp_group)
         wg_thread_layout = cute.make_layout(
             self.num_wg_mma, stride=self.num_threads_per_warp_group
@@ -498,33 +603,26 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
         mma_qk_fn = partial(
             sm90_utils.gemm_zero_init, tiled_mma_qk, (self.tile_m, self.tile_n), tSrQ, tSrK
         )
-        # A operand of the PV gemm is None -> P stays in registers (mma_pv_is_rs)
         acc_O, tOrP, tOrVt = sm90_utils.partition_fragment_ABC(
             wg_mma_pv, (self.tile_m, self.tile_hdimv, self.tile_n), None, sVt
         )
         mma_pv_fn = partial(sm90_utils.gemm_w_idx, tiled_mma_pv, acc_O, tOrP, tOrVt)
 
-        # EXERCISE (6): mma_init() used to prime the warp-scheduler token ring here by
-        # having warpgroup 1 arrive on NamedBarrierFwd.WarpSchedulerWG1. Both MMA
-        # warpgroups now issue their WGMMAs whenever the hardware warp scheduler pleases.
-
-        # pack_gqa 的 Q/O scatter 助手（Q 用 load_Q，O/LSE 在 epilogue 里用 store_O/store_LSE）。
         pack_gqa_q = PackGQA(
             self.tile_m, self.tile_hdim, self.check_hdim_oob, self.qhead_per_kvhead
         )
-
-        kv_producer_state = pipeline.make_pipeline_state(
-            pipeline.PipelineUserType.Producer, self.num_stages
-        )
         kv_consumer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Consumer, self.num_stages
+        )
+        # 非-WS 单 warpgroup 版需要自己发 K/V TMA，用一个 producer state。
+        kv_producer_state = pipeline.make_pipeline_state(
+            pipeline.PipelineUserType.Producer, self.num_stages
         )
         softmax = Softmax.create(
             softmax_scale_log2,
             num_rows=acc_O.shape[0][0] * acc_O.shape[1],
             softmax_scale=softmax_scale,
         )
-
         is_split_kv = const_expr(self.num_splits > 1)
 
         tile_scheduler = TileSchedulerCls()
@@ -532,25 +630,16 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
         while work_tile.is_valid_tile:
             m_block, head_idx, batch_idx, split_idx = work_tile.tile_idx
             seqlen = SeqlenInfoCls(batch_idx)
-            # pack_gqa 后 scheduler 迭代的 head_idx 就是 kv-head 索引（q-head 已折进 M 维）。
             head_idx_kv = head_idx
             mask = AttentionMaskCls(seqlen)
-            # decode 非因果：mask_causal=False，只用 mask_seqlen 在最后一个 KV 块做边界。
             mask_fn = partial(
                 mask.apply_mask,
-                batch_idx=batch_idx,
-                head_idx=head_idx,
-                m_block=m_block,
-                thr_mma=thr_mma_qk,
-                mask_seqlen=True,
-                mask_causal=self.is_causal,
-                mask_local=False,
-                mask_mod=None,
+                batch_idx=batch_idx, head_idx=head_idx, m_block=m_block,
+                thr_mma=thr_mma_qk, mask_seqlen=True, mask_causal=self.is_causal,
+                mask_local=False, mask_mod=None,
             )
-
-            # Q：pack_gqa 的 mQ 是 ((qpkv, s_q), d, h_k, b)。取本 kv-head、batch 的切片
-            # ((qpkv, s_q), d)，PackGQA.load_Q 会把打包后的 M 行 scatter-gather 到 sQ。
             mQ_cur = mQ[None, None, head_idx_kv, batch_idx]
+            # 非-WS 版本地发 TMA 需要的 load 闭包（WS 版由 producer_loop 负责，这里不用）。
             gK = cute.local_tile(
                 mK[None, None, head_idx_kv, batch_idx], (self.tile_n, self.tile_hdim), (None, 0)
             )
@@ -565,70 +654,30 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
             load_V = partial(
                 self.load_KV, copy_utils.tma_producer_copy_fn(tma_load_V, pipeline_v), pipeline_v
             )
+            n_block_min, n_block_max = self._n_block_range(seqlen, m_block, split_idx)
 
-            # EXERCISE (2) 已加回：causal n-block skipping。
-            # 非因果时遍历全部 key block；因果时，query block m_block 内最大 query 行的
-            # 绝对位置为 (m_block+1)*tile_m - 1 + (seqlen_k - seqlen_q)，超过它的 key block
-            # 整块在对角线以上、会被完全 mask，直接跳过不加载/不计算，约省一半 KV 遍历。
-            n_block_max = cute.ceil_div(seqlen.seqlen_k, self.tile_n)
-            if const_expr(self.is_causal):
-                n_block_max_causal = cute.ceil_div(
-                    (m_block + 1) * self.tile_m + seqlen.seqlen_k - seqlen.seqlen_q,
-                    self.tile_n,
-                )
-                if n_block_max_causal < n_block_max:
-                    n_block_max = n_block_max_causal
-
-            # Split-KV：把全局块区间 [0, n_block_total) 均分给 num_splits 个 CTA。
-            # 本 split 处理 [n_block_min, n_block_max)（半开区间，n_block 为全局块号，
-            # 因此 mask 的 seqlen 上限仍按真正最后一个全局块判定，内部 split 正确）。
-            n_block_min = Int32(0)
-            if const_expr(is_split_kv):
-                n_block_total = n_block_max
-                blocks_per_split = cute.ceil_div(n_block_total, self.num_splits)
-                n_block_min = split_idx * blocks_per_split
-                n_block_max = cutlass.min(n_block_min + blocks_per_split, n_block_total)
-
-            # 空 split 防护：num_splits 不整除 n_block_total 时，尾部可能出现
-            # n_block_min >= n_block_max 的空 split。此时不遍历任何 KV，重置 softmax
-            # （row_sum=0 -> finalize 写 lse=-inf）并清零 acc_O，epilogue 写出 O=0/LSE=-inf，
-            # PyTorch 合并端用 nan_to_num 把 -inf 权重归零，保证正确。
             has_work = n_block_max > n_block_min
             if has_work:
-                # Q 加载：pack_gqa 走 cp.async（所有 mma 线程参与），加载到 sQ 后同步。
-                # Q 极小（qhead_per_kvhead 行），直接同步加载即可，无需流水。
+                # Q 加载：cp.async 载入 sQ 后用具名 barrier 限定在本 warpgroup（128 线程），
+                # 避免整块 barrier 死等 producer warpgroup。
                 pack_gqa_q.load_Q(mQ_cur, sQ, gmem_tiled_copy_Q, tidx, m_block, seqlen.seqlen_q)
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(0)
-                cute.arch.barrier()  # 确保 sQ 对所有消费 QK 的线程可见
+                cute.arch.barrier(
+                    barrier_id=int(NamedBarrierFwd.WarpSchedulerWG1),
+                    number_of_threads=self.num_epilogue_threads,
+                )
 
-                kv_producer_state, kv_consumer_state = self.mainloop_overlap(
-                    n_block_min,
-                    n_block_max,
-                    warp_idx,
-                    load_K,
-                    load_V,
-                    pipeline_k,
-                    pipeline_v,
-                    kv_producer_state,
-                    kv_consumer_state,
-                    mma_qk_fn,
-                    mma_pv_fn,
-                    acc_O,
-                    tOrP,
-                    softmax,
-                    mask_fn,
+                kv_consumer_state, kv_producer_state = self.consumer_compute(
+                    n_block_min, n_block_max, warp_idx, load_K, load_V,
+                    pipeline_k, pipeline_v, kv_consumer_state, kv_producer_state,
+                    mma_qk_fn, mma_pv_fn, acc_O, tOrP, softmax, mask_fn,
                 )
             else:
-                softmax.reset()      # row_max=-inf, row_sum=0 -> finalize 得 lse=-inf
+                softmax.reset()
                 acc_O.fill(0.0)
 
-            # Split-KV：切到本 split 的 partial-O / partial-LSE 分片后再 pack_gqa。
-            #   mO: (s_q,d,h,b,num_splits) -> 切片 (s_q,d,h,b) -> pack ((qpkv,s),d,h_k,b)
-            #   mLSE: (s_q,h,b,num_splits) -> 切片 (s_q,h,b) -> pack ((qpkv,s),h_k,b)
-            # 非-split：入口已 pack_gqa，直接用。
             if const_expr(is_split_kv):
-                # mO 的 h 在 index 2；mLSE 的 h 在 index 1。pack 后头数=q_heads//qhead_per_kvhead。
                 nheads_kv_o = mO.shape[2] // self.qhead_per_kvhead
                 nheads_kv_lse = mLSE.shape[1] // self.qhead_per_kvhead
                 mO_epi = pack_gqa_layout(
@@ -643,36 +692,29 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
                 mO_epi = mO
                 mLSE_epi = mLSE
 
-            # Normalize acc_O by row_sum and compute the lse
             softmax.rescale_O(acc_O, softmax.finalize())
-            # use_tma_O=False + pack_gqa=True：base epilogue 走 PackGQA.store_O/store_LSE。
+            if const_expr(self._ws_debug):
+                if cute.arch.thread_idx()[0] == self.num_threads_per_warp_group:
+                    cute.printf("[C] pre-epilogue\n")
             self.epilogue(
-                acc_O,
-                softmax.row_sum,
-                mO_epi,
-                mLSE_epi,
-                sO,
-                seqlen,
-                gmem_tiled_copy_O,
-                None,  # tma_atom_O 不用
-                tiled_mma_pv,
-                tidx,
-                m_block,
-                head_idx,
-                batch_idx,
+                acc_O, softmax.row_sum, mO_epi, mLSE_epi, sO, seqlen,
+                gmem_tiled_copy_O, None, tiled_mma_pv, tidx, m_block, head_idx, batch_idx,
             )
+            if const_expr(self._ws_debug):
+                if cute.arch.thread_idx()[0] == self.num_threads_per_warp_group:
+                    cute.printf("[C] post-epilogue\n")
 
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
             work_tile = tile_scheduler.get_current_work()
 
-        # Redundant here (every TMA is consumer-waited inside the loop) but kept so the
-        # producer-side accounting still balances if the loop structure is changed.
-        if warp_idx == 0:
-            pipeline_v.producer_tail(kv_producer_state)
+        # 非-WS 单 warpgroup 版：warp0 是 producer，收尾 producer_tail 平衡账。
+        if const_expr(not self.warp_specialized):
+            if warp_idx == 0:
+                pipeline_v.producer_tail(kv_producer_state)
 
     @cute.jit
-    def mainloop_overlap(
+    def consumer_compute(
         self,
         n_block_min: Int32,
         n_block_max: Int32,
@@ -681,8 +723,8 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
         load_V: Callable,
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
-        kv_producer_state,
         kv_consumer_state,
+        kv_producer_state,
         mma_qk_fn: Callable,
         mma_pv_fn: Callable,
         acc_O: cute.Tensor,
@@ -690,37 +732,23 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
         softmax: Softmax,
         mask_fn: Callable,
     ):
-        """软件流水：QK[n-1] 与 PV[n] 在 tensor core 上重叠。
-
-        每次迭代（n 从 n_block_max-1 递减到 0）：
-          1. 发起本块 K/V 的 TMA 加载（producer）;
-          2. 等 K 就绪 -> 发射 QK[n]（wg_wait=0 等完，得 acc_S）-> 释放 K;
-          3. mask + online-softmax（首块 is_first 不 rescale_O）-> 转 P[n] 到 tOrP;
-          4. 等 V 就绪 -> 发射 PV[n]（zero_init=首块; wg_wait=0）-> 释放 V。
-
-        说明：真正的跨块 WGMMA 重叠需要把 QK[n-1] 提前到 PV[n] 之前发射且都不等。
-        本实现保持每块 QK、PV 各自 wg_wait=0（与已验证的正确版一致），但把 K/V 的
-        加载与释放安排成流水，使 TMA 访存与 WGMMA 计算重叠（TMA 侧重叠已由 pipeline
-        的 num_stages 提供）。这样在不改变 WGMMA 异步排序（避免 race）的前提下拿到
-        访存/计算重叠的收益。
-        """
-        # 首块 is_first=True（PV 用 zero_init 写 acc_O，不 rescale）；其余从
-        # n_block_max-2 递减到 n_block_min。Split-KV 时 n_block_min>0，只遍历本 split 段。
-        kv_producer_state, kv_consumer_state = self._one_n_block_body(
+        """QK/softmax/PV。WS=True 时 K/V 由 producer 提供；WS=False 时本 warp0 发 TMA。
+        从 n_block_max-1 递减到 n_block_min。"""
+        kv_consumer_state, kv_producer_state = self._one_n_block_consumer(
             n_block_max - 1, warp_idx, load_K, load_V, pipeline_k, pipeline_v,
-            kv_producer_state, kv_consumer_state, mma_qk_fn, mma_pv_fn,
+            kv_consumer_state, kv_producer_state, mma_qk_fn, mma_pv_fn,
             acc_O, tOrP, softmax, mask_fn, is_first=True,
         )
         for n_tile in cutlass.range(n_block_max - 1 - n_block_min, unroll=1):
-            kv_producer_state, kv_consumer_state = self._one_n_block_body(
+            kv_consumer_state, kv_producer_state = self._one_n_block_consumer(
                 n_block_max - 2 - n_tile, warp_idx, load_K, load_V, pipeline_k, pipeline_v,
-                kv_producer_state, kv_consumer_state, mma_qk_fn, mma_pv_fn,
+                kv_consumer_state, kv_producer_state, mma_qk_fn, mma_pv_fn,
                 acc_O, tOrP, softmax, mask_fn, is_first=False,
             )
-        return kv_producer_state, kv_consumer_state
+        return kv_consumer_state, kv_producer_state
 
     @cute.jit
-    def _one_n_block_body(
+    def _one_n_block_consumer(
         self,
         n_block: Int32,
         warp_idx: Int32,
@@ -728,8 +756,8 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
         load_V: Callable,
         pipeline_k: pipeline.PipelineAsync,
         pipeline_v: pipeline.PipelineAsync,
-        kv_producer_state,
         kv_consumer_state,
+        kv_producer_state,
         mma_qk_fn: Callable,
         mma_pv_fn: Callable,
         acc_O: cute.Tensor,
@@ -738,40 +766,39 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
         mask_fn: Callable,
         is_first: cutlass.Constexpr = False,
     ):
-        """Load K[n] and V[n], then S = Q@K.T, softmax, O += P@V -- all fully serialized."""
-        # ---- load -------------------------------------------------------------------
-        # EXERCISE (3)/(5): the loads live inside the compute loop and are issued for this
-        # block only. The original skewed the streams (K of block n-1 issued alongside V of
-        # block n) so that the consumer's deferred PV always had its V resident.
-        if warp_idx == 0:
-            load_K(n_block, kv_producer_state)
-            load_V(n_block, kv_producer_state)
-        kv_producer_state.advance()
+        """S = Q@K.T, softmax, O += P@V。WS=False 时本侧 warp0 先发 K/V TMA。"""
+        # ---- load（仅非-WS 单 warpgroup 版；WS 版由独立 producer warp 负责）----
+        if const_expr(not self.warp_specialized):
+            if warp_idx == 0:
+                load_K(n_block, kv_producer_state)
+                load_V(n_block, kv_producer_state)
+            kv_producer_state.advance()
 
         # ---- S = Q @ K.T ------------------------------------------------------------
-        # EXERCISE (3)/(5): warp_scheduler_barrier_sync() used to guard this region.
+        if const_expr(self._ws_debug):
+            if cute.arch.thread_idx()[0] == self.num_threads_per_warp_group:
+                cute.printf("[C] wait K n=%d\n", n_block)
         pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
-        # wg_wait=0: block on the QK gemm immediately instead of leaving it in flight.
+        if const_expr(self._ws_debug):
+            if cute.arch.thread_idx()[0] == self.num_threads_per_warp_group:
+                cute.printf("[C] got K n=%d\n", n_block)
         acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
         pipeline_k.consumer_release(kv_consumer_state)
 
         # ---- softmax ----------------------------------------------------------------
         mask_fn(acc_S=acc_S, n_block=n_block)
         if const_expr(is_first):
-            # row_scale unused: the PV gemm below writes acc_O instead of accumulating.
             softmax.online_softmax(acc_S, is_first=True)
             utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), tOrP)
         else:
             row_scale = softmax.online_softmax(acc_S, check_inf=True)
             utils.cvt_f16(layout_utils.reshape_acc_to_frgA(acc_S), tOrP)
-            # Must happen before the PV gemm accumulates into acc_O.
             softmax.rescale_O(acc_O, row_scale)
 
         # ---- O += P @ V -------------------------------------------------------------
-        # EXERCISE (3)/(5): warp_scheduler_barrier_arrive() used to release the token here.
         pipeline_v.consumer_wait(kv_consumer_state, pipeline_v.consumer_try_wait(kv_consumer_state))
         mma_pv_fn(B_idx=kv_consumer_state.index, zero_init=is_first, wg_wait=0)
         pipeline_v.consumer_release(kv_consumer_state)
         kv_consumer_state.advance()
 
-        return kv_producer_state, kv_consumer_state
+        return kv_consumer_state, kv_producer_state

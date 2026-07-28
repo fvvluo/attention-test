@@ -63,9 +63,9 @@ _compiled_cache = {}
 #   tile_n=64  -> sK/sV 减半，进一步压 smem 到 2 CTA/SM。
 # 与 tile_m=128/tile_n=128 相比该组合在本 shape 快约 1.8x（0.67ms -> 0.375ms）。
 _DECODE_TILE_M = 64
-_DECODE_TILE_N = 64
+_DECODE_TILE_N = 32   # tile_n=32 -> smem 更小，每 SM 可驻留 3 个 CTA（tile_n=64 只有 2）
 _DECODE_NUM_THREADS = 128
-_DECODE_BLOCKS_PER_SPLIT = 16  # 每 split 覆盖的 KV block 数（tile_n=64 时 -> ~128 splits）
+_DECODE_BLOCKS_PER_SPLIT = 16  # 每 split 覆盖的 KV block 数（tile_n=32 时 -> ~256 splits）
 
 
 def _decode_num_splits(q_len, kv_len, kv_heads, batch, device):
@@ -123,15 +123,17 @@ def _attention_decode(q, k, v, sm_scale, qhead_per_kvhead, num_splits):
     o_t = from_dlpack(o_partial, assumed_align=16)
     lse_t = from_dlpack(lse_partial, assumed_align=4)
 
-    cache_key = ("decode", qhead_per_kvhead, q_len, kv_len, num_splits)
+    cache_key = ("decode", qhead_per_kvhead, q_len, kv_len, num_splits, _DECODE_WARP_SPECIALIZED)
     entry = _compiled_cache.get(cache_key)
     if entry is None:
         fa = FA(
             cutlass.BFloat16, head_dim, head_dim, qhead_per_kvhead,
             is_causal=False, is_local=False, pack_gqa=True,
             tile_m=_DECODE_TILE_M, tile_n=_DECODE_TILE_N, num_stages=2,
-            num_threads=_DECODE_NUM_THREADS, Q_in_regs=False,
+            num_threads=(_DECODE_NUM_THREADS + 128) if _DECODE_WARP_SPECIALIZED else _DECODE_NUM_THREADS,
+            Q_in_regs=False,
             num_splits=num_splits,
+            warp_specialized=_DECODE_WARP_SPECIALIZED,
         )
         aux = _AuxData()
         compiled = cute.compile(
@@ -151,12 +153,13 @@ def _attention_decode(q, k, v, sm_scale, qhead_per_kvhead, num_splits):
 
     # 合并各 split：lse = logsumexp_s(lse_s)，O = Σ_s O_s * exp(lse_s - lse)。
     # lse_partial 是 (S,b,h,s_q)，转成与 o_partial (S,b,s_q,h) 对齐的 (S,b,s_q,h)。
+    # 空 split 的 lse=-inf -> w=exp(-inf-lse)=0（合法）；对 w 兜底防极端全 -inf 行 nan。
     lse_f = lse_partial.float().transpose(2, 3)          # (S,b,s_q,h)
     lse = torch.logsumexp(lse_f, dim=0)                  # (b,s_q,h)
     w = (lse_f - lse.unsqueeze(0)).exp()                 # (S,b,s_q,h)
     w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
-    o = (o_partial.float() * w.unsqueeze(-1)).sum(0)     # (b,s_q,h,d)
-    o = torch.nan_to_num(o)
+    # einsum 单 kernel 做加权求和；端到端里其 launch 与主 kernel 重叠，略优于 (op*w).sum(0)。
+    o = torch.einsum('sbqh,sbqhd->bqhd', w, o_partial.float())  # (b,s_q,h,d)
     return o.transpose(1, 2).to(orig_dtype)              # (b,h,s_q,d)
 
 
@@ -219,4 +222,4 @@ def attention(q, k, v, causal=True, sm_scale=None):
     return _attention_prefill(q, k, v, causal, sm_scale, qhead_per_kvhead)
 
 
-register("ljr_flash_attention", attention)
+register("ljr_flash_attention_fa3", attention)
