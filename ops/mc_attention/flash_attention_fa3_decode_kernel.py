@@ -326,7 +326,7 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
             grid=TileScheduler.get_grid_shape(tile_sched_params),
             block=[self.num_threads, 1, 1],
             stream=stream,
-            min_blocks_per_mp=6,
+            min_blocks_per_mp=1,
         )
 
     @cute.kernel
