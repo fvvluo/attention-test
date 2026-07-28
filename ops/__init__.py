@@ -5,6 +5,29 @@
 
 import importlib
 import pkgutil
+import sys as _sys
+import types as _types
+
+# --- self-healing flash_attn shim ---------------------------------------
+# bench_attention.py 会先 `import flash_attn`，随后把 flash_attn.__path__
+# 重定向到 vendored flash-attention-baseline，再导入纯 CuTe-DSL 的
+# `flash_attn.cute`。本机（经常被重装镜像）没有安装顶层 flash_attn 包，
+# 那句裸 import 会抛 ModuleNotFoundError，导致 bench 在加载 baseline 之前
+# 就崩溃。这里保证一个最小的顶层 flash_attn 包存在（空 __path__、无编译扩展），
+# 使 bench 后续的 __path__ 重定向 + `flash_attn.cute` 导入能够成功。
+# 只改动我们自己的 ops 包；baseline 本身完全不动。
+if "flash_attn" not in _sys.modules:
+    try:
+        import flash_attn  # noqa: F401
+    except Exception:
+        _fa = _types.ModuleType("flash_attn")
+        _fa.__path__ = []  # 命名空间式；bench 会覆写它
+        _fa.__doc__ = (
+            "minimal shim injected by ops/__init__.py so bench can redirect "
+            "flash_attn.__path__ to the vendored baseline and load flash_attn.cute"
+        )
+        _sys.modules["flash_attn"] = _fa
+# ------------------------------------------------------------------------
 
 from .base import OPS, register  # noqa: F401  (register 供子模块使用)
 
