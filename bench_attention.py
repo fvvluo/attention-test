@@ -31,6 +31,7 @@ Prefill / Decode 说明：
 
 import argparse
 import importlib
+import os
 import time
 import unicodedata
 from dataclasses import dataclass, field
@@ -117,8 +118,12 @@ def parse_args():
         default=True,
         help="是否使用因果掩码（仅作用于 prefill 阶段，默认开启，用 --no-causal 关闭）",
     )
-    parser.add_argument("--warmup", type=int, default=5, help="正式计时前的 warmup 次数")
-    parser.add_argument("--iters", type=int, default=20, help="正式计时的迭代次数")
+    parser.add_argument("--warmup", type=int, default=5, help="所有阶段默认的 warmup 次数")
+    parser.add_argument("--iters", type=int, default=20, help="所有阶段默认的正式计时迭代次数")
+    parser.add_argument("--prefill-warmup", type=int, default=None, help="Prefill warmup 次数（覆盖 --warmup）")
+    parser.add_argument("--prefill-iters", type=int, default=None, help="Prefill 正式计时迭代次数（覆盖 --iters）")
+    parser.add_argument("--decode-warmup", type=int, default=None, help="Decode warmup 次数（覆盖 --warmup）")
+    parser.add_argument("--decode-iters", type=int, default=None, help="Decode 正式计时迭代次数（覆盖 --iters）")
     parser.add_argument(
         "--check-only",
         action="store_true",
@@ -507,13 +512,19 @@ def main():
     if args.gpu is not None:
         if not torch.cuda.is_available():
             raise RuntimeError(f"指定了 --gpu {args.gpu}，但当前环境检测不到可用的 CUDA 设备")
-        if args.gpu < 0 or args.gpu >= torch.cuda.device_count():
+        visible_gpu_count = torch.cuda.device_count()
+        gpu_index = args.gpu
+        gpu_alias = os.environ.get("ATTENTION_GPU_ALIAS")
+        if gpu_alias is not None and args.gpu == int(gpu_alias) and visible_gpu_count == 1:
+            gpu_index = 0
+            print(f"GPU 别名映射: --gpu {args.gpu} -> cuda:0")
+        if gpu_index < 0 or gpu_index >= visible_gpu_count:
             raise ValueError(
                 f"--gpu {args.gpu} 超出范围，当前可见 GPU 数量为 "
-                f"{torch.cuda.device_count()}（可用卡号: 0~{torch.cuda.device_count() - 1}）"
+                f"{visible_gpu_count}（可用卡号: 0~{visible_gpu_count - 1}）"
             )
-        torch.cuda.set_device(args.gpu)
-        device = torch.device(f"cuda:{args.gpu}")
+        torch.cuda.set_device(gpu_index)
+        device = torch.device(f"cuda:{gpu_index}")
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -547,12 +558,16 @@ def main():
             if phase == "prefill":
                 q_len, kv_len = seq_len, seq_len
                 phase_causal = args.causal
+                phase_warmup = args.prefill_warmup if args.prefill_warmup is not None else args.warmup
+                phase_iters = args.prefill_iters if args.prefill_iters is not None else args.iters
             else:  # decode
                 q_len, kv_len = 1, seq_len
                 # decode 阶段新 token 天然位于序列末尾，能 attend 到全部已缓存的
                 # kv，等价于非因果；这里显式关闭 causal，避免部分朴素实现在
                 # q_len != kv_len 时对绝对位置的因果掩码处理出错。
                 phase_causal = False
+                phase_warmup = args.decode_warmup if args.decode_warmup is not None else args.warmup
+                phase_iters = args.decode_iters if args.decode_iters is not None else args.iters
 
             q, k, v = make_inputs(batch, q_heads, kv_heads, q_len, kv_len, head_dim, dtype, device)
             sm_scale = None  # 使用默认缩放 1/sqrt(head_dim)
@@ -568,7 +583,7 @@ def main():
             if not args.check_only:
                 baseline_bench = benchmark_fn(
                     baseline_fn, q, k, v, phase_causal, sm_scale,
-                    args.warmup, args.iters, device,
+                    phase_warmup, phase_iters, device,
                 )
                 phase_baseline_benches[phase] = baseline_bench
 
@@ -582,7 +597,7 @@ def main():
                     if not args.check_only:
                         report.bench = benchmark_fn(
                             fn, q, k, v, phase_causal, sm_scale,
-                            args.warmup, args.iters, device,
+                            phase_warmup, phase_iters, device,
                         )
                 except Exception as e:  # noqa: BLE001
                     report.run_error = str(e)
