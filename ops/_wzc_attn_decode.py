@@ -45,8 +45,15 @@ GROUP_M = 8        # q_heads per kv_head for the target shape
 HEAD_DIM = 128
 BLOCK_N = 128      # kv rows per mainloop tile
 NUM_STAGES = 3     # TMA pipeline stages (K and V each)
-NUM_THREADS = 256  # 1 producer warpgroup + 1 consumer warpgroup
-NUM_SPLITS = 39    # default split count: 64 * 8 = 512 CTAs on 78 SMs
+NUM_THREADS = 256  # 1 producer warpgroup + 1 consumer warpgroup.
+                   # (Tried 160 = 1 producer warp + 1 consumer warpgroup: measured
+                   #  slower — dropping to 5 warps/CTA hurts occupancy and the long
+                   #  splits at NUM_SPLITS=6 then fail to hide TMA latency. Kept 256.)
+NUM_SPLITS = 6     # 6 splits x 8 kv_heads = 48 items, 1 item/SM (48 of 78 SMs).
+                   # Empirically optimal on H20: 48 CTAs already saturate HBM, while
+                   # fewer/longer splits minimize the combine reduction size and
+                   # per-item overhead, and give perfect static balance (1 item/SM,
+                   # no round-robin tail). Measured 0.1565ms vs 0.1605ms at splits=39.
 
 # Debug bisect switches (compile-time constants read from env).
 _DBG_SKIP_QCOPY = _os.environ.get("AD_SKIP_QCOPY") == "1"
