@@ -1,20 +1,3 @@
-# ljr 的 FA3 **decode 专用** 前向 kernel —— 从 flash_attention_fa3_kernel.py（prefill 版）
-# 派生而来，专为 decode（q_len=1、非因果、访存密集）优化。类名 LjrFlashFwdDecodeSm90。
-#
-# decode 的核心瓶颈是「qhead_per_kvhead× 冗余 KV 读」：GQA 下多个 q-head 共享同一 kv-head，
-# 但原 kernel 每个 q-head 各起一个 CTA、各自把完整 KV 读一遍，实际访存量是理论最小值的
-# qhead_per_kvhead 倍。本 kernel 用两把武器同时压这个瓶颈：
-#   1) GQA packing：把共享同一 kv-head 的 qhead_per_kvhead 个 q-head 的 query 打包进 M 维，
-#      每个 KV 块只被读一次供多行复用 —— 直接消除 qhead_per_kvhead× 冗余读。
-#   2) Split-KV（沿用 prefill 版）：打包后 grid 从 q_heads 掉到 kv_heads，占用率骤降，
-#      靠 KV 维切分把 grid 撑回 kv_heads*num_splits 填满 SM。
-#
-# 复用 baseline 已验证的叶子构件：pack_gqa（PackGQA + pack_gqa_layout）、TMA copy（K/V）、
-# PipelineTmaAsync、Softmax、AttentionMask、SingleTileScheduler（原生支持 split）。
-# 依赖 flash_attn.cute.* 已被路由到 flash-attention-baseline（由 ljr 接入层触发）。
-#
-# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-
 from typing import Callable, Optional
 from functools import partial
 
@@ -86,7 +69,6 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
         self.warp_specialized = warp_specialized
         self.num_producer_regs = 32
         self.num_consumer_regs = 160  # 单 consumer warpgroup 时可给到较高
-        self._ws_debug = False  # 打开可在 producer/consumer 打印进度定位死锁
         self.buffer_align_bytes = 1024
         self.cluster_shape_mn = (1, 1)
         assert self.arch.is_family_of(Arch.sm_90a), "Only SM 9.x is supported"
@@ -466,18 +448,9 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
         block: Int32,
         producer_state: pipeline.PipelineState,
     ):
-        if const_expr(self._ws_debug):
-            if cute.arch.thread_idx()[0] == 0:
-                cute.printf("[P]   acquire blk=%d idx=%d\n", block, producer_state.index)
         pipeline_kv.producer_acquire(producer_state)
-        if const_expr(self._ws_debug):
-            if cute.arch.thread_idx()[0] == 0:
-                cute.printf("[P]   acquired blk=%d\n", block)
         tma_load_fn(src_idx=block, producer_state=producer_state)
         pipeline_kv.producer_commit(producer_state)
-        if const_expr(self._ws_debug):
-            if cute.arch.thread_idx()[0] == 0:
-                cute.printf("[P]   committed blk=%d\n", block)
 
     def _n_block_range(self, seqlen, m_block, split_idx):
         """计算本 work-tile 在本 split 下要遍历的全局 KV 块区间 [n_block_min, n_block_max)。
@@ -513,8 +486,6 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
     ):
         """Producer warp（elected warp 0）：只负责按 KV 块顺序发 K/V 的 TMA。
         与 consumer 用同一个 scheduler + 同一段 [n_block_min, n_block_max)，从高到低发块。"""
-        if const_expr(self._ws_debug):
-            cute.printf("[P] ENTER producer_loop tid=%d\n", cute.arch.thread_idx()[0])
         kv_producer_state = pipeline.make_pipeline_state(
             pipeline.PipelineUserType.Producer, self.num_stages
         )
@@ -539,8 +510,6 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
                 self.load_KV, copy_utils.tma_producer_copy_fn(tma_load_V, pipeline_v), pipeline_v
             )
             n_block_min, n_block_max = self._n_block_range(seqlen, m_block, split_idx)
-            if const_expr(self._ws_debug):
-                cute.printf("[P] tile bidx=%d nmin=%d nmax=%d\n", batch_idx, n_block_min, n_block_max)
             # 从高到低发块（与 consumer 消费顺序一致）。
             n_block = n_block_max - 1
             for _ in cutlass.range(n_block_max - n_block_min, unroll=1):
@@ -548,8 +517,6 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
                 load_V(n_block, kv_producer_state)
                 kv_producer_state.advance()
                 n_block -= 1
-            if const_expr(self._ws_debug):
-                cute.printf("[P] tile done\n")
 
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
@@ -693,16 +660,10 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
                 mLSE_epi = mLSE
 
             softmax.rescale_O(acc_O, softmax.finalize())
-            if const_expr(self._ws_debug):
-                if cute.arch.thread_idx()[0] == self.num_threads_per_warp_group:
-                    cute.printf("[C] pre-epilogue\n")
             self.epilogue(
                 acc_O, softmax.row_sum, mO_epi, mLSE_epi, sO, seqlen,
                 gmem_tiled_copy_O, None, tiled_mma_pv, tidx, m_block, head_idx, batch_idx,
             )
-            if const_expr(self._ws_debug):
-                if cute.arch.thread_idx()[0] == self.num_threads_per_warp_group:
-                    cute.printf("[C] post-epilogue\n")
 
             tile_scheduler.prefetch_next_work()
             tile_scheduler.advance_to_next_work()
@@ -775,13 +736,7 @@ class LjrFlashFwdDecodeSm90(FlashAttentionForwardBase):
             kv_producer_state.advance()
 
         # ---- S = Q @ K.T ------------------------------------------------------------
-        if const_expr(self._ws_debug):
-            if cute.arch.thread_idx()[0] == self.num_threads_per_warp_group:
-                cute.printf("[C] wait K n=%d\n", n_block)
         pipeline_k.consumer_wait(kv_consumer_state, pipeline_k.consumer_try_wait(kv_consumer_state))
-        if const_expr(self._ws_debug):
-            if cute.arch.thread_idx()[0] == self.num_threads_per_warp_group:
-                cute.printf("[C] got K n=%d\n", n_block)
         acc_S = mma_qk_fn(B_idx=kv_consumer_state.index, wg_wait=0)
         pipeline_k.consumer_release(kv_consumer_state)
 
