@@ -66,6 +66,9 @@ _DECODE_TILE_M = 64
 _DECODE_TILE_N = 32   # tile_n=32 -> smem 更小，每 SM 可驻留 3 个 CTA（tile_n=64 只有 2）
 _DECODE_NUM_THREADS = 128
 _DECODE_BLOCKS_PER_SPLIT = 16  # 每 split 覆盖的 KV block 数（tile_n=32 时 -> ~256 splits）
+# warp specialization：True 时额外加一个 producer warpgroup（总 256 线程），
+# producer 专发 K/V TMA、consumer 专做 MMA，解耦访存与计算以隐藏延迟。
+_DECODE_WARP_SPECIALIZED = False
 
 
 def _decode_num_splits(q_len, kv_len, kv_heads, batch, device):
@@ -205,6 +208,26 @@ def _attention_prefill(q, k, v, causal, sm_scale, qhead_per_kvhead):
     return o_bshd.transpose(1, 2).to(orig_dtype)
 
 
+_DECODE_CUDA_EXT = None
+
+
+def _get_decode_cuda_ext():
+    """惰性编译手写 CUDA decode kernel（mma.m16n8k16，KV token 放 M 维）。"""
+    global _DECODE_CUDA_EXT
+    if _DECODE_CUDA_EXT is None:
+        import os
+        from torch.utils.cpp_extension import load
+        src = os.path.join(os.path.dirname(__file__), "ljr_decode_cuda", "ljr_flash_decode.cu")
+        _DECODE_CUDA_EXT = load(
+            name="ljr_flash_decode_cuda",
+            sources=[src],
+            verbose=False,
+            extra_cuda_cflags=["-O3", "--use_fast_math",
+                               "-gencode=arch=compute_90a,code=sm_90a"],
+        )
+    return _DECODE_CUDA_EXT
+
+
 def attention(q, k, v, causal=True, sm_scale=None):
     batch, q_heads, q_len, head_dim = q.shape
     kv_heads = k.shape[1]
@@ -215,8 +238,12 @@ def attention(q, k, v, causal=True, sm_scale=None):
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
 
+    # decode（q_len==1）优先走手写 CUDA kernel（mma.m16n8k16：KV token 放 M 维、q-head 放 N 维，
+    # split-KV + 1 warp/CTA），比 WGMMA/GEMV 都快。约束：D=128、kv_len%32==0、qpkv<=8。
+    if q_len == 1 and kv_len % 32 == 0 and qhead_per_kvhead <= 8:
+        return _get_decode_cuda_ext().forward(q, k, v, float(sm_scale))
+
     num_splits = _decode_num_splits(q_len, kv_len, kv_heads, batch, q.device)
-    # decode 判定：q_len 小且能有效 split（num_splits>1）时走 pack_gqa+split 的 decode kernel。
     if q_len <= 8 and num_splits > 1:
         return _attention_decode(q, k, v, sm_scale, qhead_per_kvhead, num_splits)
     return _attention_prefill(q, k, v, causal, sm_scale, qhead_per_kvhead)
