@@ -197,11 +197,12 @@ class TransposedDecode:
             Q, ka, kt, va, vt, mOpart, mLSE, F32(self.scale_log2),
             qL, kL, vL, pL, mma_qk, mma_pv, Smem,
         ).launch(grid=(self.workers, 1, 1), block=[THREADS, 1, 1],
-                 smem=Smem.size_in_bytes(), stream=stream, min_blocks_per_mp=1)
+                 smem=Smem.size_in_bytes(), stream=stream, min_blocks_per_mp=1,
+                 use_pdl=True)
 
         self.combine_kernel(mOpart, mLSE, O).launch(
             grid=(self.q_heads, self.batch, 1), block=[128, 1, 1],
-            smem=self.splits * 4, stream=stream)
+            smem=self.splits * 4, stream=stream, use_pdl=True)
 
     @cute.kernel
     def split_kernel(self, mQ, ka, mK, va, mV, mOpart, mLSE, scale_log2,
@@ -346,6 +347,10 @@ class TransposedDecode:
                 self._epilogue(accO_mn, rmax, rsum, cO, mOpart, mLSE,
                                sp, kvh, bt, NC, wwg, lane)
 
+        # PDL：本 CTA 全部 item 完成、partial/LSE 已写。触发依赖的 combine 提前启动，
+        # 把 combine 的 launch 开销藏进 split 尾部（consumer 已写完 mOpart 后）。
+        cute.arch.griddepcontrol_launch_dependents()
+
     @cute.jit
     def _softmax(self, accS_mn, accO_mn, rmax, rsum, cS, cO, sP,
                  scale_log2, NR: cutlass.Constexpr, NC: cutlass.Constexpr,
@@ -435,6 +440,7 @@ class TransposedDecode:
         g = qh % GROUP
         sm = cutlass.utils.SmemAllocator()
         buf = sm.allocate_tensor(F32, cute.make_layout(self.splits), 16)
+        cute.arch.griddepcontrol_wait()   # PDL：等 split 写完 partial/LSE
         for i in cutlass.range(tidx, self.splits, 128):
             buf[i] = mLSE[i, kvh, g, bt]
         cute.arch.barrier()
