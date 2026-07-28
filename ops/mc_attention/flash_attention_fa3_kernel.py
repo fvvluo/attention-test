@@ -1,28 +1,3 @@
-# ljr 的 FA3 前向 kernel —— 照 baseline flash_fwd_sm90.py 抄写/改写而来（不是直接调用它）。
-# 复用 baseline 已验证的叶子构件（TMA copy / PipelineTmaAsync / Softmax / AttentionMask /
-# tile scheduler / FlashAttentionForwardBase 的 _setup_attributes/epilogue），但 WGMMA+TMA+
-# mbarrier pipeline 的主体（__call__/kernel/mainloop/one_n_block）作为本文件自己的代码，可自行调优。
-# 类名改为 LjrFlashFwdSm90，与 baseline 区分。
-# 依赖 flash_attn.cute.* 已被路由到 flash-attention-baseline（由 ljr 接入层触发）。
-
-# Copyright (c) 2025, Jay Shah, Ganesh Bikshandi, Ying Zhang, Vijay Thakkar, Pradeep Ramani, Tri Dao.
-#
-# SM90 (Hopper) forward pass for flash attention -- DE-OPTIMIZED TEACHING VERSION.
-#
-# This file is derived from the original SM90 kernel with six optimizations deliberately
-# removed. It is functionally correct (under 1x64x8x131072x128) but substantially slower.
-# Each removal is marked with an `EXERCISE (n)` comment at the site where the technique used to live
-# (typically, more code is required to modify; they might be far away from the `EXERCISE (n)` comment).
-#
-#   [EASY] EXERCISE (1)  LPT tile scheduling            -> plain SingleTileScheduler
-#   [EASY] EXERCISE (2)  Causal n-block skipping        -> every KV block is visited and masked
-#   [MEDIUM] EXERCISE (3)  Warp specialization          -> one merged 256-thread mainloop
-#   [EASY] EXERCISE (4)  Register redistribution        -> setmaxnreg calls deleted
-#   [MEDIUM] EXERCISE (5)  Intra-warpgroup overlap      -> QK and PV serialized in one iteration
-#   [HARD] EXERCISE (6)  Inter-warpgroup ping-pong      -> warp scheduler barriers deleted
-#
-# If you are stuck, refer to https://github.com/Dao-AILab/flash-attention/blob/main/flash_attn/cute/flash_fwd_sm90.py.
-#
 
 from typing import Callable, Optional
 from functools import partial

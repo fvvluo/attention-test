@@ -249,4 +249,4 @@ def attention(q, k, v, causal=True, sm_scale=None):
     return _attention_prefill(q, k, v, causal, sm_scale, qhead_per_kvhead)
 
 
-register("ljr_flash_attention_fa3", attention)
+register("ljr_flash_attention_fa3 (WGMMA+TMA)", attention)
