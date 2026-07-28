@@ -1,3 +1,14 @@
+# ljr 的 FA3 版接入：调用 **本仓库自己写的** LjrFlashFwdSm90（照 baseline 抄写/改写，
+# 见 mc_attention/flash_attention_fa3_kernel.py），而非直接 import baseline 的类。
+#
+# 该 kernel 是 Hopper FA3 前向（WGMMA + TMA + mbarrier pipeline）。本接入层负责：
+#   - benchmark 的 (batch, q_heads, seq, head_dim) -> kernel 期望的 (b, s, h, d)（转置 head/seq）；
+#   - GQA 原生（qhead_per_kvhead = q_heads//kv_heads），无需 repeat_interleave；
+#   - 编译缓存 + 传 stream / AuxData。
+#
+# 依赖：baseline 库需先被路由（flash_attn.cute 指向 flash-attention-baseline）。本模块 import
+# 时触发一次路由，之后 kernel 文件里的 flash_attn.cute.* 才能正确解析。
+
 import importlib
 import math
 
@@ -57,7 +68,15 @@ def _get_decode_cls():
 _compiled_cache = {}
 
 
-_TILE_N = 128  # kernel 固定 tile_n=128
+# decode kernel 的最优 tile 配置（经扫描）：
+#   tile_m=64  -> 单 MMA warpgroup(128 线程)，sQ/sO 减半，smem 从 192KB->96KB，
+#                 让每 SM 能驻留 2 个 CTA，大幅提升 occupancy 与访存隐藏；
+#   tile_n=64  -> sK/sV 减半，进一步压 smem 到 2 CTA/SM。
+# 与 tile_m=128/tile_n=128 相比该组合在本 shape 快约 1.8x（0.67ms -> 0.375ms）。
+_DECODE_TILE_M = 64
+_DECODE_TILE_N = 64
+_DECODE_NUM_THREADS = 128
+_DECODE_BLOCKS_PER_SPLIT = 16  # 每 split 覆盖的 KV block 数（tile_n=64 时 -> ~128 splits）
 
 
 def _decode_num_splits(q_len, kv_len, kv_heads, batch, device):
@@ -71,13 +90,11 @@ def _decode_num_splits(q_len, kv_len, kv_heads, batch, device):
         return 1
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     num_ctas_base = kv_heads * batch
-    n_block_total = (kv_len + _TILE_N - 1) // _TILE_N
+    n_block_total = (kv_len + _DECODE_TILE_N - 1) // _DECODE_TILE_N
     if n_block_total <= 4:
         return 1
-    # 目标：把总 CTA 数拉高以充分并行 KV 访存；同时每个 split 至少覆盖若干 KV block
-    # （太碎会让 tail/合并开销吃掉收益）。取「每 split 覆盖约 min_blocks_per_split 个块」为上限。
-    min_blocks_per_split = 16
-    num_splits = max(1, n_block_total // min_blocks_per_split)
+    # 每个 split 覆盖约 _DECODE_BLOCKS_PER_SPLIT 个 KV block（太碎会让 tail/合并开销吃掉收益）。
+    num_splits = max(1, n_block_total // _DECODE_BLOCKS_PER_SPLIT)
     # 不超过 KV 总块数；下限保证至少填满 ~num_sms 的 CTA
     min_splits = max(1, (num_sms + num_ctas_base - 1) // num_ctas_base)
     return max(min_splits, min(n_block_total, num_splits))
@@ -106,11 +123,13 @@ def _attention_decode(q, k, v, sm_scale, qhead_per_kvhead, num_splits):
     v_t = from_dlpack(_prep_bshd(v), assumed_align=16)
 
     # 分 split 的 partial-O(bf16) + partial-LSE(fp32)。
+    # 注意 LSE 用 (ns, b, h, s_q)：head 在 seqlen 之前，与 baseline 的
+    # lse_shape=(b,h,s_q) 约定一致，kernel 里 pack_gqa 的 head_idx=1 才对得上。
     o_partial = torch.empty(
         (num_splits, batch, q_len, q_heads, head_dim), device=q.device, dtype=torch.bfloat16
     )
     lse_partial = torch.empty(
-        (num_splits, batch, q_len, q_heads), device=q.device, dtype=torch.float32
+        (num_splits, batch, q_heads, q_len), device=q.device, dtype=torch.float32
     )
     o_t = from_dlpack(o_partial, assumed_align=16)
     lse_t = from_dlpack(lse_partial, assumed_align=4)
@@ -121,7 +140,8 @@ def _attention_decode(q, k, v, sm_scale, qhead_per_kvhead, num_splits):
         fa = FA(
             cutlass.BFloat16, head_dim, head_dim, qhead_per_kvhead,
             is_causal=False, is_local=False, pack_gqa=True,
-            tile_m=128, tile_n=128, num_stages=2, num_threads=256, Q_in_regs=False,
+            tile_m=_DECODE_TILE_M, tile_n=_DECODE_TILE_N, num_stages=2,
+            num_threads=_DECODE_NUM_THREADS, Q_in_regs=False,
             num_splits=num_splits,
         )
         aux = _AuxData()
@@ -141,7 +161,8 @@ def _attention_decode(q, k, v, sm_scale, qhead_per_kvhead, num_splits):
     )
 
     # 合并各 split：lse = logsumexp_s(lse_s)，O = Σ_s O_s * exp(lse_s - lse)。
-    lse_f = lse_partial.float()                          # (S,b,s_q,h)
+    # lse_partial 是 (S,b,h,s_q)，转成与 o_partial (S,b,s_q,h) 对齐的 (S,b,s_q,h)。
+    lse_f = lse_partial.float().transpose(2, 3)          # (S,b,s_q,h)
     lse = torch.logsumexp(lse_f, dim=0)                  # (b,s_q,h)
     w = (lse_f - lse.unsqueeze(0)).exp()                 # (S,b,s_q,h)
     w = torch.nan_to_num(w, nan=0.0, posinf=0.0, neginf=0.0)
