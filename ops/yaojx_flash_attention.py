@@ -20,12 +20,12 @@ from .base import register
 
 from cutlass import cute
 import math
-WARPS_PER_CTA=4
+WARPS_PER_CTA=8
 BLOCK_M=128
 BLOCK_N=128
 HEAD_DIM=128
 INV_SQRT_D=1.0/math.sqrt(float(HEAD_DIM))
-PIPELINE_STAGES=3
+PIPELINE_STAGES=2
 DECODE_CTAS_PER_KV_DEFAULT = 4
 DECODE_BLOCK_KV=128
 NEG_INF=-float('inf')
