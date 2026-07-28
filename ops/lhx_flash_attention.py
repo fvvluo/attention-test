@@ -1408,23 +1408,23 @@ class GqaDecodeSm90:
             lse_max = -Float32.inf
             for src_warp in cutlass.range_constexpr(self.num_worker_warps):
                 lse_max = cute.arch.fmax(lse_max, sWarpLSE[src_warp, q_row])
+            weights = cute.make_rmem_tensor(self.num_worker_warps, Float32)
             weight_sum = Float32(0.0)
             for src_warp in cutlass.range_constexpr(self.num_worker_warps):
-                weight_sum += cute.math.exp2(
+                weight = cute.math.exp2(
                     (sWarpLSE[src_warp, q_row] - lse_max) * math.log2(math.e),
                     fastmath=True,
                 )
+                weights[src_warp] = weight
+                weight_sum += weight
+            inv_weight_sum = cute.arch.rcp_approx(weight_sum)
 
             for d_iter in cutlass.range_constexpr(4):
                 d = lane_idx + d_iter * 32
                 out = Float32(0.0)
                 for src_warp in cutlass.range_constexpr(self.num_worker_warps):
-                    weight = cute.math.exp2(
-                        (sWarpLSE[src_warp, q_row] - lse_max) * math.log2(math.e),
-                        fastmath=True,
-                    )
-                    out += sWarpO[src_warp, q_row, d] * weight
-                out = out * cute.arch.rcp_approx(weight_sum)
+                    out += sWarpO[src_warp, q_row, d] * weights[src_warp]
+                out = out * inv_weight_sum
                 if const_expr(self.qheads_per_kvhead % self.qheads_per_cta == 0):
                     mPartialO[batch_idx, split_idx, q_head, d] = out
                 else:
