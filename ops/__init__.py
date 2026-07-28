@@ -4,9 +4,32 @@
 # 无需手动修改这个文件 —— 新文件会被自动发现并导入。
 
 import importlib
+import os as _os
 import pkgutil
 import sys as _sys
 import types as _types
+
+# --- self-healing quack dependency ---------------------------------------
+# vendored flash-attention-baseline 的 flash_attn.cute 依赖纯 Python 包
+# `quack`（quack-kernels）。本机经常被重装镜像，site-packages 里的 quack
+# 会被抹掉，导致 bench 加载 baseline 时报 ModuleNotFoundError: No module
+# named 'quack'。这里把 quack 的 wheel 随仓库一起 vendored 到
+# tools/h20/vendor/ 下；如果正常 import 失败，就把该 wheel 加入 sys.path，
+# Python 内置的 zipimport 会直接从 wheel（纯 Python，无 .so）里加载。
+# 只在系统缺失时兜底，系统已装则不干预；baseline 本身完全不动。
+if "quack" not in _sys.modules:
+    try:
+        import quack  # noqa: F401
+    except Exception:
+        _repo_root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+        _vendor = _os.path.join(_repo_root, "tools", "h20", "vendor")
+        if _os.path.isdir(_vendor):
+            for _fn in sorted(_os.listdir(_vendor)):
+                if _fn.startswith("quack") and _fn.endswith(".whl"):
+                    _whl = _os.path.join(_vendor, _fn)
+                    if _whl not in _sys.path:
+                        _sys.path.append(_whl)
+                    break
 
 # --- self-healing flash_attn shim ---------------------------------------
 # bench_attention.py 会先 `import flash_attn`，随后把 flash_attn.__path__
