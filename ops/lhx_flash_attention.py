@@ -974,6 +974,7 @@ class GqaDecodeSm90:
         self.q_groups = (
             self.qheads_per_kvhead + self.qheads_per_cta - 1
         ) // self.qheads_per_cta
+        self.full_q_group = self.qheads_per_kvhead % self.qheads_per_cta == 0
         self.num_blocks = (kv_len + self.tile_n - 1) // self.tile_n
         self.num_splits = num_splits
         self.blocks_per_split = blocks_per_split
@@ -1015,9 +1016,10 @@ class GqaDecodeSm90:
         sKV_layout = cute.tile_to_shape(
             smem_atom, (self.tile_n, self.head_dim), (0, 1)
         )
+        warp_o_rows = self.qheads_per_cta if self.full_q_group else 16
         sWarpO_layout = cute.make_layout(
-            (self.num_worker_warps, 16, self.head_dim),
-            stride=(16 * self.head_dim, self.head_dim, 1),
+            (self.num_worker_warps, warp_o_rows, self.head_dim),
+            stride=(warp_o_rows * self.head_dim, self.head_dim, 1),
         )
         sWarpLSE_layout = cute.make_layout(
             (self.num_worker_warps, 16), stride=(16, 1)
@@ -1173,9 +1175,14 @@ class GqaDecodeSm90:
             thr_mma.partition_shape_C((16, self.head_dim)), Float32
         )
         acc_O.fill(0.0)
+        mma_rows_per_thread = acc_O.shape[0][0] * acc_O.shape[1]
         softmax = Softmax.create(
             scale_log2,
-            num_rows=acc_O.shape[0][0] * acc_O.shape[1],
+            num_rows=(
+                mma_rows_per_thread // 2
+                if const_expr(self.full_q_group)
+                else mma_rows_per_thread
+            ),
         )
         softmax.reset()
 
@@ -1293,7 +1300,7 @@ class GqaDecodeSm90:
                     cS = cute.make_identity_tensor((16, 16))
                     tScS = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cS))
                     tail_tokens = self.kv_len % self.tile_n
-                    for row in cutlass.range_constexpr(cute.size(acc_S_mn.shape[0])):
+                    for row in cutlass.range_constexpr(cute.size(softmax.row_max)):
                         for col in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
                             token_in_tile = warp_idx * 16 + tScS[0, col][1]
                             if token_in_tile >= tail_tokens:
@@ -1306,7 +1313,11 @@ class GqaDecodeSm90:
                 is_first=False,
                 check_inf=self.has_tail,
             )
-            softmax.rescale_O(acc_O, row_scale)
+            acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
+            for row in cutlass.range_constexpr(cute.size(row_scale)):
+                acc_O_mn[row, None].store(
+                    acc_O_mn[row, None].load() * row_scale[row]
+                )
             rP = cute.make_fragment_like(acc_S, self.dtype)
             rP.store(acc_S.load().to(self.dtype))
             tOrP = layout_utils.reshape_acc_to_frgA(rP)
@@ -1373,14 +1384,26 @@ class GqaDecodeSm90:
         # Convert each warp's state to normalized O plus LSE. These compose with
         # the simple exp(LSE_i - LSE_max) rule in both reduction levels.
         final_scale = softmax.finalize()
-        softmax.rescale_O(acc_O, final_scale)
+        acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
+        for row in cutlass.range_constexpr(cute.size(final_scale)):
+            acc_O_mn[row, None].store(
+                acc_O_mn[row, None].load() * final_scale[row]
+            )
 
         sWarpO_cur = sWarpO[warp_idx, None, None]
-        store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32)
-        store_o = cute.make_tiled_copy_C(store_atom, tiled_mma).get_slice(lane_idx)
-        tOrO = store_o.retile(acc_O)
-        tOsO = store_o.partition_D(sWarpO_cur)
-        cute.copy(store_atom, tOrO, tOsO)
+        cO = cute.make_identity_tensor((16, self.head_dim))
+        tLcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
+        if const_expr(self.full_q_group):
+            for row in cutlass.range_constexpr(cute.size(final_scale)):
+                for col in cutlass.range_constexpr(cute.size(acc_O_mn.shape[1])):
+                    coord = tLcO[row, col]
+                    sWarpO_cur[coord[0], coord[1]] = acc_O_mn[row, col]
+        else:
+            store_atom = cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), Float32)
+            store_o = cute.make_tiled_copy_C(store_atom, tiled_mma).get_slice(lane_idx)
+            tOrO = store_o.retile(acc_O)
+            tOsO = store_o.partition_D(sWarpO_cur)
+            cute.copy(store_atom, tOrO, tOsO)
 
         # Expand a 1-D LSE row with zero column stride so partition_C provides
         # exactly the same row ownership as the MMA accumulator.
@@ -1393,8 +1416,6 @@ class GqaDecodeSm90:
             ),
         )
         tLsLSE = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(sLSE_expanded))
-        cO = cute.make_identity_tensor((16, self.head_dim))
-        tLcO = layout_utils.reshape_acc_to_mn(thr_mma.partition_C(cO))
         if tLcO[0][1] == 0:
             for row in cutlass.range_constexpr(cute.size(softmax.row_sum)):
                 tLsLSE[row, 0] = softmax.row_sum[row]
