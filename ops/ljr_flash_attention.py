@@ -1,14 +1,3 @@
-# ljr 的 FA3 版接入：调用 **本仓库自己写的** LjrFlashFwdSm90（照 baseline 抄写/改写，
-# 见 mc_attention/flash_attention_fa3_kernel.py），而非直接 import baseline 的类。
-#
-# 该 kernel 是 Hopper FA3 前向（WGMMA + TMA + mbarrier pipeline）。本接入层负责：
-#   - benchmark 的 (batch, q_heads, seq, head_dim) -> kernel 期望的 (b, s, h, d)（转置 head/seq）；
-#   - GQA 原生（qhead_per_kvhead = q_heads//kv_heads），无需 repeat_interleave；
-#   - 编译缓存 + 传 stream / AuxData。
-#
-# 依赖：baseline 库需先被路由（flash_attn.cute 指向 flash-attention-baseline）。本模块 import
-# 时触发一次路由，之后 kernel 文件里的 flash_attn.cute.* 才能正确解析。
-
 import importlib
 import math
 
@@ -230,4 +219,4 @@ def attention(q, k, v, causal=True, sm_scale=None):
     return _attention_prefill(q, k, v, causal, sm_scale, qhead_per_kvhead)
 
 
-register("ljr_flash_attention_fa3 (WGMMA+TMA)", attention)
+register("ljr_flash_attention", attention)
