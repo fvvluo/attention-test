@@ -101,6 +101,17 @@ _ensure_paged_fa3()
 from paged_fa3.cute_attention import cute_attention  # noqa: E402
 from paged_fa3.cute_mma_decode import mma_decode_cute  # noqa: E402
 
+# Transposed-WGMMA + TMA warp-specialized decode (bf16). Runs the GQA GEMV at
+# full WGMMA M-efficiency by transposing the dataflow (long dim on M), fed by a
+# persistent TMA-producer / WGMMA-consumer pipeline. On the target shape
+# (1x64x8x131072x128) this reaches ~152.9us vs ~175us for the single-warp
+# mma_decode_cute -- a decisive win. Guarded fast path; falls back to
+# mma_decode_cute on any unsupported shape.
+try:
+    from paged_fa3.transposed_decode import decode as _transposed_decode  # noqa: E402
+except Exception:  # pragma: no cover - fall back if the module fails to import
+    _transposed_decode = None
+
 
 def attention(q, k, v, causal=True, sm_scale=None):
     """CuTe DSL FlashAttention.
@@ -125,13 +136,29 @@ def attention(q, k, v, causal=True, sm_scale=None):
 
     if q_len == 1:
         # ---- decode: single query token vs the full KV cache (memory-bound) ----
-        # split-KV MMA decode. Present K/V as a transposed VIEW (no .contiguous()).
-        q_dec = q[:, :, 0, :].contiguous()                       # [B, Hq, D] (tiny)
-        k_bshd = k.transpose(1, 2)                               # [B, Sk, Hkv, D] view
-        v_bshd = v.transpose(1, 2)                               # (no copy)
-        out = mma_decode_cute(q_dec, k_bshd, v_bshd,
-                              sm_scale=sm_scale, n_block=64)      # [B, Hq, D]
-        out = out.unsqueeze(2)                                   # [B, Hq, 1, D]
+        # Preferred: transposed-WGMMA + TMA warp-specialized decode. It wants the
+        # NATIVE benchmark layout (q [B,Hq,1,D], k/v [B,Hkv,S,D]) directly -- no
+        # transpose/contiguous needed. Guarded: GQA==8 and kv_len%256==0.
+        use_transposed = (
+            _transposed_decode is not None
+            and Hq == Hkv * 8
+            and k.shape[2] % 256 == 0
+            and D == 128
+            and q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
+        )
+        if use_transposed:
+            try:
+                out = _transposed_decode(q, k, v, sm_scale=sm_scale)  # [B, Hq, 1, D]
+            except Exception:
+                use_transposed = False
+        if not use_transposed:
+            # Fallback: split-KV MMA decode. K/V as a transposed VIEW (no copy).
+            q_dec = q[:, :, 0, :].contiguous()                   # [B, Hq, D] (tiny)
+            k_bshd = k.transpose(1, 2)                            # [B, Sk, Hkv, D] view
+            v_bshd = v.transpose(1, 2)                            # (no copy)
+            out = mma_decode_cute(q_dec, k_bshd, v_bshd,
+                                  sm_scale=sm_scale, n_block=64)  # [B, Hq, D]
+            out = out.unsqueeze(2)                               # [B, Hq, 1, D]
     else:
         # ---- prefill: full-KV FlashAttention with optional causal mask ----
         # kernel wants (B, S, H, D). Present a transposed VIEW (no .contiguous()).
