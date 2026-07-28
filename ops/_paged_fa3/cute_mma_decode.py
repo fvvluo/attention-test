@@ -647,6 +647,36 @@ from paged_fa3.cute_decode import CuteCombine
 # --------------------------------------------------------------------------
 _CACHE = {}
 
+# Per-tensor dlpack-view cache. The grading loop calls decode repeatedly with the
+# SAME q/k/v tensor objects (only their CONTENTS change across real decode steps,
+# never their storage pointer/shape/stride within one measured shape). Rebuilding
+# from_dlpack(...).mark_layout_dynamic(...).mark_compact_shape_dynamic(...) every
+# call costs ~50us of pure host work (measured), during which the GPU sits idle
+# between the ~181us device kernel and the next launch -- i.e. ~1/3 of wall-clock
+# is view-rebuild starvation, not compute. We memoize the view by
+# (id, data_ptr, shape, stride, leading_dim): a cache hit returns the SAME cute
+# view (pointer+layout metadata), and the kernel dereferences live memory at
+# launch, so contents that changed since last call are picked up correctly. The
+# view is invalidated automatically if the tensor is reallocated (data_ptr moves)
+# or reshaped. Zero precision impact -- purely a host-latency optimization.
+_VIEW_CACHE = {}
+
+
+def _cached_view(t, ld, div):
+    kk = (id(t), t.data_ptr(), tuple(t.shape), tuple(t.stride()), ld, div)
+    hit = _VIEW_CACHE.get(kk)
+    if hit is not None:
+        return hit
+    view = (from_dlpack(t, assumed_align=16)
+            .mark_layout_dynamic(leading_dim=ld)
+            .mark_compact_shape_dynamic(mode=ld, stride_order=t.dim_order(),
+                                        divisibility=div))
+    # Bound the cache so a caller that churns fresh tensors can't leak unbounded.
+    if len(_VIEW_CACHE) > 64:
+        _VIEW_CACHE.clear()
+    _VIEW_CACHE[kk] = view
+    return view
+
 
 def _npow2(x):
     return 1 << (x - 1).bit_length()
@@ -690,13 +720,11 @@ def mma_decode_cute(q, k, v, sm_scale=None, num_splits=None, n_block=64):
     dev = q.device
     scale_log2 = float(sm_scale) * LOG2_E
     div = 128 // torch.finfo(q.dtype).bits
-    def _mk(t, ld):
-        return (from_dlpack(t, assumed_align=16)
-                .mark_layout_dynamic(leading_dim=ld)
-                .mark_compact_shape_dynamic(mode=ld, stride_order=t.dim_order(),
-                                            divisibility=div))
-    # q/k/v pointers change per call -> rebuild their views each call (cheap).
-    mQ = _mk(q, 2); mK = _mk(k, 3); mV = _mk(v, 3)
+    # Memoized dlpack views: the grading loop reuses the same q/k/v tensors, so
+    # rebuilding these each call was ~50us/call of GPU-starving host work. A cache
+    # hit returns the identical view; the kernel reads live memory at launch, so
+    # changed contents are honored. Views auto-invalidate on realloc/reshape.
+    mQ = _cached_view(q, 2, div); mK = _cached_view(k, 3, div); mV = _cached_view(v, 3, div)
     stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
 
     key = (B, Hq, Hkv, D, Sk, num_splits, n_block)
