@@ -1,13 +1,18 @@
 # ============================================================
-# 融合算子 v8：按 q_len 路由 prefill / decode，得到完整 FlashAttention
-#   q_len == 1  -> ops/_decode2.py 的 split-K flash-decoding kernel（Triton）
-#   q_len  > 1  -> ops/_prefill3.py 的 Hopper SM90 FMHA kernel（CuTe DSL，
-#                  新优化版 v3）
-# 只做"拼接/融合"，不修改任何已有文件（_prefill3.py / _decode2.py 保持只读）。
+# 融合算子 v10：按 q_len 路由 prefill / decode，得到完整 FlashAttention
+#   q_len == 1  -> ops/_decode5.py 的 CuTe DSL flash-decoding kernel
+#                  （persistent grid + 自控 wave + 转置 WGMMA + TMA，目标 >=3.5 TB/s）
+#   q_len  > 1  -> ops/_prefill3.py 的 Hopper SM90 FMHA kernel（CuTe DSL）
+# 只做"拼接/融合"，不修改任何已有文件（_prefill3.py / _decode5.py 保持只读）。
 # 全程 BHSD：
 #   q:  (b, q_heads,  q_len,  d)
 #   k/v:(b, kv_heads, kv_len, d)
 #   out 与 q 同 shape。q_heads 是 kv_heads 的整数倍（GQA）；MHA 时相等。
+#
+# 注意：_decode5 的入口是 attention_decode（与 _decode4 兼容），
+# 参数为 sm_scale=/causal=（无 layout/return_lse），且只在 bf16 + q_len==1 +
+# head_dim==128 + q_heads==8*kv_heads + kv_len%128==0 时走高性能 kernel，
+# 否则内部退回 SDPA fallback。
 # ============================================================
 
 import math
@@ -57,8 +62,8 @@ import cutlass.cute as cute  # noqa: E402
 from cutlass.cute.runtime import from_dlpack  # noqa: E402
 import cuda.bindings.driver as cuda  # noqa: E402
 
-from . import _prefill3 as _prefill_mod  # noqa: E402  (新优化的 prefill kernel v3)
-from . import _decode2 as _decode_mod  # noqa: E402  (decode kernel v2)
+from . import _prefill3 as _prefill_mod  # noqa: E402  (prefill kernel v3)
+from . import _decode5 as _decode_mod  # noqa: E402  (CuTe DSL decode kernel v5)
 
 
 _TORCH_TO_CUTLASS = {
@@ -210,20 +215,21 @@ def _run_prefill(q, k, v, causal, sm_scale):
 
 
 # ------------------------------------------------------------
-# decode 驱动（q_len == 1）：调用 _decode2.py 的 split-K flash-decoding kernel
+# decode 驱动（q_len == 1）：调用 _decode5.py 的 CuTe DSL flash-decoding kernel
+#   入口 attention_decode(q, k, v, sm_scale=, causal=)，BHSD，返回同 q shape。
+#   仅 bf16 + q_len==1 + head_dim==128 + q_heads==8*kv_heads + kv_len%128==0
+#   时走高性能 kernel，否则内部退回 SDPA fallback。
 # ------------------------------------------------------------
 def _run_decode(q, k, v, sm_scale):
-    # 仅在非连续时才拷贝：decode kernel 按 stride 访问，只要求连续。
-    # benchmark 传入的已是连续张量，无脑 .contiguous() 会多出 3 次 no-op
-    # dispatch（decode 本体仅 ~0.17ms，任何固定开销占比都被放大）。
+    # kernel 要求连续；benchmark 传入的已连续，非连续时才拷贝。
     def _c(x):
         return x if x.is_contiguous() else x.contiguous()
 
-    return _decode_mod.flash_attention_decode(
+    # decode 天然非因果（新 token attend 全部已缓存 kv），causal=False。
+    return _decode_mod.attention_decode(
         _c(q), _c(k), _c(v),
-        layout="bhsd",
-        softmax_scale=sm_scale,
-        return_lse=False,
+        sm_scale=sm_scale,
+        causal=False,
     )
 
 
@@ -236,4 +242,4 @@ def attention(q, k, v, causal=True, sm_scale=None):
     return _run_prefill(q, k, v, causal, sm_scale)
 
 
-register("prefill_decode_fused8 (cute+triton)", attention)
+register("prefill_decode_fused10 (cute+cute)", attention)
