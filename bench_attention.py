@@ -199,12 +199,15 @@ TOLERANCE = {
     torch.float32: dict(abs_tol=1e-4, rel_tol=1e-4),
 }
 
-# decode 阶段（q_len=1）累加规模远小于 prefill，正确实现的最大绝差实测仅
-# ~1e-3 量级，因此用更严的阈值，避免"用均值/近似糊弄 softmax"之类的取巧实现
-# 蒙混过关。未在此列出的 dtype 回落到 TOLERANCE。
+# decode 阶段（q_len=1）累加规模远小于 prefill：在真实评测形状
+# (1x64x8x131072x128) 上，正确实现相对 baseline 的最大绝差实测仅 ~1e-4 量级
+# （fp32 softmax 6.1e-5，分数走 bf16 也只有 1.2e-4）；而"均值糊弄 softmax"
+# 之类的取巧实现最大绝差 ~1.5e-2、top-1/last-token 更是 >3。因此用 1e-3 的
+# 严阈值：正确实现仍有近一个数量级余量，投机实现全部被拦下。
+# 未在此列出的 dtype 回落到 TOLERANCE。
 DECODE_TOLERANCE = {
-    torch.float16: dict(abs_tol=2e-3, rel_tol=2e-3),
-    torch.bfloat16: dict(abs_tol=2e-3, rel_tol=2e-3),
+    torch.float16: dict(abs_tol=1e-3, rel_tol=1e-3),
+    torch.bfloat16: dict(abs_tol=1e-3, rel_tol=1e-3),
 }
 
 
