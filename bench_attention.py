@@ -190,11 +190,21 @@ DTYPE_MAP = {
     "bf16": torch.bfloat16,
 }
 
-# 不同 dtype 下的正确性容差
+# 不同 dtype 下的正确性容差（prefill 阶段 / 未指定阶段时的默认值）。
+# prefill 是 q_len==kv_len 的长序列求和，bf16 累加误差随序列长度增大，
+# 实测正确实现的最大绝差可达 ~1.5e-2（128K 更大），因此保持 2e-2。
 TOLERANCE = {
     torch.float16: dict(abs_tol=2e-2, rel_tol=2e-2),
     torch.bfloat16: dict(abs_tol=2e-2, rel_tol=2e-2),
     torch.float32: dict(abs_tol=1e-4, rel_tol=1e-4),
+}
+
+# decode 阶段（q_len=1）累加规模远小于 prefill，正确实现的最大绝差实测仅
+# ~1e-3 量级，因此用更严的阈值，避免"用均值/近似糊弄 softmax"之类的取巧实现
+# 蒙混过关。未在此列出的 dtype 回落到 TOLERANCE。
+DECODE_TOLERANCE = {
+    torch.float16: dict(abs_tol=2e-3, rel_tol=2e-3),
+    torch.bfloat16: dict(abs_tol=2e-3, rel_tol=2e-3),
 }
 
 
@@ -305,8 +315,17 @@ class CorrectnessResult:
     error: Optional[str] = None
 
 
-def check_correctness(output: torch.Tensor, baseline_output: torch.Tensor, dtype: torch.dtype) -> CorrectnessResult:
-    tol = TOLERANCE.get(dtype, dict(abs_tol=1e-4, rel_tol=1e-4))
+def check_correctness(
+    output: torch.Tensor,
+    baseline_output: torch.Tensor,
+    dtype: torch.dtype,
+    phase: Optional[str] = None,
+) -> CorrectnessResult:
+    # decode 阶段用更严的容差（见 DECODE_TOLERANCE 说明）；其余阶段用默认 TOLERANCE。
+    if phase == "decode" and dtype in DECODE_TOLERANCE:
+        tol = DECODE_TOLERANCE[dtype]
+    else:
+        tol = TOLERANCE.get(dtype, dict(abs_tol=1e-4, rel_tol=1e-4))
 
     out_f32 = output.float()
     base_f32 = baseline_output.float()
@@ -592,7 +611,7 @@ def main():
                 report = OpReport(name=name)
                 try:
                     output = fn(q, k, v, causal=phase_causal, sm_scale=sm_scale)
-                    report.correctness = check_correctness(output, baseline_output, dtype)
+                    report.correctness = check_correctness(output, baseline_output, dtype, phase)
 
                     if not args.check_only:
                         report.bench = benchmark_fn(

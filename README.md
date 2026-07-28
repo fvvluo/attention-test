@@ -347,21 +347,20 @@ python bench_attention.py --gpu 0 --phases decode
 
 对每个形状会打印一个对比表格，包含：
 
-* **baseline**：固定使用 `flash-attention-baseline` 提供的
-`flash_attn.cute.flash_attn_func`，展示其耗时 / TFLOPS。
-* 每个已注册算子的：
-* 耗时（ms，真实测量）、估算 TFLOPS/GB·s（基于理论 FLOPs/字节数公式，仅供参考）
-* **相对 baseline 的耗时占比**（`vs baseline` 列，`baseline耗时 / 算子耗时 * 100%`，
-基于真实耗时计算，是精确值；数值越大代表比 baseline 越快）
-* 与 baseline 输出的**最大绝对误差**
-* 正确性校验结果（`PASS` / `FAIL`）：
-* fp16 / bf16 容差：绝对误差 ≤ 2e-2 或相对误差 ≤ 2e-2
-
-
-* 如果算子运行时抛异常（比如显存不足、shape 不支持），会标注为“运行失败”，
-不会影响其他算子继续测试。
-
-
+- **baseline**：固定使用 `flash-attention-baseline` 提供的
+  `flash_attn.cute.flash_attn_func`，展示其耗时 / TFLOPS。
+- 每个已注册算子的：
+  - 耗时（ms，真实测量）、估算 TFLOPS/GB·s（基于理论 FLOPs/字节数公式，仅供参考）
+  - **相对 baseline 的耗时占比**（`vs baseline` 列，`baseline耗时 / 算子耗时 * 100%`，
+    基于真实耗时计算，是精确值；数值越大代表比 baseline 越快）
+  - 与 baseline 输出的**最大绝对误差**
+  - 正确性校验结果（`PASS` / `FAIL`），fp16 / bf16 分阶段容差（绝对误差或相对误差满足其一即 PASS）：
+    - **prefill**：绝对误差 ≤ 2e-2 或相对误差 ≤ 2e-2（q_len==kv_len 的长序列
+      求和，bf16 累加误差随序列长度增大，实测正确实现最大绝差可达 ~1.5e-2）
+    - **decode**：绝对误差 ≤ 2e-3 或相对误差 ≤ 2e-3（q_len=1 累加规模小，正确
+      实现最大绝差仅 ~1e-3 量级，用更严阈值防止近似/糊弄 softmax 的实现蒙混过关）
+  - 如果算子运行时抛异常（比如显存不足、shape 不支持），会标注为“运行失败”，
+    不会影响其他算子继续测试。
 
 在非 `--check-only` 模式下，每个 shape 的 prefill/decode 两个阶段都跑完后，
 还会额外打印一行 `[小结]`，对比 baseline 在 prefill（耗时/TFLOPS）和
