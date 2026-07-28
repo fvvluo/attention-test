@@ -14,6 +14,10 @@ _package_path = __path__
 for _, _module_name, _is_pkg in pkgutil.iter_modules(_package_path):
     if _module_name == "base":
         continue
+    if _is_pkg:
+        # 子包（如 quanbofeng_final/）是算子的具体实现，不是注册脚本，
+        # 由对应的注册模块自行相对导入，这里不重复扫描导入。
+        continue
     if _module_name.startswith("_"):
         # 以下划线开头的模块（如 _template.py）视为模板/草稿，不自动导入，
         # 避免团队成员还没写完就被扫描到导致报错。
