@@ -1,11 +1,4 @@
-# ============================================================
-# 算子接入模板 —— 复制这个文件，改名后即可接入 benchmark
-# ============================================================
-#
-# 使用方法（3 步接入）：
-#   1. 复制本文件到同目录下，改名为 <你的名字或算子名>_flash_attention.py
-#      （例如 zhangsan_flash_attention.py），注意文件名不要以 "_" 开头，
-#      否则会被自动扫描忽略（本文件就是因为以 "_" 开头才不会被扫描到）。
+
 #   2. 把下面 TODO 标记的地方替换成你自己的实现。
 #   3. 直接运行 `python bench_attention.py` ，你的算子会被自动发现、
 #      自动与 baseline 做正确性校验 + 性能对比，无需改动任何其他文件。
@@ -48,6 +41,5 @@ def attention(q, k, v, causal=True, sm_scale=None):
     )
 
 
-# TODO: 把下面这个 name 改成能区分你实现方式的唯一名字，
-# 例如 "zhangsan_flash_attention (triton)" / "lisi_flash_attention (cuda)"
-register("TODO_改成你的算子名字", attention)
+
+register("yaojixiu_flashattention(CuTe DSL)", attention)
