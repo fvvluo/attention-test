@@ -13,21 +13,21 @@ import argparse
 from datetime import datetime
 
 # ================= Configuration =================
-# Define exactly where the repo is relative to this script
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-REPO_DIR = os.path.join(SCRIPT_DIR, "attention-test")  # <--- CHANGE THIS IF YOUR REPO FOLDER NAME IS DIFFERENT
+REPO_DIR = SCRIPT_DIR
 
-# Logs and CSV will be saved safely in the parent directory, away from Git operations
-CSV_FILENAME = os.path.join(SCRIPT_DIR, "attention_leaderboard.csv")
-LOG_FILENAME = os.path.join(SCRIPT_DIR, "attn_sentinel.log")
+CSV_FILENAME = os.path.join(os.path.dirname(SCRIPT_DIR), "attention_leaderboard.csv")
+LOG_FILENAME = os.path.join(os.path.dirname(SCRIPT_DIR), "attn_sentinel.log")
 
 POLL_INTERVAL_SECONDS = 60
+
+# Updated path: Assuming bench_attention.py is inside the repo, removed '../'
 BENCH_CMD = (
     "python3 bench_attention.py --gpu {gpu} --shapes 1x64x8x131072x128 "
-    "--dtype bf16 --causal --warmup 10 --iters 10"
+    "--dtype bf16 --causal --prefill-warmup 10 --prefill-iters 10 "
+    "--decode-warmup 100 --decode-iters 100"
 )
 
-# Fallback baselines
 DEFAULT_BASELINE_PREFILL = 3956.011
 DEFAULT_BASELINE_DECODE = 5.358
 # =================================================
@@ -73,10 +73,8 @@ def parse_section(text, section_marker):
             
         if in_table and line.strip():
             parts = line.strip().split()
-            # A valid row has the operator name + 6 trailing metric columns
             if len(parts) >= 7:
                 try:
-                    # The latency is ALWAYS the 6th token from the right
                     latency = float(parts[-6])
                     op_name = " ".join(parts[:-6])
                     latencies[op_name] = latency
@@ -91,13 +89,12 @@ def get_latencies(latencies_dict):
 
 def main():
     parser = argparse.ArgumentParser(description="AttnSentinel Daemon")
-    parser.add_argument("--branch", type=str, help="Specify a single branch to run (e.g., origin/my-branch or my-branch)")
+    parser.add_argument("--branch", type=str, help="Specify a single branch to run")
     parser.add_argument("--gpu", type=str, default="0", help="Specify GPU ID to use (default: 0)")
     args = parser.parse_args()
 
     if not os.path.exists(REPO_DIR):
         print(f"❌ ERROR: Repository directory not found at {REPO_DIR}")
-        print("Please check the REPO_DIR path in the configuration.")
         return
 
     mode_msg = f"targeting specific branch: {args.branch}" if args.branch else "in continuous daemon mode"
@@ -116,11 +113,9 @@ def main():
         now_str = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         print(f"\n[{now_str}] Fetching latest remote branches...")
         
-        # Fetch directly inside REPO_DIR
         run_shell("git fetch --all")
 
         if args.branch:
-            # Ensure branch starts with 'origin/'
             target_branch = args.branch if args.branch.startswith('origin/') else f"origin/{args.branch}"
             branches_output = [target_branch]
         else:
@@ -135,14 +130,12 @@ def main():
             person_name = branch.replace('origin/', '')
             commit_hash = run_shell(f"git rev-parse {branch}").strip()
 
-            # Handle edge case where specified branch doesn't exist remotely
             if "fatal:" in commit_hash.lower():
                 err_msg = f"Could not resolve branch '{branch}'. Ensure the branch exists."
                 print(f"❌ ERROR: {err_msg}")
                 logging.error(err_msg)
                 continue
             
-            # Skip if already benchmarked (unless a specific branch was passed, then we force run)
             already_benchmarked = branch in results and results[branch].get('Commit') == commit_hash
             if already_benchmarked and not args.branch:
                 continue
@@ -153,7 +146,7 @@ def main():
             print(f"🚀 {detect_msg}")
             logging.info(detect_msg)
             
-            # Scorched Earth Git Reset: Ensures total cleanliness before checking out
+            # Scorched Earth Git Reset prevents modified file conflicts from previous loops
             run_shell("git reset --hard")
             run_shell("git clean -fd") 
             
@@ -162,6 +155,15 @@ def main():
             if "error:" in checkout_out.lower() or "fatal:" in checkout_out.lower():
                 logging.error(f"Failed to checkout branch {branch}. Reason:\n{checkout_out}")
                 continue
+
+            # =========================================================================
+            # NEW: Pull authoritative benchmarking & grading files from main
+            # =========================================================================
+            print("   Forcing use of authoritative grade/bench scripts from main...")
+            overwrite_out = run_shell("git checkout main -- bench_attention.py grade_task1.py")
+            if "error:" in overwrite_out.lower() or "fatal:" in overwrite_out.lower():
+                # Note: if the files are in a subfolder like 'tests/', adjust the paths above.
+                logging.error(f"Failed to checkout authoritative files from main. Reason:\n{overwrite_out}")
             
             print(f"   Running benchmark and extracting execution times...")
             bench_output = run_shell(BENCH_CMD.format(gpu=args.gpu))
@@ -169,16 +171,10 @@ def main():
             prefill_lats = parse_section(bench_output, "[PREFILL]")
             decode_lats  = parse_section(bench_output, "[DECODE]")
             
-            # Debug prints to verify the right-to-left parser is working
-            print(f"   [Debug] Parsed Prefill: {prefill_lats}")
-            print(f"   [Debug] Parsed Decode:  {decode_lats}")
-            
             if not prefill_lats and not decode_lats:
                 fail_msg = f"Benchmark failed/crashed on {branch} (Commit: {commit_hash}). Assigning Score = 0."
                 print(f"   [!] {fail_msg} Check log file for traceback.")
-                
                 logging.error(f"{fail_msg}\n--- RAW STDOUT ---\n{bench_output}\n--- END STDOUT ---")
-                
                 score, A, B, c_pref, c_dec = 0.0, 0.0, 0.0, 0.0, 0.0
             else:
                 c_pref, b_pref = get_latencies(prefill_lats), DEFAULT_BASELINE_PREFILL
@@ -188,13 +184,12 @@ def main():
                 B = (b_dec / c_dec) if (c_dec is not None and c_dec > 0) else 0.0
                 score = (A / 2) + (B / 35)
                 
-                # Format for display/logs, avoiding NoneType errors
                 disp_pref = f"{c_pref:.3f}" if c_pref else "FAIL"
                 disp_dec = f"{c_dec:.3f}" if c_dec else "FAIL"
                 
                 success_msg = f"Done! Prefill: {disp_pref} ms | Decode: {disp_dec} ms | Score: {score:.4f}"
                 print(f"   ✅ {success_msg}")
-                logging.info(f"Branch: {branch} | Prefill: {disp_pref} ms (Speedup: {A:.2f}x) | Decode: {disp_dec} ms (Speedup: {B:.2f}x) | Score: {score:.4f}")
+                logging.info(f"Branch: {branch} | Prefill: {disp_pref} ms | Decode: {disp_dec} ms | Score: {score:.4f}")
                 
             results[branch] = {
                 'Branch': branch,
@@ -217,7 +212,6 @@ def main():
                 writer.writeheader()
                 writer.writerows(sorted_rows)
 
-        # Break out of loop if running a single, specific branch
         if args.branch:
             print(f"🎯 Execution complete for specified branch '{target_branch}'. Exiting.")
             break
