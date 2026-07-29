@@ -427,12 +427,14 @@ class FlashAttentionPrefill:
             row_max[r] = new_max
 
     @staticmethod
+    @cute.jit
     def _quad_reduce_max(val):
         val = max(val, cute.arch.shuffle_sync_bfly(val, offset=2, mask=-1, mask_and_clamp=31))
         val = max(val, cute.arch.shuffle_sync_bfly(val, offset=1, mask=-1, mask_and_clamp=31))
         return val
 
     @staticmethod
+    @cute.jit
     def _quad_reduce_sum(val):
         val = val + cute.arch.shuffle_sync_bfly(val, offset=2, mask=-1, mask_and_clamp=31)
         val = val + cute.arch.shuffle_sync_bfly(val, offset=1, mask=-1, mask_and_clamp=31)
