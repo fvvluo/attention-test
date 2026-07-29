@@ -493,7 +493,6 @@ def decode(q, k, v, sm_scale=None, splits=DEF_SPLITS, tile_kv=TILE_KV,
     key = (q.device.index, B, H, HK, S, D, splits, tile_kv, stages, v_stages, workers, float(sm_scale))
     with torch.cuda.device(q.device):
         stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-        o = torch.empty_like(q)
         ent = _CACHE.get(key)
         if ent is None:
             if workers is None:
@@ -503,14 +502,16 @@ def decode(q, k, v, sm_scale=None, splits=DEF_SPLITS, tile_kv=TILE_KV,
                                    stages=stages, workers=workers, sm_scale=sm_scale)
             opart = torch.empty((splits, HK, GROUP, D, B), dtype=torch.bfloat16, device=q.device)
             lse = torch.empty((splits, HK, GROUP, B), dtype=torch.float32, device=q.device)
+            o = torch.empty_like(q)
             opart_view = from_dlpack(opart, assumed_align=16)
             lse_view = from_dlpack(lse, assumed_align=16)
+            output_view = _cute4d(o)
             args = (_cute4d(q), _cute4d(k), _cute4d(v),
-                    opart_view, lse_view, _cute4d(o), stream)
+                    opart_view, lse_view, output_view, stream)
             comp = cute.compile(ker, *args)
-            ent = (comp, opart, lse, opart_view, lse_view)
+            ent = (comp, opart, lse, o, opart_view, lse_view, output_view)
             _CACHE[key] = ent
-        comp, opart, lse, opart_view, lse_view = ent
+        comp, opart, lse, o, opart_view, lse_view, output_view = ent
         comp(_cute4d(q), _cute4d(k), _cute4d(v),
-             opart_view, lse_view, _cute4d(o), stream)
+             opart_view, lse_view, output_view, stream)
     return o
