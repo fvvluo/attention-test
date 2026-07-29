@@ -414,3 +414,5 @@ python3 -c "import bench_attention; _, name = bench_attention.get_baseline_fn();
 指定各自的 GPU 卡号再运行（见上方"多人共享 GPU 机器时必读"），避免抢卡
 导致结果不可信或 OOM。
 <!-- regrade trigger: 20260729-100946 -->
+
+<!-- regrade 20260729-102723 -->
