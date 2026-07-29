@@ -418,14 +418,39 @@ def _decode_fast_build(q, k, v, o, qk_scale, causal, splits, key):
 _DECODE_TUNE = {}
 
 
+def _graph_time(fn, warmup=3, iters=20):
+    """纯 GPU 时间（CUDA graph 重放，毫秒）。
+
+    splits 候选的 kernel 只有几十 us，do_bench 会把 ~12us 的 JIT 启动开销
+    计入每次测量，淹没候选间差异（曾在 kv=8192 误选 sp=20，实测 sp=8 快
+    ~12%）。重放消除了 launch/Python 开销，候选只需很少迭代即可分辨。
+    前置的 warmup 调用会触发 kernel 编译，capture 的是纯 kernel 执行。"""
+    for _ in range(warmup):
+        fn()
+    torch.cuda.synchronize()
+    s = torch.cuda.Stream()
+    s.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(s):
+        fn()
+    torch.cuda.current_stream().wait_stream(s)
+    g = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(g):
+        fn()
+    torch.cuda.synchronize()
+    t0 = time.perf_counter()
+    for _ in range(iters):
+        g.replay()
+    torch.cuda.synchronize()
+    return (time.perf_counter() - t0) / iters * 1e3
+
+
 def _tune_decode_splits(q, k, v, o, qk_scale, causal, key):
     """splits 是 host 侧 grid 参数，triton.autotune 覆盖不到；实测少量候选
     并缓存最优值，语义与 autotune 相同：每个形状只在首次调用时调一次。
 
-    候选为目标总 program 数 ~= {1, 1.5, 2, 2.7, 4} x SM 数 的 splits
-    （每个工作项一个 program 的结构下，波次整数倍附近通常最优）。
-    splits 越大 partial 暂存读写流量越大（带宽受限场景的额外开销），
-    因此也覆盖较小的 1x 候选。
+    候选为目标总 program 数 ~= {0.75, 1, 1.5, 2, 2.7, 4} x SM 数 的 splits
+    （每个工作项一个 program 的结构下，单波次到少数波次通常最优；
+    splits 越大 partial 暂存读写流量越大，带宽受限场景的额外开销）。
     """
     b, h, _, _ = q.shape
     _, h_kv, n_kv, _ = k.shape
@@ -433,12 +458,15 @@ def _tune_decode_splits(q, k, v, o, qk_scale, causal, key):
     cap = min(triton.cdiv(n_kv, 256), 64)
     n_sm = torch.cuda.get_device_properties(q.device).multi_processor_count
     cands = sorted({min(max(triton.cdiv(int(f * n_sm), BHK), 1), cap)
-                    for f in (1.0, 1.5, 2.0, 2.7, 4.0)})
+                    for f in (0.75, 1.0, 1.5, 2.0, 2.7, 4.0)})
     best_t, best_s = float("inf"), cands[0]
     for sp in cands:
-        t = triton.testing.do_bench(
-            lambda: _decode_run(q, k, v, o, qk_scale, causal, sp),
-            warmup=3, rep=20)
+        fn = lambda: _decode_run(q, k, v, o, qk_scale, causal, sp)
+        try:
+            t = _graph_time(fn)
+        except Exception:
+            # graph capture 不可用的环境（如 MPS/调试器）回退 do_bench
+            t = triton.testing.do_bench(fn, warmup=3, rep=20)
         if t < best_t:
             best_t, best_s = t, sp
     if len(_DECODE_TUNE) > 64:
