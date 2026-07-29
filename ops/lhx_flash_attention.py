@@ -59,6 +59,12 @@ from quack import layout_utils
 from quack import sm90_utils
 from quack.cute_dsl_utils import ParamsBase
 
+from decode_split_config import (
+    DECODE_QHEADS_PER_CTA,
+    DECODE_TILE_N,
+    compute_decode_split_config,
+    format_decode_split_config,
+)
 from .lhx_cute.cute_dsl_utils import assume_tensor_aligned, to_cute_tensor
 from .lhx_cute import utils
 from .lhx_cute.mask import AttentionMask
@@ -949,8 +955,8 @@ class FlashAttentionForwardSm90(FlashAttentionForwardBase):
 class GqaDecodeSm90:
     """Split-KV decode; generic shapes use the same target-optimized mapping."""
 
-    tile_n = 64
-    qheads_per_cta = 8
+    tile_n = DECODE_TILE_N
+    qheads_per_cta = DECODE_QHEADS_PER_CTA
     head_dim = 128
     num_threads = 128
     num_worker_warps = 4
@@ -985,6 +991,12 @@ class GqaDecodeSm90:
         self.full_q_group = self.qheads_per_kvhead % self.qheads_per_cta == 0
         self.num_blocks = (kv_len + self.tile_n - 1) // self.tile_n
         self.num_splits = num_splits
+        expected_blocks_per_split = (self.num_blocks + num_splits - 1) // num_splits
+        if blocks_per_split != expected_blocks_per_split:
+            raise ValueError(
+                "blocks_per_split must equal ceil(num_blocks / num_splits)"
+            )
+        # Kept in the constructor/cache contract; split scheduling uses base + remainder.
         self.blocks_per_split = blocks_per_split
         self.base_blocks_per_split = self.num_blocks // num_splits
         self.long_splits = self.num_blocks % num_splits
@@ -1083,7 +1095,7 @@ class GqaDecodeSm90:
             grid=(self.num_splits, self.kv_heads * self.q_groups, self.batch_size),
             block=[self.num_threads, 1, 1],
             stream=stream,
-            min_blocks_per_mp=1,
+            min_blocks_per_mp=2,
         )
         self.reduce_kernel(mPartialO, mPartialLSE, mO).launch(
             grid=(self.q_heads, self.batch_size, 1),
@@ -1213,8 +1225,8 @@ class GqaDecodeSm90:
             cKV = cute.make_identity_tensor((self.tile_n, self.head_dim))
             tKVcKV = gmem_thr_copy.partition_S(cKV)
 
-        # Balance non-divisible block counts across splits; the runtime loop below
-        # handles the 52/53 tiles without cloning its MMA body.
+        # Balance non-divisible block counts across splits; the runtime loop handles
+        # the one-tile difference without cloning its MMA body.
         split_count = self.base_blocks_per_split
         if split_idx < self.long_splits:
             split_count += 1
@@ -1636,20 +1648,31 @@ def _run_attention_sm90(q, k, v, causal=True, sm_scale=None):
     return o_t.transpose(1, 2)
 
 
-def _decode_split_config(batch, q_heads, kv_heads, kv_len, device):
-    """Fill one resident wave at three four-warp CTAs per SM."""
-    num_blocks = (kv_len + GqaDecodeSm90.tile_n - 1) // GqaDecodeSm90.tile_n
-    q_ratio = q_heads // kv_heads
-    q_groups = (q_ratio + GqaDecodeSm90.qheads_per_cta - 1) // GqaDecodeSm90.qheads_per_cta
-    base_ctas = batch * kv_heads * q_groups
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    resident_ctas = sm_count * 3
-    # Round down to avoid crossing into a sparsely populated second wave.
-    num_splits = max(1, min(num_blocks, resident_ctas // base_ctas))
-    return num_splits, (num_blocks + num_splits - 1) // num_splits
+def _decode_split_config(
+    batch, q_heads, kv_heads, kv_len, device, num_splits: Optional[int] = None
+):
+    """Target at most one resident wave at two four-warp CTAs per SM."""
+    num_sms = torch.cuda.get_device_properties(device).multi_processor_count
+    return compute_decode_split_config(
+        batch_size=batch,
+        q_heads=q_heads,
+        kv_heads=kv_heads,
+        kv_len=kv_len,
+        num_sms=num_sms,
+        num_splits=num_splits,
+        tile_n=GqaDecodeSm90.tile_n,
+        qheads_per_cta=GqaDecodeSm90.qheads_per_cta,
+    )
 
 
-def _run_decode_sm90(q, k, v, sm_scale=None):
+def _run_decode_sm90(
+    q,
+    k,
+    v,
+    sm_scale=None,
+    num_splits: Optional[int] = None,
+    debug_config: bool = False,
+):
     """Run the JIT-specialized split-KV GQA decode kernel."""
     batch, q_heads, q_len, head_dim = q.shape
     kv_heads, kv_len = k.shape[1], k.shape[2]
@@ -1666,9 +1689,18 @@ def _run_decode_sm90(q, k, v, sm_scale=None):
     if sm_scale is None:
         sm_scale = 1.0 / math.sqrt(head_dim)
 
-    num_splits, blocks_per_split = _decode_split_config(
-        batch, q_heads, kv_heads, kv_len, q.device
+    split_config = _decode_split_config(
+        batch,
+        q_heads,
+        kv_heads,
+        kv_len,
+        q.device,
+        num_splits=num_splits,
     )
+    if debug_config:
+        print(format_decode_split_config(split_config))
+    resolved_num_splits = split_config.num_splits
+    blocks_per_split = split_config.blocks_per_split
     q_t = q.transpose(1, 2)
     k_t = k.transpose(1, 2)
     v_t = v.transpose(1, 2)
@@ -1677,12 +1709,12 @@ def _run_decode_sm90(q, k, v, sm_scale=None):
     v_t = v_t if v_t.stride(-1) == 1 else v_t.contiguous()
 
     partial_o = torch.empty(
-        (batch, num_splits, q_heads, head_dim),
+        (batch, resolved_num_splits, q_heads, head_dim),
         dtype=torch.float32,
         device=q.device,
     )
     partial_lse = torch.empty(
-        (batch, num_splits, q_heads),
+        (batch, resolved_num_splits, q_heads),
         dtype=torch.float32,
         device=q.device,
     )
@@ -1696,7 +1728,7 @@ def _run_decode_sm90(q, k, v, sm_scale=None):
         q_heads,
         kv_heads,
         kv_len,
-        num_splits,
+        resolved_num_splits,
         blocks_per_split,
         q_t.stride(),
         k_t.stride(),
@@ -1710,7 +1742,7 @@ def _run_decode_sm90(q, k, v, sm_scale=None):
             q_heads,
             kv_heads,
             kv_len,
-            num_splits,
+            resolved_num_splits,
             blocks_per_split,
         )
         compiled = cute.compile(
@@ -1736,11 +1768,28 @@ def prefill_attention(q, k, v, causal=True, sm_scale=None):
     return _run_attention_sm90(q, k, v, causal=causal, sm_scale=sm_scale)
 
 
-def decode_attention(q, k, v, causal=False, sm_scale=None):
+def decode_attention(
+    q,
+    k,
+    v,
+    causal=False,
+    sm_scale=None,
+    num_splits: Optional[int] = None,
+    debug_config: bool = False,
+):
     """Decode 入口；所有支持的 non-causal q_len=1 shape 使用新 kernel。"""
     if bool(causal):
+        if num_splits is not None:
+            raise ValueError("num_splits override only applies to non-causal decode")
         return _run_attention_sm90(q, k, v, causal=True, sm_scale=sm_scale)
-    return _run_decode_sm90(q, k, v, sm_scale=sm_scale)
+    return _run_decode_sm90(
+        q,
+        k,
+        v,
+        sm_scale=sm_scale,
+        num_splits=num_splits,
+        debug_config=debug_config,
+    )
 
 
 def attention(q, k, v, causal=True, sm_scale=None):
