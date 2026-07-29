@@ -52,6 +52,7 @@ def _prefill_configs():
     """prefill kernel 的 autotune 候选（共享显存超限的配置会被自动跳过）。"""
     cfgs = []
     for BR, BC, w, s in [(128, 64, 4, 2), (128, 64, 4, 3), (128, 64, 8, 2),
+                         (128, 64, 8, 3), (128, 128, 4, 2),
                          (128, 128, 8, 2), (128, 128, 8, 3),
                          (64, 64, 4, 2), (64, 64, 4, 4),
                          (64, 128, 4, 2), (64, 128, 4, 3),
@@ -63,8 +64,9 @@ def _prefill_configs():
 def _decode_configs():
     """decode fused kernel 的 autotune 候选（共享显存超限的会被自动跳过）。"""
     cfgs = []
-    for BC, w, s in [(64, 4, 2), (64, 4, 4), (128, 4, 2), (128, 4, 3),
-                     (128, 4, 4), (128, 8, 3), (256, 4, 2), (256, 8, 2)]:
+    for BC, w, s in [(64, 4, 2), (64, 4, 3), (64, 4, 4), (64, 8, 3),
+                     (128, 4, 2), (128, 4, 3), (128, 4, 4), (128, 8, 2), (128, 8, 3),
+                     (256, 4, 2), (256, 8, 2), (256, 8, 3)]:
         cfgs.append(triton.Config({'BC': BC}, num_warps=w, num_stages=s))
     return cfgs
 
@@ -273,6 +275,9 @@ def _decode_fused_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
         l_g = tl.sum(l_all * w_all, axis=0)
 
         o_g = tl.zeros([M_PAD, D], dtype=q.dtype)
+        # 注意：曾尝试按 CS 个 split 一组做 3D 向量 load 加速 merge（D1 优化），
+        # 实测 128K kv 下因寄存器占用膨胀、拉低 occupancy 反而慢 ~8%（2683 ->
+        # 2912 GB/s @sp=39），已回退为逐个 split 串行 load。
         for sid in range(splits):
             pid2 = bhk * splits + sid
             m_s = tl.load(mp_ptr + pid2 * GNQ + rows, mask=valid,
@@ -385,15 +390,18 @@ def _tune_decode_splits(q, k, v, o, qk_scale, causal, key):
     """splits 是 host 侧 grid 参数，triton.autotune 覆盖不到；实测少量候选
     并缓存最优值，语义与 autotune 相同：每个形状只在首次调用时调一次。
 
-    候选为目标总 program 数 ~= {1.5, 2, 2.7, 4} x SM 数 的 splits
+    候选为目标总 program 数 ~= {1, 1.5, 2, 2.7, 4} x SM 数 的 splits
     （每个工作项一个 program 的结构下，波次整数倍附近通常最优）。
+    splits 越大 partial 暂存读写流量越大（带宽受限场景的额外开销），
+    因此也覆盖较小的 1x 候选。
     """
     b, h, _, _ = q.shape
     _, h_kv, n_kv, _ = k.shape
     BHK = b * h_kv
     cap = min(triton.cdiv(n_kv, 256), 64)
-    cands = sorted({min(max(triton.cdiv(int(f * 78), BHK), 1), cap)
-                    for f in (1.5, 2.0, 2.7, 4.0)})
+    n_sm = torch.cuda.get_device_properties(q.device).multi_processor_count
+    cands = sorted({min(max(triton.cdiv(int(f * n_sm), BHK), 1), cap)
+                    for f in (1.0, 1.5, 2.0, 2.7, 4.0)})
     best_t, best_s = float("inf"), cands[0]
     for sp in cands:
         t = triton.testing.do_bench(
