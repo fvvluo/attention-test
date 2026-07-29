@@ -1,977 +1,832 @@
 
-#   2. 把下面 TODO 标记的地方替换成你自己的实现。
-#   3. 直接运行 `python bench_attention.py` ，你的算子会被自动发现、
-#      自动与 baseline 做正确性校验 + 性能对比，无需改动任何其他文件。
-#
-# 接入 TODO 清单：
-#   [ ] 1. 把函数体替换成你自己的 attention 实现（可以是 Triton / CUDA / CuTe DSL 等）
-#   [ ] 2. 确认函数签名保持 (q, k, v, causal=True, sm_scale=None) -> output
-#   [ ] 3. 确认输出 shape 与 q 相同: (batch, heads, seq_len, head_dim)
-#   [ ] 4. 把最后一行 register() 的 name 改成能区分你实现方式的唯一名字
-#   [ ] 5. 先跑 `python bench_attention.py --check-only` 验证正确性 PASS
-#   [ ] 6. 再跑 `python bench_attention.py` 看性能对比（耗时 / TFLOPS）
-#
-# 可以参考同目录下 _example_flash_attention.py（纯 PyTorch online-softmax 实现，
-# 仅供参考，文件名以 "_" 开头不会被自动扫描注册），里面有完整的分块 + online softmax 算法示例。
+
+import math
+from typing import Type
 
 import torch
+import cutlass
+import cutlass.cute as cute
+from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.nvgpu import cpasync, warp
+import cutlass.utils as utils
 
 from .base import register
 
-from cutlass import cute
-import math
-
-# ============================================================================
-# 目标形状最优配置:
-#   q :  (1, 64, 131072, 128)   -> batch=1, q_heads=64, seq_len=131072, head_dim=128
-#   k/v: (1,  8, 131072, 128)   -> batch=1, kv_heads=8, seq_len=131072, head_dim=128
-#
-# 路由: seq_len_q(131072) >= BLOCK_M -> prefill_kernel (计算受限, causal)
-#       seq_len_q==1(自回归生成)         -> decode_kernel  (KV 带宽受限, seq_len_kv=131072)
-#       group_size = q_heads/kv_heads = 64/8 = 8 (GQA, 每8个q head共享1个kv head)
-#       head_dim=128 == HEAD_DIM, 无需改动
-#
-# 性能要点:
-#   prefill: 1024 个 KV 块的内循环, 需足够深的流水线隐藏 TMA 延迟 -> STAGES=3
-#            (通过 O 复用 Q 的共享内存区释放 32KB, 使 STAGES=3 也能落进 228KB)
-#   decode : 单 query 对 131072 长度 KV 做 reduction, 属带宽/延迟受限,
-#            必须把 KV 切成足够多的分片并行 (原固定 4 分片严重欠并行) -> 自适应分片
-# ============================================================================
-
-# 一个 CTA 内 8 个 warp (2 个 warpgroup):
-#   MMA-M 方向 8*16 = 128 = BLOCK_M, 一次 MMA 即覆盖整块 M, 消除多趟 M 迭代,
-#   拉满 Tensor Core 利用率 (长序列 causal 场景为计算受限, 这是主要收益点)。
-WARPS_PER_CTA=8
-
-# 大 tile 保持 128x128: 长序列下算术强度高, 大 tile 最大化 MMA 效率;
-# 128 也与 HEAD_DIM / WARPS_PER_CTA*16 对齐, 无边角浪费。
-BLOCK_M=128
-BLOCK_N=128
-HEAD_DIM=128
-INV_SQRT_D=1.0/math.sqrt(float(HEAD_DIM))
-
-# 共享内存预算 (SM100, fp16, 单 CTA 上限约 228KB):
-#   单个 K/V tile = BLOCK_N*HEAD_DIM*2B = 32KB
-#   O 只在收尾写出, Q 在循环前就已读入寄存器 rQ, 二者生命周期不重叠,
-#   因此让 O 复用 Q 的共享内存区 (见 prefill_kernel), 省下 32KB:
-#     Q/O(32) + K(STAGES*32) + V(STAGES*32)
-#     STAGES=3 -> 32 + 96 + 96 = 224KB <= 228KB (放得下, 且流水线更深)。
-#   3 级流水 (2 个在途预取) 能更好地隐藏 1024 次 KV 加载的 TMA 延迟。
-PIPELINE_STAGES=3
-
-# decode 每个 KV 分片(CTA)的块大小; 128 块 = 一次 TMA 载入的 KV 行数。
-DECODE_BLOCK_KV=128
-# decode 的 KV 分割上限: 单条 query 面对 131072(=1024块) KV 时, 固定 4 分片会让
-# 每个 CTA 串行处理 256 块, 临界路径极长。提高到 64 分片 -> 每 CTA 仅 16 块,
-# 大幅缩短 decode 延迟; reduce 阶段只需合并 64 个部分结果, 开销可忽略。
-DECODE_MAX_SPLITS = 64
-# 兼容旧引用: 短 KV 时的最小分片数下限。
-DECODE_CTAS_PER_KV_DEFAULT = 4
-NEG_INF=-float('inf')
-ZERO=0.0
+try:
+    import cuda.bindings.driver as cuda
+    _HAS_CUDA_PY = True
+except Exception:  # pragma: no cover
+    _HAS_CUDA_PY = False
 
 
-def _scale_fragment(frag, scalar):
-    cute.for_each(frag, lambda v: v * scalar)
-# fr=fr*sc缩放
-
-def _apply_exp(frag):
-    cute.for_each(frag, lambda v: math.exp(v))
-# fr=exp(fr)
-
-def _fill_value(frag, value):
-    cute.fill(frag, value)
+LOG2_E = 1.4426950408889634074
+_DECODE_QLEN_THRESHOLD = 16
+_COMPILE_CACHE = {}
 
 
-def elem_max(a, b):
-    result=cute.make_fragment_like(a, dtype=cute.float32)
-    if cute.size(b) != cute.size(a):
-        cute.for_each(result,
-                      lambda v_new, va, vb: max(va, vb),
-                      a, cute.broadcast(b, a.shape()))
-    else:
-        cute.for_each(result,
-                      lambda v_new, va, vb: max(va, vb),
-                      a, b)
-    return result
-# 逐个max，返回新fr
-
-def elem_sub_inplace(a, b):
-    if cute.size(b) != cute.size(a):
-        cute.for_each(a,
-                      lambda va, vb: va - vb,
-                      cute.broadcast(b, a.shape()))
-    else:
-        cute.for_each(a,
-                      lambda va, vb: va - vb,
-                      b)
-# 逐个a-
-
-def elem_mul(a, b):
-    result = cute.make_fragment_like(a, dtype=cute.float32)
-    cute.for_each(result, lambda v_new, va, vb: va * vb, a, b)
-    return result
-
-def elem_mul_add(a, b, c):
-    result=cute.make_fragment_like(a, dtype=cute.float32)
-    cute.for_each(result,
-    lambda v_new, va, vb, vc: va * vb + vc,
-        a, b, c
-    )
-    return result
-# 逐个a*b+c,返回新fr
-
-def elem_div_inplace(a, b):
-    cute.for_each(a, lambda va, vb: va / vb, b)
+class FlashAttentionPrefill:
 
 
-def sub_broadcast_inplace(a, b):
-    cute.for_each(a,
-                  lambda va, vb: va - vb,
-                   cute.broadcast(b, a.shape()))
-# 每个a减标量b，返回新fr
+    def __init__(
+        self,
+        head_dim: int,
+        m_block_size: int = 128,
+        n_block_size: int = 128,
+        num_threads: int = 128,
+        is_causal: bool = True,
+    ):
+        self._head_dim = head_dim
 
-def div_broadcast(a, b):
-    cute.for_each(a,
-                  lambda va, vb: va / vb,
-                  cute.broadcast(b, a.shape()))
-# 每个/标量b
+        self._m_block_size = m_block_size
+        self._n_block_size = n_block_size
+        self._num_threads = num_threads
+        self._is_causal = is_causal
 
-def mul_broadcast(a, b):
-    cute.for_each(a,
-                  lambda va, vb: va * vb,
-                  cute.broadcast(b, a.shape()))
-# 每个*b
+    # ------------------------------------------------------------------ #
+    # host 端：布局/copy atom/MMA 设置 + launch
+    # ------------------------------------------------------------------ #
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,      # [B, H,    S, D]
+        mK: cute.Tensor,      # [B, H_kv, S, D]
+        mV: cute.Tensor,      # [B, H_kv, S, D]
+        mO: cute.Tensor,      # [B, H,    S, D]
+        softmax_scale: cutlass.Float32,
+        stream,
+    ):
+        self._dtype: Type[cutlass.Numeric] = mQ.element_type
 
-def _copy_fragment(dst, src):
-    cute.copy_n(src, dst)
-# copy src->dst
-
-def _to_f16(frag_f32):
-    # 将 fp32 fragment 转成 fp16（第二个 GEMM 的 A 操作数需要 fp16）
-    frag_f16 = cute.make_fragment_like(frag_f32, dtype=cute.float16)
-    cute.copy_n(frag_f32, frag_f16)
-    return frag_f16
-
-
-def _make_row_fragment(tiled_mma, init):
-    # m/l 是“每行一个标量”，其形状应与 C 累加器沿列(E<1>)归约后的行向量一致，
-    # 从而与 MMA 对行的线程划分匹配（而不是整块 [M, N]）。
-    c_frag = tiled_mma.make_fragment_C()
-    cute.fill(c_frag, 0.0)
-    row_like = cute.reduce(cute.maximum{}, c_frag, cute.E<1>{})
-    return cute.make_fragment_like(row_like, dtype=cute.float32, init=init)
-
-
-def _apply_causal_mask(rS, q_block_idx, kv_block_idx,
-                       block_m=BLOCK_M, block_n=BLOCK_N):
-    # 对角块的逐元素 causal 掩码：全局 key 位置 > 全局 query 位置的元素置 -inf。
-    q_base = q_block_idx * block_m
-    k_base = kv_block_idx * block_n
-    # 块级快速判断：整块都落在下三角内（含对角）则无需逐元素掩码。
-    if k_base + block_n - 1 <= q_base:
-        return
-    crd = cute.make_identity_tensor(cute.Shape[block_m, block_n])
-    cute.for_each(
-        rS,
-        lambda s, coord: NEG_INF
-        if (k_base + cute.get(coord, 1)) > (q_base + cute.get(coord, 0))
-        else s,
-        crd
-    )
-
-
-def _flash_update_step(rS, reg_m, reg_l, reg_o):
-# m_new = max(reg_m, rowmax(rS))
-# P = exp(rS - m_new)
-# l_new = exp(reg_m - m_new) * reg_l + rowsum(P)
-# reg_o = exp(reg_m - m_new) * reg_o
-# 返回 (m_new, l_new,P)
-    rS_max = cute.reduce(cute.maximum{}, rS, cute.E<1>{})
-    rM_new = elem_max(reg_m, rS_max)
-    elem_sub_inplace(reg_m,rM_new)
-    _apply_exp(reg_m)
-    sub_broadcast_inplace(rS, rM_new)
-    _apply_exp(rS)
-    rL_local = cute.reduce(cute.plus{}, rS, cute.E<1>{})
-    reg_l_new = elem_mul_add(reg_m, reg_l, rL_local)
-    mul_broadcast(reg_o, reg_m)
-    _copy_fragment(reg_m, rM_new)
-    _copy_fragment(reg_l, reg_l_new)
-    return rS
-
-
-
-def _consume_kv_tile(k_pipe, v_pipe, smem_K, smem_V,
-                    tiled_mma, rQ, copy_s2r_K, copy_s2r_V,
-                    reg_m, reg_l, reg_o,
-                    rK_work,rV_work,rS_work,
-                    causal=False, q_block_idx=0, kv_block_idx=0,
-                    sm_scale=INV_SQRT_D):
-# 一个KVtile
-    k_pipe.consumer_wait()
-    k_stage = k_pipe.consumer_acquire()
-    v_pipe.consumer_wait()
-    v_stage = v_pipe.consumer_acquire()
-
-    cute.copy(copy_s2r_K, smem_K(k_stage), rK_work)
-    cute.copy(copy_s2r_V, smem_V(v_stage), rV_work)
-
-    cute.fill(rS_work, 0.0)
-    cute.gemm(tiled_mma, rQ, rK_work, rS_work)
-    _scale_fragment(rS_work, sm_scale)
-
-    if causal:
-        _apply_causal_mask(rS_work, q_block_idx, kv_block_idx)
-
-    rP = _flash_update_step(rS_work, reg_m, reg_l, reg_o)
-
-    # P 是 fp32 累加器，MMA 需要 fp16 的 A 操作数
-    rP_f16 = _to_f16(rP)
-    cute.gemm(tiled_mma, rP_f16, rV_work, reg_o)
-
-    k_pipe.consumer_release(k_stage)
-    v_pipe.consumer_release(v_stage)
-
-def _build_prefill_config():
-    mma_atom=cute.MMA_Atom[
-        cute.SM100,
-        cute.F16F16F16F32_TN,
-        16,16,32
-    ]
-    tiled_mma=cute.make_tiled_mma(
-        mma_atom,
-        cute.make_layout(cute.Shape[cute.Int<WARPS_PER_CTA>, 1, 1]),
-        cute.make_layout(cute.Shape[1, 1, 1])
-    )
-    gQ_shape=cute.Shape[BLOCK_M,HEAD_DIM]
-    sQ_layout=cute.make_layout(gQ_shape,swizzle=cute.swizzle.B_128)
-    gK_shape=cute.Shape[BLOCK_N,HEAD_DIM]
-    sK_layout=cute.make_layout(gK_shape,swizzle=cute.swizzle.B_128)
-    gV_shape=cute.Shape[BLOCK_N,HEAD_DIM]
-    sV_layout=cute.make_layout(gV_shape,swizzle=cute.swizzle.B_128)
-    gO_shape=cute.Shape[BLOCK_M,HEAD_DIM]
-    sO_layout=cute.make_layout(gO_shape,swizzle=cute.swizzle.B_128)
-
-    copy_g2s_Q=cute.make_tiled_copy(
-        cute.Copy_Atom[cute.TMA,cute.F16],
-        cute.make_layout(gQ_shape),
-        sQ_layout
-    )
-    copy_g2s_K=cute.make_tiled_copy(
-        cute.Copy_Atom[cute.TMA,cute.F16],
-        cute.make_layout(gK_shape),
-        sK_layout
-    )
-    copy_g2s_V=cute.make_tiled_copy(
-        cute.Copy_Atom[cute.TMA,cute.F16],
-        cute.make_layout(gV_shape),
-        sV_layout
-    )
-    copy_s2r_Q=cute.make_tiled_copy(
-        cute.Copy_Atom[cute.SM90,cute.F16,cute.F16],
-        sQ_layout,
-        tiled_mma.get_layout_A()
-    )
-    copy_s2r_K=cute.make_tiled_copy(
-        cute.Copy_Atom[cute.SM90,cute.F16,cute.F16],
-        sK_layout,
-        tiled_mma.get_layout_B()
-    )
-    copy_s2r_V=cute.make_tiled_copy(
-        cute.Copy_Atom[cute.SM90,cute.F16,cute.F16],
-        sV_layout,
-        tiled_mma.get_layout_B()
-    )
-    copy_r2s_O=cute.make_tiled_copy(
-        cute.Copy_Atom[cute.SM90,cute.F16,cute.F32],
-        sO_layout,
-        tiled_mma.get_layout_C()
-    )
-    copy_s2g_O=cute.make_tiled_copy(
-        cute.Copy_Atom[cute.TMA,cute.F16],
-        cute.make_layout(gO_shape),
-        sO_layout
-    )
-    pred_Q=cute.make_predicate(gQ_shape)
-    pred_K=cute.make_predicate(gK_shape)
-    pred_V=cute.make_predicate(gV_shape)
-    pred_O=cute.make_predicate(gO_shape)
-
-    return (tiled_mma,
-            gQ_shape, sQ_layout, gK_shape, sK_layout,
-            gV_shape, sV_layout, gO_shape, sO_layout,
-            copy_g2s_Q, copy_g2s_K, copy_g2s_V,
-            copy_s2r_Q, copy_s2r_K, copy_s2r_V,
-            copy_r2s_O, copy_s2g_O,
-            pred_Q, pred_K, pred_V, pred_O)
-
-
-def prefill_kernel(Q_gmem,K_gmem,V_gmem,O_gmem,L_gmem,M_gmem,causal:bool=False,
-                   sm_scale=INV_SQRT_D):
-    (tiled_mma,
-     gQ_shape, sQ_layout, gK_shape, sK_layout,
-     gV_shape, sV_layout, gO_shape, sO_layout,
-     copy_g2s_Q, copy_g2s_K, copy_g2s_V,
-     copy_s2r_Q, copy_s2r_K, copy_s2r_V,
-     copy_r2s_O, copy_s2g_O,
-     pred_Q, pred_K, pred_V, pred_O) = _build_prefill_config()
-
-    cta_coord=cute.blockIdx(cute.Int<0>{})
-    grid_size=cute.gridDim(cute.Int<0>{})
-
-    smem_base=cute.smem_ptr()
-    smem_Q = cute.make_tensor(smem_base, sQ_layout)
-
-    smem_K_offset=cute.round_up(cute.cosize(sQ_layout),128)
-    smem_K_2stage = cute.make_layout(
-        cute.Shape[cute.Int<PIPELINE_STAGES>{}, cute.Shape[BLOCK_N, HEAD_DIM]],
-        swizzle=cute.swizzle.B_128
-    )
-    smem_K = cute.make_tensor(smem_base+smem_K_offset,smem_K_2stage)
-
-    smem_V_offset=cute.round_up(smem_K_offset+cute.cosize(smem_K_2stage),128)
-    smem_V_2stage = cute.make_layout(
-        cute.Shape[cute.Int<PIPELINE_STAGES>{}, cute.Shape[BLOCK_N, HEAD_DIM]],
-        swizzle=cute.swizzle.B_128
-    )
-    smem_V = cute.make_tensor(smem_base+smem_V_offset,smem_V_2stage)
-
-    # O 复用 Q 的共享内存区: Q 在 KV 循环前已读入寄存器 rQ, 之后其 smem 不再被使用;
-    # O 只在收尾阶段写出。二者生命周期不重叠, 复用可省 32KB, 从而支持 STAGES=3。
-    smem_O = cute.make_tensor(smem_base, sO_layout)
-
-    num_q_blocks = int(cute.size(Q_gmem, 0)) // BLOCK_M
-    num_kv_blocks = int(cute.size(K_gmem, 0)) // BLOCK_N
-
-    work_rK = cute.make_fragment_like(tiled_mma.make_fragment_B(),
-                                      dtype=cute.float16)
-    work_rV = cute.make_fragment_like(tiled_mma.make_fragment_B(),
-                                      dtype=cute.float16)
-    work_rS = cute.make_fragment_like(tiled_mma.make_fragment_C(),
-                                      dtype=cute.float32)
-
-
-    for q_block_idx in range(int(cta_coord),
-        num_q_blocks, grid_size):
-
-        tgQ=cute.local_tile(
-            Q_gmem,
-            cute.Shape[BLOCK_M,HEAD_DIM],
-            cute.make_coord(q_block_idx)
+        # ---- 共享内存 swizzled 布局 (Q/K/V/O) ----
+        smem_k_block = 64 if self._head_dim_padded % 64 == 0 else 32
+        swizzle_bits = 3 if smem_k_block == 64 else 2
+        sQ_layout_atom = cute.make_composed_layout(
+            cute.make_swizzle(swizzle_bits, 3, 3),
+            0,
+            cute.make_layout((8, smem_k_block), stride=(smem_k_block, 1)),
         )
-        # m/l 是每行一个标量（行向量），o 才是整块 [BLOCK_M, HEAD_DIM]
-        reg_m=_make_row_fragment(tiled_mma, NEG_INF)
-        reg_l=_make_row_fragment(tiled_mma, ZERO)
-        reg_o=cute.make_fragment_like(tiled_mma.make_fragment_C(),
-        dtype=cute.float32,init=ZERO)
+        sQ_layout = cute.tile_to_shape(
+            sQ_layout_atom, (self._m_block_size, self._head_dim_padded), (0, 1))
+        sKV_layout = cute.tile_to_shape(
+            sQ_layout_atom, (self._n_block_size, self._head_dim_padded), (0, 1))
+        sO_layout = sQ_layout
 
-        # O 与 Q 复用同一 smem 区: 覆盖 Q 之前必须等待上一轮 O 的 TMA store 读完该区域,
-        # 否则新 Q 会覆盖尚未存完的 O (WAR 冒险)。首轮无在途 store, 该等待为空操作。
-        cute.tma_store_wait()
-        cute.synchronize()
+        # ---- gmem copy atoms ----
+        copy_bits = 128
+        async_elems = copy_bits // self._dtype.width
+        atom_async_copy = cute.make_copy_atom(
+            cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
+            self._dtype,
+            num_bits_per_copy=copy_bits,
+        )
+        atom_universal_copy = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(), self._dtype, num_bits_per_copy=copy_bits)
 
-        cute.copy(copy_g2s_Q, tgQ, smem_Q)
-        cute.tma_store_fence()
+        t_dim1 = sQ_layout_atom.outer.shape[1] // async_elems
+        tQKV_layout = cute.make_layout(
+            (self._num_threads // t_dim1, t_dim1), stride=(t_dim1, 1))
+        vQKV_layout = cute.make_layout((1, async_elems))
+        gmem_tiled_copy_QKV = cute.make_tiled_copy_tv(
+            atom_async_copy, tQKV_layout, vQKV_layout)
+        gmem_tiled_copy_O = cute.make_tiled_copy_tv(
+            atom_universal_copy, tQKV_layout, vQKV_layout)
 
-        rQ = cute.make_fragment_like(tiled_mma.make_fragment_A(),
-        dtype=cute.float16)
-        cute.copy(copy_s2r_Q, smem_Q, rQ)
+        # ---- tensor-core MMA ----
+        tiled_mma = cute.make_tiled_mma(
+            warp.MmaF16BF16Op(self._dtype, cutlass.Float32, (16, 8, 16)),
+            (self._num_threads // 32, 1, 1),
+            permutation_mnk=(self._num_threads // 32 * 16, 16, 16),
+        )
 
-        k_pipe = cute.make_pipeline(copy_g2s_K, PIPELINE_STAGES)
-        v_pipe = cute.make_pipeline(copy_g2s_V, PIPELINE_STAGES)
-        copy_g2s_K_pred = copy_g2s_K.with(pred_K)
-        copy_g2s_V_pred = copy_g2s_V.with(pred_V)
+        # ---- smem->reg copy atoms (ldmatrix) ----
+        smem_copy_atom_QK = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=False, num_matrices=4), self._dtype)
+        smem_copy_atom_V = cute.make_copy_atom(
+            warp.LdMatrix8x8x16bOp(transpose=True, num_matrices=4), self._dtype)
+        smem_tiled_copy_Q = cute.make_tiled_copy_A(smem_copy_atom_QK, tiled_mma)
+        smem_tiled_copy_K = cute.make_tiled_copy_B(smem_copy_atom_QK, tiled_mma)
+        smem_tiled_copy_V = cute.make_tiled_copy_B(smem_copy_atom_V, tiled_mma)
 
-        # causal 时只处理到当前 q 块对应的 KV 块
-        if causal:
-            num_kv_blocks_effective = q_block_idx + 1
+        @cute.struct
+        class SharedStorage:
+            sQ: cute.struct.Align[
+                cute.struct.MemRange[self._dtype, cute.cosize(sQ_layout)], 1024]
+            sK: cute.struct.Align[
+                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024]
+            sV: cute.struct.Align[
+                cute.struct.MemRange[self._dtype, cute.cosize(sKV_layout)], 1024]
+
+        H = cute.size(mQ.shape[1])
+        H_kv = cute.size(mK.shape[1])
+        self._gqa_group = H // H_kv
+
+        softmax_scale_log2 = softmax_scale * LOG2_E
+
+        grid_dim = (
+            cute.ceil_div(cute.size(mQ.shape[2]), self._m_block_size),  # m blocks
+            cute.size(mQ.shape[0]),                                     # batch
+            H,                                                          # query heads
+        )
+        self.kernel(
+            mQ, mK, mV, mO, softmax_scale_log2,
+            sQ_layout, sKV_layout, sO_layout,
+            gmem_tiled_copy_QKV, gmem_tiled_copy_O,
+            tiled_mma,
+            smem_tiled_copy_Q, smem_tiled_copy_K, smem_tiled_copy_V,
+            SharedStorage,
+        ).launch(
+            grid=grid_dim,
+            block=[self._num_threads, 1, 1],
+            stream=stream,
+        )
+
+   
+    @cute.kernel
+    def kernel(
+        self,
+        mQ: cute.Tensor, mK: cute.Tensor, mV: cute.Tensor, mO: cute.Tensor,
+        softmax_scale_log2: cutlass.Float32,
+        # [修复] swizzled 的 _ComposedLayout 不能作为 cute.Layout 类型的运行时
+        # kernel 参数传入，改为编译期常量（Constexpr）捕获。
+        sQ_layout: cutlass.Constexpr,
+        sKV_layout: cutlass.Constexpr,
+        sO_layout: cutlass.Constexpr,
+        gmem_tiled_copy_QKV: cute.TiledCopy, gmem_tiled_copy_O: cute.TiledCopy,
+        tiled_mma: cute.TiledMma,
+        smem_tiled_copy_Q: cute.TiledCopy,
+        smem_tiled_copy_K: cute.TiledCopy,
+        smem_tiled_copy_V: cute.TiledCopy,
+        SharedStorage: cutlass.Constexpr,
+    ):
+        tidx, _, _ = cute.arch.thread_idx()
+        m_block, batch, head = cute.arch.block_idx()
+        kv_head = head // self._gqa_group  # GQA 映射
+
+        seqlen_q = cute.size(mQ.shape[2])
+        seqlen_k = cute.size(mK.shape[2])
+
+        # 需要处理的 KV block 数（causal 提前退出）
+        n_block_max = cute.ceil_div(seqlen_k, self._n_block_size)
+        if cutlass.const_expr(self._is_causal):
+            n_block_max = min(
+                cute.ceil_div((m_block + 1) * self._m_block_size, self._n_block_size),
+                n_block_max,
+            )
+
+        # 取出当前 (batch, head) 的 [S, D] 全局 tile
+        mQ_bh = mQ[batch, head, None, None]
+        mK_bh = mK[batch, kv_head, None, None]
+        mV_bh = mV[batch, kv_head, None, None]
+        mO_bh = mO[batch, head, None, None]
+
+        gQ = cute.local_tile(
+            mQ_bh, (self._m_block_size, self._head_dim_padded), (m_block, 0))
+        gK = cute.local_tile(
+            mK_bh, (self._n_block_size, self._head_dim_padded), (None, 0))
+        gV = cute.local_tile(
+            mV_bh, (self._n_block_size, self._head_dim_padded), (None, 0))
+
+        smem = utils.SmemAllocator()
+        storage = smem.allocate(SharedStorage)
+        sQ = storage.sQ.get_tensor(sQ_layout)
+        sK = storage.sK.get_tensor(sKV_layout)
+        sV = storage.sV.get_tensor(sKV_layout)
+        # V 的转置视图 (head_dim, n_block)，用于 P@V 的 MMA
+        sVt = cute.composition(
+            sV,
+            cute.make_layout(
+                (self._head_dim_padded, self._n_block_size),
+                stride=(self._n_block_size, 1)),
+        )
+
+        # ---- gmem -> smem 划分 ----
+        gmem_thr_copy = gmem_tiled_copy_QKV.get_slice(tidx)
+        tQgQ = gmem_thr_copy.partition_S(gQ)
+        tQsQ = gmem_thr_copy.partition_D(sQ)
+        tKgK = gmem_thr_copy.partition_S(gK)
+        tKsK = gmem_thr_copy.partition_D(sK)
+        tVgV = gmem_thr_copy.partition_S(gV)
+        tVsV = gmem_thr_copy.partition_D(sV)
+
+        # ---- MMA fragments ----
+        thr_mma = tiled_mma.get_slice(tidx)
+        tSrQ = thr_mma.make_fragment_A(thr_mma.partition_A(sQ))
+        tSrK = thr_mma.make_fragment_B(thr_mma.partition_B(sK))
+        tOrVt = thr_mma.make_fragment_B(thr_mma.partition_B(sVt))
+
+        acc_shape_O = thr_mma.partition_shape_C(
+            (self._m_block_size, self._head_dim_padded))
+        acc_O = cute.make_rmem_tensor(acc_shape_O, cutlass.Float32)
+        acc_O.fill(0.0)
+
+        # smem->reg copy 划分
+        smem_thr_copy_Q = smem_tiled_copy_Q.get_slice(tidx)
+        smem_thr_copy_K = smem_tiled_copy_K.get_slice(tidx)
+        smem_thr_copy_V = smem_tiled_copy_V.get_slice(tidx)
+        tSsQ = smem_thr_copy_Q.partition_S(sQ)
+        tSrQ_copy = smem_thr_copy_Q.retile(tSrQ)
+        tSsK = smem_thr_copy_K.partition_S(sK)
+        tSrK_copy = smem_thr_copy_K.retile(tSrK)
+        tOsVt = smem_thr_copy_V.partition_S(sVt)
+        tOrVt_copy = smem_thr_copy_V.retile(tOrVt)
+
+        # ---- 序幕：发射 Q + 最后一块 K 的加载 ----
+        cute.copy(gmem_tiled_copy_QKV, tQgQ, tQsQ)
+        cute.arch.cp_async_commit_group()
+
+        n_block = n_block_max - 1
+        cute.copy(gmem_tiled_copy_QKV, tKgK[None, None, None, n_block], tKsK)
+        cute.arch.cp_async_commit_group()
+
+        # 等待 Q 与首块 K 到位
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
+
+        
+        cute.copy(smem_tiled_copy_Q, tSsQ, tSrQ_copy)
+        cute.arch.barrier()
+
+        
+       
+        tSrQ.store(
+            (tSrQ.load().to(cutlass.Float32) * softmax_scale_log2).to(self._dtype))
+
+        # ---- 在线 softmax 的运行统计 ----
+        acc_O_mn = self._acc_mn_view(acc_O)
+        n_rows = cute.size(acc_O_mn.shape[0])
+        row_max = cute.make_rmem_tensor((n_rows,), cutlass.Float32)
+        row_sum = cute.make_rmem_tensor((n_rows,), cutlass.Float32)
+        row_max.fill(-cutlass.Float32.inf)
+        row_sum.fill(0.0)
+
+        # 需要掩码的前导（对角线）block 数
+        mask_steps = 1
+        if cutlass.const_expr(self._is_causal):
+            mask_steps = cute.ceil_div(self._m_block_size, self._n_block_size)
+
+        # ---- 主循环：先处理需要掩码的对角块，再处理无需掩码的主体 ----
+        for i in cutlass.range_constexpr(mask_steps):
+            nb = n_block_max - 1 - i
+            if nb >= 0:
+                self._one_n_block(
+                    nb, i == 0, True,
+                    m_block, seqlen_q, seqlen_k,
+                    tKgK, tKsK, tVgV, tVsV,
+                    tSrQ, tSrK, tOrVt,
+                    tSsK, tSrK_copy, tOsVt, tOrVt_copy,
+                    smem_tiled_copy_K, smem_tiled_copy_V,
+                    gmem_tiled_copy_QKV, thr_mma,
+                    acc_O, row_max, row_sum, softmax_scale_log2,
+                )
+
+        for nb in cutlass.range(n_block_max - 1 - mask_steps, -1, -1, unroll=1):
+            self._one_n_block(
+                nb, False, False,
+                m_block, seqlen_q, seqlen_k,
+                tKgK, tKsK, tVgV, tVsV,
+                tSrQ, tSrK, tOrVt,
+                tSsK, tSrK_copy, tOsVt, tOrVt_copy,
+                smem_tiled_copy_K, smem_tiled_copy_V,
+                gmem_tiled_copy_QKV, thr_mma,
+                acc_O, row_max, row_sum, softmax_scale_log2,
+            )
+
+        # ---- 收尾：按 row_sum 归一化并写出 O ----
+        self._normalize(acc_O, row_sum)
+        self._write_output(
+            acc_O, mO_bh, m_block, sO_layout, gmem_tiled_copy_O,
+            thr_mma, tidx, seqlen_q, storage, sQ_layout)
+
+   
+    @cute.jit
+    def _one_n_block(
+        self, n_block, is_first, do_mask,
+        m_block, seqlen_q, seqlen_k,
+        tKgK, tKsK, tVgV, tVsV,
+        tSrQ, tSrK, tOrVt,
+        tSsK, tSrK_copy, tOsVt, tOrVt_copy,
+        smem_tiled_copy_K, smem_tiled_copy_V,
+        gmem_tiled_copy_QKV, thr_mma,
+        acc_O, row_max, row_sum, softmax_scale_log2,
+    ):
+        tiled_mma = thr_mma  # thr_mma 已绑定 tidx，用于 gemm 时传 tiled_mma
+        has_next = n_block - 1 >= 0
+
+        
+        cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
+
+       
+        cute.copy(smem_tiled_copy_K, tSsK, tSrK_copy)
+        cute.arch.barrier()  # WAR：确保所有 warp 读完 sK 再覆盖
+
+        
+        cute.copy(gmem_tiled_copy_QKV, tVgV[None, None, None, n_block], tVsV)
+        cute.arch.cp_async_commit_group()
+        if has_next:
+            cute.copy(
+                gmem_tiled_copy_QKV, tKgK[None, None, None, n_block - 1], tKsK)
+            cute.arch.cp_async_commit_group()
+
+        # S = Q @ K^T  (fp32 累加)
+        acc_shape_S = thr_mma.partition_shape_C(
+            (self._m_block_size, self._n_block_size))
+        acc_S = cute.make_rmem_tensor(acc_shape_S, cutlass.Float32)
+        acc_S.fill(0.0)
+        cute.gemm(tiled_mma, acc_S, tSrQ, tSrK, acc_S)
+
+        # 对角块施加 causal mask
+        if cutlass.const_expr(self._is_causal):
+            if do_mask:
+                self._apply_causal_mask(
+                    acc_S, m_block, n_block, seqlen_q, seqlen_k)
+
+        # 在线 softmax：更新 row_max/row_sum，重缩放 acc_O，得到 P
+        self._softmax_rescale(
+            acc_S, acc_O, row_max, row_sum, softmax_scale_log2, is_first)
+
+        # 将 P 转成输入 dtype 供第二个 MMA
+        rP = cute.make_rmem_tensor(acc_S.shape, self._dtype)
+        rP_frag = thr_mma.make_fragment_A(rP)
+        rP_frag.store(acc_S.load().to(self._dtype))
+
+        # 等待 V 到位（group A）；若已预取下一块 K（group B），用 wait_group(1)
+        # 让下一块 K 继续在后台加载，与本块 P@V 重叠
+        if has_next:
+            cute.arch.cp_async_wait_group(1)
         else:
-            num_kv_blocks_effective = num_kv_blocks
+            cute.arch.cp_async_wait_group(0)
+        cute.arch.barrier()
+        cute.copy(smem_tiled_copy_V, tOsVt, tOrVt_copy)
+        cute.gemm(tiled_mma, acc_O, rP_frag, tOrVt, acc_O)
 
-        preload_count = min(PIPELINE_STAGES - 1, num_kv_blocks_effective)
-
-        for kv_idx in range(preload_count):
-            tgK = cute.local_tile(
-                K_gmem,
-                cute.Shape[BLOCK_N, HEAD_DIM],
-                cute.make_coord(kv_idx)
-            )
-            tgV = cute.local_tile(
-                V_gmem,
-                cute.Shape[BLOCK_N, HEAD_DIM],
-                cute.make_coord(kv_idx)
-            )
-            k_stage = k_pipe.producer_acquire()
-            v_stage = v_pipe.producer_acquire()
-
-            cute.copy(copy_g2s_K_pred, tgK, smem_K(k_stage))
-            cute.copy(copy_g2s_V_pred, tgV, smem_V(v_stage))
-
-            k_pipe.producer_commit(k_stage)
-            v_pipe.producer_commit(v_stage)
-
-        # 消费块索引需独立计数：流水线里“正在消费”的块比“正在加载”的块滞后 preload_count
-        consume_idx = 0
-        for kv_idx in range(preload_count, num_kv_blocks_effective):
-            tgK = cute.local_tile(
-                K_gmem,
-                cute.Shape[BLOCK_N, HEAD_DIM],
-                cute.make_coord(kv_idx)
-            )
-            tgV = cute.local_tile(
-                V_gmem,
-                cute.Shape[BLOCK_N, HEAD_DIM],
-                cute.make_coord(kv_idx)
-            )
-            k_stage = k_pipe.producer_acquire()
-            v_stage = v_pipe.producer_acquire()
-
-            cute.copy(copy_g2s_K_pred, tgK, smem_K(k_stage))
-            cute.copy(copy_g2s_V_pred, tgV, smem_V(v_stage))
-
-            k_pipe.producer_commit(k_stage)
-            v_pipe.producer_commit(v_stage)
-
-            _consume_kv_tile(k_pipe, v_pipe, smem_K, smem_V,
-            tiled_mma, rQ, copy_s2r_K, copy_s2r_V,
-            reg_m, reg_l, reg_o,work_rK,work_rV,work_rS,
-            causal=causal, q_block_idx=q_block_idx, kv_block_idx=consume_idx,
-            sm_scale=sm_scale)
-            consume_idx += 1
-
-        for _ in range(preload_count):
-            _consume_kv_tile(k_pipe, v_pipe, smem_K, smem_V,
-            tiled_mma, rQ, copy_s2r_K, copy_s2r_V,
-            reg_m, reg_l, reg_o,work_rK,work_rV,work_rS,
-            causal=causal, q_block_idx=q_block_idx, kv_block_idx=consume_idx,
-            sm_scale=sm_scale)
-            consume_idx += 1
-
-        elem_div_inplace(reg_o, reg_l)
-
-        tgL = cute.local_tile(L_gmem, cute.Shape[BLOCK_M],
-        cute.make_coord(q_block_idx))
-        cute.copy_n(reg_l, tgL)
-        tgM = cute.local_tile(M_gmem, cute.Shape[BLOCK_M],
-        cute.make_coord(q_block_idx))
-        cute.copy_n(reg_m, tgM)
-        cute.copy(copy_r2s_O, reg_o, smem_O)
-        cute.synchronize()
-        tgO = cute.local_tile(O_gmem, cute.Shape[BLOCK_M, HEAD_DIM],
-        cute.make_coord(q_block_idx))
-        copy_s2g_O_pred=copy_s2g_O.with(pred_O)
-        cute.copy(copy_s2g_O_pred, smem_O, tgO)
-
-
-def _build_decode_config():
-    gK_shape = cute.Shape[DECODE_BLOCK_KV, HEAD_DIM]
-    sK_layout = cute.make_layout(gK_shape, swizzle=cute.swizzle.B_128)
-
-    gV_shape = cute.Shape[DECODE_BLOCK_KV, HEAD_DIM]
-    sV_layout = cute.make_layout(gV_shape, swizzle=cute.swizzle.B_128)
-
-    gQ_shape = cute.Shape[1, HEAD_DIM]
-    sQ_layout = cute.make_layout(gQ_shape,swizzle=cute.swizzle.B_128)
-
-    mma_atom = cute.MMA_Atom[
-        cute.SM100,
-        cute.F16F16F16F32_TN,
-        16, 16, 32
-    ]
-    tiled_mma = cute.make_tiled_mma(
-        mma_atom,
-        cute.make_layout(cute.Shape[1, 1, 1]),
-        cute.make_layout(cute.Shape[1, 1, 1])
-    )
-
-    copy_g2s_K = cute.make_tiled_copy(
-        cute.Copy_Atom[cute.TMA, cute.F16],
-        cute.make_layout(gK_shape),
-        sK_layout
-    )
-    copy_g2s_V = cute.make_tiled_copy(
-        cute.Copy_Atom[cute.TMA, cute.F16],
-        cute.make_layout(gV_shape),
-        sV_layout
-    )
-    copy_g2s_Q = cute.make_tiled_copy(
-        cute.Copy_Atom[cute.TMA, cute.F16],
-        cute.make_layout(gQ_shape),
-        sQ_layout
-    )
-    copy_s2r_Q = cute.make_tiled_copy(
-        cute.Copy_Atom[cute.SM90, cute.F16, cute.F16],
-        sQ_layout,
-        tiled_mma.get_layout_A()
-    )
-    copy_s2r_K = cute.make_tiled_copy(
-        cute.Copy_Atom[cute.SM90, cute.F16, cute.F16],
-        sK_layout,
-        tiled_mma.get_layout_B()
-    )
-    copy_s2r_V = cute.make_tiled_copy(
-        cute.Copy_Atom[cute.SM90, cute.F16, cute.F16],
-        sV_layout,
-        tiled_mma.get_layout_B()
-    )
-
-    pred_K = cute.make_predicate(gK_shape)
-    pred_V = cute.make_predicate(gV_shape)
-
-    return (tiled_mma,
-            gQ_shape, sQ_layout, gK_shape, sK_layout,
-            gV_shape, sV_layout,
-            copy_g2s_Q, copy_g2s_K, copy_g2s_V,
-            copy_s2r_Q, copy_s2r_K, copy_s2r_V,
-            pred_K, pred_V)
-
-def decode_kernel(Q_gmem, K_gmem, V_gmem,
-                  partial_O_gmem, partial_L_gmem, partial_M_gmem,
-                  sm_scale=INV_SQRT_D):
-    (tiled_mma,
-     gQ_shape, sQ_layout, gK_shape, sK_layout,
-     gV_shape, sV_layout,
-     copy_g2s_Q, copy_g2s_K, copy_g2s_V,
-     copy_s2r_Q, copy_s2r_K, copy_s2r_V,
-     pred_K, pred_V) = _build_decode_config()
-
-    cta_id = int(cute.blockIdx())
-    num_ctas = int(cute.gridDim())
-    seq_len_kv = int(cute.size(K_gmem, 0))
-
-    smem_base = cute.smem_ptr()
-
-    smem_Q = cute.make_tensor(smem_base, sQ_layout)
-
-    smem_K_offset = cute.round_up(cute.cosize(sQ_layout), 128)
-    smem_K_2stage = cute.make_layout(
-        cute.Shape[cute.Int<PIPELINE_STAGES>{}, cute.Shape[DECODE_BLOCK_KV, HEAD_DIM]],
-        swizzle=cute.swizzle.B_128
-    )
-    smem_K = cute.make_tensor(smem_base + smem_K_offset, smem_K_2stage)
-
-    smem_V_offset = cute.round_up(
-        smem_K_offset + cute.cosize(smem_K_2stage), 128
-    )
-    smem_V_2stage = cute.make_layout(
-        cute.Shape[cute.Int<PIPELINE_STAGES>{}, cute.Shape[DECODE_BLOCK_KV, HEAD_DIM]],
-        swizzle=cute.swizzle.B_128
-    )
-    smem_V = cute.make_tensor(smem_base + smem_V_offset, smem_V_2stage)
-
-    tgQ = cute.local_tile(Q_gmem, cute.Shape[1, HEAD_DIM], cute.make_coord(0))
-    cute.copy(copy_g2s_Q, tgQ, smem_Q)
-    cute.synchronize()
-
-    rQ = cute.make_fragment_like(tiled_mma.make_fragment_A(),
-                                 dtype=cute.float16)
-    cute.copy(copy_s2r_Q, smem_Q, rQ)
-
-    total_kv_blocks = (seq_len_kv + DECODE_BLOCK_KV - 1) // DECODE_BLOCK_KV
-    kv_blocks_per_cta = (total_kv_blocks + num_ctas - 1) // num_ctas
-    kv_start_block = cta_id * kv_blocks_per_cta
-    kv_end_block = min(kv_start_block + kv_blocks_per_cta, total_kv_blocks)
-
-    if kv_start_block >= kv_end_block:
-        return
-
-    # m/l 为行向量（decode 时行数=1），o 为整块 [1, HEAD_DIM]
-    reg_m = _make_row_fragment(tiled_mma, NEG_INF)
-    reg_l = _make_row_fragment(tiled_mma, ZERO)
-    reg_o = cute.make_fragment_like(tiled_mma.make_fragment_C(),
-                                    dtype=cute.float32,
-                                    init=ZERO)
-
-    work_rK = cute.make_fragment_like(tiled_mma.make_fragment_B(),
-                                      dtype=cute.float16)
-    work_rV = cute.make_fragment_like(tiled_mma.make_fragment_B(),
-                                      dtype=cute.float16)
-    work_rS = cute.make_fragment_like(tiled_mma.make_fragment_C(),
-                                      dtype=cute.float32)
-
-    k_pipe = cute.make_pipeline(copy_g2s_K, PIPELINE_STAGES)
-    v_pipe = cute.make_pipeline(copy_g2s_V, PIPELINE_STAGES)
-    copy_g2s_K_pred = copy_g2s_K.with(pred_K)
-    copy_g2s_V_pred = copy_g2s_V.with(pred_V)
-
-    kv_blocks_range = list(range(kv_start_block, kv_end_block))
-
-    if len(kv_blocks_range) == 0:
-        return
-
-    preload_count = min(PIPELINE_STAGES - 1, len(kv_blocks_range))
-
-    for i in range(preload_count):
-        block_idx = kv_blocks_range[i]
-        tgK = cute.local_tile(
-            K_gmem,
-            cute.Shape[DECODE_BLOCK_KV, HEAD_DIM],
-            cute.make_coord(block_idx)
+    
+    @staticmethod
+    def _acc_mn_view(acc):
+        l = acc.layout
+        mn = cute.make_layout(
+            ((l.shape[0][0], l.shape[1]), (l.shape[0][1], l.shape[2])),
+            stride=((l.stride[0][0], l.stride[1]), (l.stride[0][1], l.stride[2])),
         )
-        tgV = cute.local_tile(
-            V_gmem,
-            cute.Shape[DECODE_BLOCK_KV, HEAD_DIM],
-            cute.make_coord(block_idx)
-        )
-        k_stage = k_pipe.producer_acquire()
-        v_stage = v_pipe.producer_acquire()
-        cute.copy(copy_g2s_K_pred, tgK, smem_K(k_stage))
-        cute.copy(copy_g2s_V_pred, tgV, smem_V(v_stage))
-        k_pipe.producer_commit(k_stage)
-        v_pipe.producer_commit(v_stage)
+        return cute.make_tensor(acc.iterator, mn)
 
-    for i in range(preload_count, len(kv_blocks_range)):
-        next_block = kv_blocks_range[i]
+    @cute.jit
+    def _apply_causal_mask(self, acc_S, m_block, n_block, seqlen_q, seqlen_k):
+        acc_S_mn = self._acc_mn_view(acc_S)
+        tidx, _, _ = cute.arch.thread_idx()
+        row_off = m_block * self._m_block_size
+        col_off = n_block * self._n_block_size
+        for r in cutlass.range_constexpr(cute.size(acc_S_mn.shape[0])):
+            for c in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
+                q_idx = row_off + self._row_coord(r, tidx)
+                k_idx = col_off + self._col_coord(c, tidx)
+                # 运行时（staged）布尔不能用 Python 的 or/and/not，改用位运算 |
+                masked = (k_idx > q_idx) | (k_idx >= seqlen_k)
+                if masked:
+                    acc_S_mn[r, c] = -cutlass.Float32.inf
 
-        tgK = cute.local_tile(
-            K_gmem,
-            cute.Shape[DECODE_BLOCK_KV, HEAD_DIM],
-            cute.make_coord(next_block)
-        )
-        tgV = cute.local_tile(
-            V_gmem,
-            cute.Shape[DECODE_BLOCK_KV, HEAD_DIM],
-            cute.make_coord(next_block)
-        )
-        k_stage = k_pipe.producer_acquire()
-        v_stage = v_pipe.producer_acquire()
-        cute.copy(copy_g2s_K_pred, tgK, smem_K(k_stage))
-        cute.copy(copy_g2s_V_pred, tgV, smem_V(v_stage))
-        k_pipe.producer_commit(k_stage)
-        v_pipe.producer_commit(v_stage)
+    @staticmethod
+    def _row_coord(r, tidx):
+        # m16n8k16: row = warp*16 + lane//4 + 8*(r%2)
+        lane = tidx % 32
+        warp = tidx // 32
+        return warp * 16 + (lane // 4) + 8 * (r % 2)
+
+    @staticmethod
+    def _col_coord(c, tidx):
+        lane = tidx % 32
+        return (lane % 4) * 2 + (c % 2) + 8 * (c // 2)
+
+    @cute.jit
+    def _softmax_rescale(
+        self, acc_S, acc_O, row_max, row_sum, scale_log2, is_first):
+        # 注：scale_log2 已在扫描前折叠进 Q（见 kernel 中 [优化3]），
+        # 因此 acc_S 已是 log2 域分数，这里不再逐元素乘 scale。
+        acc_S_mn = self._acc_mn_view(acc_S)
+        acc_O_mn = self._acc_mn_view(acc_O)
+        for r in cutlass.range_constexpr(cute.size(acc_S_mn.shape[0])):
+            # 本块的行最大值
+            cur = -cutlass.Float32.inf
+            for c in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
+                cur = max(cur, acc_S_mn[r, c])
+            cur = self._quad_reduce_max(cur)
+            new_max = max(row_max[r], cur)
+
+            correction = cute.math.exp2(row_max[r] - new_max, fastmath=True)
+            s = 0.0
+            for c in cutlass.range_constexpr(cute.size(acc_S_mn.shape[1])):
+                p = cute.math.exp2(acc_S_mn[r, c] - new_max, fastmath=True)
+                acc_S_mn[r, c] = p
+                s += p
+            if not is_first:
+                row_sum[r] = row_sum[r] * correction + s
+                for c in cutlass.range_constexpr(cute.size(acc_O_mn.shape[1])):
+                    acc_O_mn[r, c] = acc_O_mn[r, c] * correction
+            else:
+                row_sum[r] = s
+            row_max[r] = new_max
+
+    @staticmethod
+    def _quad_reduce_max(val):
+        val = max(val, cute.arch.shuffle_sync_bfly(val, offset=2, mask=-1, mask_and_clamp=31))
+        val = max(val, cute.arch.shuffle_sync_bfly(val, offset=1, mask=-1, mask_and_clamp=31))
+        return val
+
+    @staticmethod
+    def _quad_reduce_sum(val):
+        val = val + cute.arch.shuffle_sync_bfly(val, offset=2, mask=-1, mask_and_clamp=31)
+        val = val + cute.arch.shuffle_sync_bfly(val, offset=1, mask=-1, mask_and_clamp=31)
+        return val
+
+    @cute.jit
+    def _normalize(self, acc_O, row_sum):
+        acc_O_mn = self._acc_mn_view(acc_O)
+        for r in cutlass.range_constexpr(cute.size(row_sum)):
+            rs = self._quad_reduce_sum(row_sum[r])
+            # 运行时值不能用三元表达式(会触发 __bool__)，改用动态 if/else
+            if (rs == 0.0) | (rs != rs):
+                inv = cutlass.Float32(1.0)
+            else:
+                inv = cute.arch.rcp_approx(rs)
+            for c in cutlass.range_constexpr(cute.size(acc_O_mn.shape[1])):
+                acc_O_mn[r, c] = acc_O_mn[r, c] * inv
+
+    @cute.jit
+    def _write_output(
+        self, acc_O, mO_bh, m_block, sO_layout, gmem_tiled_copy_O,
+        thr_mma, tidx, seqlen_q, storage, sQ_layout):
+        # 先经 smem 暂存 O，再合并写回 gmem
+        sO = storage.sQ.get_tensor(sO_layout)  # 复用 Q 的 smem 区域
+        cute.arch.barrier()
+        rO = cute.make_rmem_tensor(acc_O.shape, self._dtype)
+        rO.store(acc_O.load().to(self._dtype))
+        tOsO = thr_mma.partition_C(sO)
+        tOsO.store(rO.load())
+        cute.arch.barrier()
+
+        gO = cute.local_tile(
+            mO_bh, (self._m_block_size, self._head_dim_padded), (m_block, 0))
+        gmem_thr_copy = gmem_tiled_copy_O.get_slice(tidx)
+        tOsO2 = gmem_thr_copy.partition_S(sO)
+        tOgO = gmem_thr_copy.partition_D(gO)
+        cute.copy(gmem_tiled_copy_O, tOsO2, tOgO)
 
 
-        _consume_decode_tile(k_pipe, v_pipe, smem_K, smem_V,
-                             tiled_mma, rQ, copy_s2r_K, copy_s2r_V,
-                             reg_m, reg_l, reg_o,
-                             work_rK, work_rV, work_rS,
-                             sm_scale=sm_scale)
 
-    for _ in range(preload_count):
-        _consume_decode_tile(
-            k_pipe, v_pipe, smem_K, smem_V,
-            tiled_mma, rQ, copy_s2r_K, copy_s2r_V,
-            reg_m, reg_l, reg_o,
-            work_rK, work_rV, work_rS,
-            sm_scale=sm_scale
-        )
+class FlashAttentionDecode:
+    
 
-    tg_partial_O = cute.local_tile(
-        partial_O_gmem,
-        cute.Shape[1, HEAD_DIM],
-        cute.make_coord(cta_id)
+    def __init__(
+        self,
+        head_dim: int,
+        q_len: int,                 # 每个 q head 的 query 长度（Python int）
+        gqa_group: int,             # H // H_kv（Python int，用于 range_constexpr）
+        num_splits: int,
+        split_size: int,
+        n_block_size: int = 64,
+        num_threads: int = 128,
+        is_causal: bool = True,
+    ):
+        self._head_dim = head_dim
+        self._head_dim_padded = int((head_dim + 7) // 8 * 8)
+        self._q_len = int(q_len)          # 每个 q head 的 query 行数
+        self._gqa_group = int(gqa_group)  # 组内 q head 数（Python int）
+        # 组融合后，一个 block 处理的“行”数 = 组内 q head 数 * 每 head query 行数
+        self._rows = self._gqa_group * self._q_len
+        self._num_splits = num_splits
+        self._split_size = split_size
+        self._n_block_size = n_block_size
+        self._num_threads = num_threads
+        self._is_causal = is_causal
+
+    @cute.jit
+    def __call__(
+        self,
+        mQ: cute.Tensor,        # [B, H, Sq, D]
+        mK: cute.Tensor,        # [B, H_kv, Sk, D]
+        mV: cute.Tensor,        # [B, H_kv, Sk, D]
+        mO: cute.Tensor,        # [B, H, Sq, D]
+        mOpart: cute.Tensor,    # [B, H, num_splits, Sq, D]  (fp32)
+        mLpart: cute.Tensor,    # [B, H, num_splits, Sq]      (fp32, base-2 lse)
+        softmax_scale: cutlass.Float32,
+        stream,
+    ):
+        self._dtype = mQ.element_type
+        H = cute.size(mQ.shape[1])
+        H_kv = cute.size(mK.shape[1])
+        # 注：gqa_group / q_len 已在构造函数中以 Python int 传入（供 range_constexpr）。
+        # seqlen_k 是动态值(cute.size)，不能在 host 算好再传进 kernel(会违反
+        # region isolation)，改在 split_kernel 内部从 mK 参数重新计算。
+        self._num_warps = self._num_threads // 32
+        # 每个 lane 负责的 head-dim 元素个数（连续），保证向量化 + 合并访存
+        self._vec = (self._head_dim + 31) // 32
+        softmax_scale_log2 = softmax_scale * LOG2_E
+
+        # split kernel grid: (split, batch, kv_head) —— 按 KV head 划分，组内共享 K/V
+        grid_split = (self._num_splits, cute.size(mQ.shape[0]), H_kv)
+        self.split_kernel(
+            mQ, mK, mV, mOpart, mLpart, softmax_scale_log2,
+        ).launch(
+            grid=grid_split, block=[self._num_threads, 1, 1], stream=stream)
+
+        # reduction grid: (batch, head) —— 仍按每个 q head 归并各 split
+        grid_red = (cute.size(mQ.shape[0]), H, 1)
+        self.reduce_kernel(
+            mOpart, mLpart, mO,
+        ).launch(
+            grid=grid_red, block=[self._num_threads, 1, 1], stream=stream)
+
+   
+    @cute.kernel
+    def split_kernel(
+        self, mQ, mK, mV, mOpart, mLpart, scale_log2: cutlass.Float32):
+        tidx, _, _ = cute.arch.thread_idx()
+        split, batch, head = cute.arch.block_idx()
+        kv_head = head // self._gqa_group
+
+        D = self._head_dim
+        VEC = self._vec
+        NW = self._num_warps
+        warp_id = tidx // 32
+        lane = tidx % 32
+
+        # seqlen_k 必须在 kernel 区域内从参数 mK 计算，不能引用 host 端的动态值
+        seqlen_k = cute.size(mK.shape[2])
+
+        kv_start = split * self._split_size
+        kv_end = min(kv_start + self._split_size, seqlen_k)
+
+        mQ_bh = mQ[batch, head, None, None]      # [Sq, D]
+        mK_bh = mK[batch, kv_head, None, None]   # [Sk, D]
+        mV_bh = mV[batch, kv_head, None, None]
+
+        # ---- 本 lane 的 Q 元素载入寄存器（跨 key 复用）----
+        # 把 scale_log2 一次性折叠进 Q，dot(q,k) 直接得到 log2 域分数，
+        # 省去每个 key 的一次缩放乘法。
+        qreg = cute.make_rmem_tensor((self._q_len, VEC), cutlass.Float32)
+        m_i = cute.make_rmem_tensor((self._q_len,), cutlass.Float32)
+        l_i = cute.make_rmem_tensor((self._q_len,), cutlass.Float32)
+        acc = cute.make_rmem_tensor((self._q_len, VEC), cutlass.Float32)
+        for i in cutlass.range_constexpr(self._q_len):
+            m_i[i] = -cutlass.Float32.inf
+            l_i[i] = 0.0
+            for e in cutlass.range_constexpr(VEC):
+                gd = lane * VEC + e
+                # gd 为运行时值，不能用三元表达式做边界判断，改用动态 if/else
+                if gd < D:
+                    qreg[i, e] = cutlass.Float32(mQ_bh[i, gd]) * scale_log2
+                else:
+                    qreg[i, e] = cutlass.Float32(0.0)
+                acc[i, e] = 0.0
+
+        q_pos_base = seqlen_k - self._q_len  # 第一个 q 行的全局位置
+
+        # ---- 本 warp 处理 keys: kv_start+warp_id, +NW, +2NW, ... ----
+        k = kv_start + warp_id
+        while k < kv_end:
+            for i in cutlass.range_constexpr(self._q_len):
+                # dot(q_i, k_k)：每 lane 先算自己 VEC 个元素，再 warp 归约
+                partial = cutlass.Float32(0.0)
+                for e in cutlass.range_constexpr(VEC):
+                    gd = lane * VEC + e
+                    if gd < D:
+                        kv = cutlass.Float32(mK_bh[k, gd])
+                    else:
+                        kv = cutlass.Float32(0.0)
+                    partial += qreg[i, e] * kv
+                dot = self._warp_reduce_sum(partial)
+                s = dot  # scale_log2 已折叠进 qreg
+
+                # 用“正向条件” in_range 取代对运行时布尔做 Python 的 not
+                in_range = True
+                if cutlass.const_expr(self._is_causal):
+                    in_range = k <= (q_pos_base + i)
+                if in_range:
+                    new_max = max(m_i[i], s)
+                    corr = cute.math.exp2(m_i[i] - new_max, fastmath=True)
+                    p = cute.math.exp2(s - new_max, fastmath=True)
+                    l_i[i] = l_i[i] * corr + p
+                    for e in cutlass.range_constexpr(VEC):
+                        gd = lane * VEC + e
+                        if gd < D:
+                            vv = cutlass.Float32(mV_bh[k, gd])
+                        else:
+                            vv = cutlass.Float32(0.0)
+                        acc[i, e] = acc[i, e] * corr + p * vv
+                    m_i[i] = new_max
+            k += NW
+
+        # ---- 跨 warp 合并 (m, l, acc) via shared memory ----
+        smem = utils.SmemAllocator()
+        sm_m = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((NW, self._q_len),
+                                              stride=(self._q_len, 1)), 16)
+        sm_l = smem.allocate_tensor(
+            cutlass.Float32, cute.make_layout((NW, self._q_len),
+                                              stride=(self._q_len, 1)), 16)
+        sacc = smem.allocate_tensor(
+            cutlass.Float32,
+            cute.make_layout((NW, self._q_len, 32, VEC),
+                             stride=(self._q_len * 32 * VEC, 32 * VEC, VEC, 1)), 16)
+
+        cute.arch.barrier()
+        for i in cutlass.range_constexpr(self._q_len):
+            if lane == 0:
+                sm_m[warp_id, i] = m_i[i]
+                sm_l[warp_id, i] = l_i[i]
+            for e in cutlass.range_constexpr(VEC):
+                sacc[warp_id, i, lane, e] = acc[i, e]
+        cute.arch.barrier()
+
+        # 仅 warp 0 负责合并并写出（其余 warp 数据相同，避免重复写）
+        mOp_bh = mOpart[batch, head, split, None, None]  # [Sq, D]
+        mLp_bh = mLpart[batch, head, split, None]        # [Sq]
+        if warp_id == 0:
+            for i in cutlass.range_constexpr(self._q_len):
+                mg = -cutlass.Float32.inf
+                for w in cutlass.range_constexpr(NW):
+                    mg = max(mg, sm_m[w, i])
+
+                lg = cutlass.Float32(0.0)
+                og = cute.make_rmem_tensor((VEC,), cutlass.Float32)
+                for e in cutlass.range_constexpr(VEC):
+                    og[e] = 0.0
+
+                valid = mg > -cutlass.Float32.inf
+                if valid:
+                    for w in cutlass.range_constexpr(NW):
+                        wgt = cute.math.exp2(sm_m[w, i] - mg, fastmath=True)
+                        lg += sm_l[w, i] * wgt
+                        for e in cutlass.range_constexpr(VEC):
+                            og[e] += sacc[w, i, lane, e] * wgt
+
+                if (lg == 0.0) | (lg != lg):
+                    inv = cutlass.Float32(1.0)
+                else:
+                    inv = cute.arch.rcp_approx(lg)
+                for e in cutlass.range_constexpr(VEC):
+                    gd = lane * VEC + e
+                    if gd < D:
+                        mOp_bh[i, gd] = og[e] * inv  # 已归一化的部分结果
+                if lane == 0:
+                    if valid & (lg > 0.0):
+                        mLp_bh[i] = mg + cute.math.log2(lg, fastmath=True)
+                    else:
+                        mLp_bh[i] = -cutlass.Float32.inf
+
+    
+    @cute.kernel
+    def reduce_kernel(self, mOpart, mLpart, mO):
+        tidx, _, _ = cute.arch.thread_idx()
+        batch, head, _ = cute.arch.block_idx()
+        D = self._head_dim
+
+        mLp_bh = mLpart[batch, head, None, None]        # [num_splits, Sq]
+        mOp_bh = mOpart[batch, head, None, None, None]  # [num_splits, Sq, D]
+        mO_bh = mO[batch, head, None, None]             # [Sq, D]
+
+        for i in cutlass.range_constexpr(self._q_len):
+            # 各 split 的全局最大值（base-2 lse）
+            gmax = -cutlass.Float32.inf
+            for s in cutlass.range_constexpr(self._num_splits):
+                gmax = max(gmax, mLp_bh[s, i])
+            denom = cutlass.Float32(0.0)
+            valid = gmax > -cutlass.Float32.inf
+            if valid:
+                for s in cutlass.range_constexpr(self._num_splits):
+                    denom += cute.math.exp2(mLp_bh[s, i] - gmax, fastmath=True)
+            if (denom == 0.0) | (denom != denom):
+                inv = cutlass.Float32(1.0)
+            else:
+                inv = cute.arch.rcp_approx(denom)
+
+            d = tidx
+            if d < D:
+                out = cutlass.Float32(0.0)
+                if valid:
+                    for s in cutlass.range_constexpr(self._num_splits):
+                        w = cute.math.exp2(mLp_bh[s, i] - gmax, fastmath=True)
+                        out += mOp_bh[s, i, d] * w
+                mO_bh[i, d] = (out * inv).to(self._dtype)
+
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _warp_reduce_sum(val):
+        # 32 lane butterfly 全归约，得到完整 D 维点积（正确覆盖 4 个 sub-lane 组）
+        val = val + cute.arch.shuffle_sync_bfly(val, offset=16, mask=-1, mask_and_clamp=31)
+        val = val + cute.arch.shuffle_sync_bfly(val, offset=8, mask=-1, mask_and_clamp=31)
+        val = val + cute.arch.shuffle_sync_bfly(val, offset=4, mask=-1, mask_and_clamp=31)
+        val = val + cute.arch.shuffle_sync_bfly(val, offset=2, mask=-1, mask_and_clamp=31)
+        val = val + cute.arch.shuffle_sync_bfly(val, offset=1, mask=-1, mask_and_clamp=31)
+        return val
+
+
+
+def _torch_to_cute(t):
+    """把 contiguous 的 [B, H, S, D] torch 张量包装成 CuTe 张量（D 维连续）。"""
+    return (
+        from_dlpack(t, assumed_align=16)
+        .mark_layout_dynamic(leading_dim=3)  # D 连续（最后一维，stride 1）
     )
-    cute.copy_n(reg_o, tg_partial_O)
-    tgL = cute.local_tile(partial_L_gmem, cute.Shape[1], cute.make_coord(cta_id))
-    cute.copy_n(reg_l, tgL)
-    tgM = cute.local_tile(partial_M_gmem, cute.Shape[1], cute.make_coord(cta_id))
-    cute.copy_n(reg_m, tgM)
-
-def _consume_decode_tile(k_pipe, v_pipe, smem_K, smem_V,
-                    tiled_mma, rQ, copy_s2r_K, copy_s2r_V,
-                    reg_m, reg_l, reg_o,
-                    rK_work, rV_work, rS_work,
-                    sm_scale=INV_SQRT_D):
-    k_pipe.consumer_wait()
-    k_stage = k_pipe.consumer_acquire()
-    v_pipe.consumer_wait()
-    v_stage = v_pipe.consumer_acquire()
-
-    cute.copy(copy_s2r_K, smem_K(k_stage), rK_work)
-    cute.copy(copy_s2r_V, smem_V(v_stage), rV_work)
-
-    cute.fill(rS_work, 0.0)
-    cute.gemm(tiled_mma, rQ, rK_work, rS_work)
-    _scale_fragment(rS_work, sm_scale)
-
-    rP = _flash_update_step(rS_work, reg_m, reg_l, reg_o)
-
-    # P 是 fp32 累加器，MMA 需要 fp16 的 A 操作数
-    rP_f16 = _to_f16(rP)
-    cute.gemm(tiled_mma, rP_f16, rV_work, reg_o)
-
-    k_pipe.consumer_release(k_stage)
-    v_pipe.consumer_release(v_stage)
-
-def decode_reduce_kernel(partial_O_gmem, partial_L_gmem, partial_M_gmem,
-                         O_gmem, L_gmem, M_gmem,
-                         num_ctas: int):
-    m_global = NEG_INF
-
-    for cta_idx in range(num_ctas):
-        tgM_i = cute.local_tile(
-            partial_M_gmem, cute.Shape[1], cute.make_coord(cta_idx)
-        )
-        m_i_frag = cute.make_fragment(
-            cute.Shape[1], dtype=cute.float32
-        )
-        cute.copy_n(tgM_i, m_i_frag)
-        m_val = cute.get(m_i_frag, 0)
-        if m_val > m_global:
-            m_global = m_val
-
-    m_global_frag = cute.make_fragment(
-        cute.Shape[1], dtype=cute.float32, init=m_global
-    )
-
-    # 优化: 第二趟 - 用全局 m_max 做加权合并
-    l_new = ZERO
-    o_new = cute.make_fragment(
-        cute.Shape[HEAD_DIM], dtype=cute.float32, init=ZERO
-    )
-
-    # 逐个cta合并
-    for cta_idx in range(num_ctas):
-        tgM_i = cute.local_tile(
-            partial_M_gmem, cute.Shape[1], cute.make_coord(cta_idx)
-        )
-        tgL_i = cute.local_tile(
-            partial_L_gmem, cute.Shape[1], cute.make_coord(cta_idx)
-        )
-        m_i = cute.make_fragment(
-            cute.Shape[1], dtype=cute.float32
-        )
-        l_i = cute.make_fragment(
-            cute.Shape[1], dtype=cute.float32
-        )
-        cute.copy_n(tgM_i, m_i)
-        cute.copy_n(tgL_i, l_i)
-
-        elem_sub_inplace(m_i, m_global_frag)
-        _apply_exp(m_i)
-
-        w=cute.get(m_i,0)
-        l_i_val=cute.get(l_i,0)
-        l_new += w*l_i_val
 
 
-        tg_O_i = cute.local_tile(
-            partial_O_gmem,
-            cute.Shape[1, HEAD_DIM],
-            cute.make_coord(cta_idx)
-        )
-        o_i = cute.make_fragment(
-            cute.Shape[HEAD_DIM], dtype=cute.float32, init=0.0
-        )
-        cute.copy_n(tg_O_i, o_i)
-
-        cute.for_each(o_new,
-                      lambda vn, w, vi: vn + w * vi,
-                      cute.broadcast(m_i, o_new.shape()),
-                      o_i)
-
-    l_new_frag = cute.make_fragment(
-        cute.Shape[1], dtype=cute.float32, init=l_new
-    )
-    cute.for_each(o_new,
-                  lambda vo, vl: vo / vl,
-                  cute.broadcast(l_new_frag, o_new.shape()))
-
-    tgO = cute.local_tile(
-        O_gmem, cute.Shape[1, HEAD_DIM], cute.make_coord(0)
-    )
-    cute.copy_n(o_new, tgO)
-
-    tgL = cute.local_tile(L_gmem, cute.Shape[1], cute.make_coord(0))
-    cute.copy_n(l_new_frag, tgL)
-
-    tgM = cute.local_tile(M_gmem, cute.Shape[1], cute.make_coord(0))
-    cute.copy_n(m_global_frag, tgM)
-
-def decode_reduce_kernel_vectorized(
-    partial_O_gmem, partial_L_gmem,
-            partial_M_gmem,
-            O_gmem, L_gmem, M_gmem,
-            num_ctas: int):
-    m_global = NEG_INF
-
-    for cta_idx in range(num_ctas):
-        tgM_i = cute.local_tile(
-            partial_M_gmem, cute.Shape[1], cute.make_coord(cta_idx)
-        )
-        m_i = cute.make_fragment(cute.Shape[1], dtype=cute.float32)
-        cute.copy_n(tgM_i, m_i)
-        m_val = cute.get(m_i, 0)
-        if m_val > m_global:
-            m_global = m_val
-
-    # 批量合并
-    m_global_frag = cute.make_fragment(
-        cute.Shape[1], dtype=cute.float32, init=m_global
-    )
-
-    l_accum = ZERO
-    o_accum = cute.make_fragment(
-        cute.Shape[HEAD_DIM], dtype=cute.float32, init=ZERO
-    )
-
-    for cta_idx in range(num_ctas):
-        tgM_i = cute.local_tile(
-            partial_M_gmem, cute.Shape[1], cute.make_coord(cta_idx)
-        )
-        tgL_i = cute.local_tile(
-            partial_L_gmem, cute.Shape[1], cute.make_coord(cta_idx)
-        )
-        m_i = cute.make_fragment(cute.Shape[1], dtype=cute.float32)
-        l_i = cute.make_fragment(cute.Shape[1], dtype=cute.float32)
-        cute.copy_n(tgM_i, m_i)
-        cute.copy_n(tgL_i, l_i)
-
-        # w_i = exp(m_i - m_global)
-        elem_sub_inplace(m_i, m_global_frag)
-        _apply_exp(m_i)
-        w_i=cute.get(m_i,0)
-        l_accum += w_i * cute.get(l_i, 0)
-
-        tg_O_i = cute.local_tile(
-            partial_O_gmem,
-            cute.Shape[1, HEAD_DIM],
-            cute.make_coord(cta_idx)
-        )
-        o_i = cute.make_fragment(
-            cute.Shape[HEAD_DIM], dtype=cute.float32, init=ZERO
-        )
-        cute.copy_n(tg_O_i, o_i)
-
-        # 使用 elem_mul_add 模式：o_accum += w_i * o_i
-        cute.for_each(o_accum,
-                      lambda va, w, vi: va + w * vi,
-                      cute.broadcast(m_i, o_accum.shape()),
-                      o_i)
-
-    # 归一化
-    l_frag = cute.make_fragment(cute.Shape[1], dtype=cute.float32,
-                                init=l_accum)
-    cute.for_each(o_accum,
-                  lambda vo, vl: vo / vl,
-                  cute.broadcast(l_frag, o_accum.shape()))
-
-    # 写回
-    cute.copy_n(o_accum, cute.local_tile(
-        O_gmem, cute.Shape[1, HEAD_DIM], cute.make_coord(0)))
-    cute.copy_n(l_frag, cute.local_tile(
-        L_gmem, cute.Shape[1], cute.make_coord(0)))
-    cute.copy_n(m_global_frag, cute.local_tile(
-        M_gmem, cute.Shape[1], cute.make_coord(0)))
+def _current_stream():
+    ts = torch.cuda.current_stream()
+    if _HAS_CUDA_PY:
+        return cuda.CUstream(ts.cuda_stream)
+    return ts.cuda_stream
 
 
-def _alloc_gmem(shape, dtype=cute.float32):
-    # 分配一段全局显存并按给定 shape 视图化（用于中间/输出缓冲）
-    return cute.make_tensor(
-        cute.make_gmem_ptr(dtype, cute.cosize(cute.make_layout(shape))),
-        cute.make_layout(shape)
-    )
+def _next_pow2(x):
+    return 1 << (max(1, x) - 1).bit_length()
 
 
-def _alloc_gmem_like(t):
-    # 分配一个与 t 同 shape、同 dtype 的全局显存张量
-    return cute.make_tensor(
-        cute.make_gmem_ptr(t.dtype, cute.cosize(t.layout)),
-        t.layout
-    )
+def _run_prefill(q, k, v, causal, sm_scale):
+    B, H, S, D = q.shape
+    o = torch.empty_like(q)
 
+    key = ("prefill", D, causal, q.dtype)
+    if key not in _COMPILE_CACHE:
+        op = FlashAttentionPrefill(
+            head_dim=D, m_block_size=128, n_block_size=128,
+            num_threads=128, is_causal=causal)
+        mQ, mK, mV, mO = (_torch_to_cute(t) for t in (q, k, v, o))
+        compiled = cute.compile(
+            op, mQ, mK, mV, mO, cutlass.Float32(sm_scale), _current_stream())
+        _COMPILE_CACHE[key] = compiled
 
-def _run_single_head(Q_bh, K_bh, V_bh, O_bh,
-                     seq_len_q, seq_len_kv, head_dim,
-                     causal, sm_scale):
-    # 单个 (batch, head) 上的 FlashAttention：Q/K/V/O 均为 (seq_len, head_dim)
-    L_bh = _alloc_gmem(cute.Shape[seq_len_q])
-    M_bh = _alloc_gmem(cute.Shape[seq_len_q])
-
-    # 按 query 长度自动分派 prefill / decode
-    mode = 'prefill' if seq_len_q >= BLOCK_M else 'decode'
-
-    if mode == 'prefill':
-        prefill_kernel(Q_bh, K_bh, V_bh,
-                       O_bh, L_bh, M_bh,
-                       causal=causal, sm_scale=sm_scale)
-
-    else:  # decode: 单 query 对超长 KV 做 reduction, 带宽/延迟受限
-        kv_blocks = (seq_len_kv + DECODE_BLOCK_KV - 1) // DECODE_BLOCK_KV
-        # 自适应 KV 分割: 尽量多分片以缩短每个 CTA 的临界路径, 上限 DECODE_MAX_SPLITS。
-        # 例: seq_len_kv=131072 -> kv_blocks=1024 -> 64 分片, 每 CTA 仅 16 块
-        #     (原来固定 4 分片时每 CTA 需串行 256 块, 延迟高 16 倍)。
-        num_decode_ctas = min(kv_blocks, DECODE_MAX_SPLITS)
-
-        partial_O_gmem = _alloc_gmem(cute.Shape[num_decode_ctas, head_dim])
-        partial_L_gmem = _alloc_gmem(cute.Shape[num_decode_ctas])
-        partial_M_gmem = _alloc_gmem(cute.Shape[num_decode_ctas])
-
-        decode_kernel(Q_bh, K_bh, V_bh,
-                      partial_O_gmem, partial_L_gmem, partial_M_gmem,
-                      sm_scale=sm_scale)
-
-        decode_reduce_kernel(partial_O_gmem, partial_L_gmem, partial_M_gmem,
-                             O_bh, L_bh, M_bh, num_decode_ctas)
-
-
-def flash_attention(q, k, v, causal=True, sm_scale=None):
-    # q: (batch, q_heads, seq_len, head_dim)
-    # k, v: (batch, kv_heads, seq_len, head_dim)，q_heads 必须是 kv_heads 的整数倍
-    # 输出 shape 与 q 相同: (batch, q_heads, seq_len, head_dim)
-    batch = int(cute.size(q, 0))
-    q_heads = int(cute.size(q, 1))
-    seq_len_q = int(cute.size(q, 2))
-    head_dim = int(cute.size(q, 3))
-
-    kv_heads = int(cute.size(k, 1))
-    seq_len_kv = int(cute.size(k, 2))
-
-    assert q_heads % kv_heads == 0, (
-        f"q_heads({q_heads}) 必须是 kv_heads({kv_heads}) 的整数倍"
-    )
-
-    # sm_scale 默认值处理：1/sqrt(head_dim)
-    if sm_scale is None:
-        sm_scale = 1.0 / math.sqrt(float(head_dim))
-
-    # GQA/MQA：每 group_size 个 q head 共享一个 kv head
-    group_size = q_heads // kv_heads
-
-    O_gmem = _alloc_gmem_like(q)
-
-    for b in range(batch):
-        for h in range(q_heads):
-            kv_h = h // group_size  # 该 q head 对应的 kv head
-
-            # 取出单个 (batch, head) 的 2D 视图: (seq_len, head_dim)
-            Q_bh = q[b, h]
-            K_bh = k[b, kv_h]
-            V_bh = v[b, kv_h]
-            O_bh = O_gmem[b, h]
-
-            _run_single_head(Q_bh, K_bh, V_bh, O_bh,
-                             seq_len_q, seq_len_kv, head_dim,
-                             causal, sm_scale)
-
-    return O_gmem
-
-
-def run_target_shape(causal=True):
-    # 针对目标形状构造 q/k/v 并执行 FlashAttention:
-    #   q :  (1, 64, 131072, 128)
-    #   k/v: (1,  8, 131072, 128)   (kv_heads=8, GQA, group_size=8)
-    BATCH = 1
-    Q_HEADS = 64
-    KV_HEADS = 8
-    SEQ_LEN = 131072
-    HD = 128
-
-    # 半精度输入 (与内核 MMA 的 F16 A/B 操作数一致)
-    q = _alloc_gmem(cute.Shape[BATCH, Q_HEADS, SEQ_LEN, HD], dtype=cute.float16)
-    k = _alloc_gmem(cute.Shape[BATCH, KV_HEADS, SEQ_LEN, HD], dtype=cute.float16)
-    v = _alloc_gmem(cute.Shape[BATCH, KV_HEADS, SEQ_LEN, HD], dtype=cute.float16)
-
-    # sm_scale 默认 1/sqrt(head_dim); causal 默认 True (长序列因果注意力)
-    o = flash_attention(q, k, v, causal=causal)
+    mQ, mK, mV, mO = (_torch_to_cute(t) for t in (q, k, v, o))
+    _COMPILE_CACHE[key](mQ, mK, mV, mO, cutlass.Float32(sm_scale), _current_stream())
     return o
 
 
-if __name__ == '__main__':
-    run_target_shape(causal=True)
+def _run_decode(q, k, v, causal, sm_scale):
+    B, H, Sq, D = q.shape
+    Sk = k.shape[2]
+    o = torch.empty_like(q)
+
+    # 选择 split 数以填满 GPU：block 总数 = B*H*num_splits 需远大于 SM 数
+    num_sm = torch.cuda.get_device_properties(q.device).multi_processor_count
+    n_block = 64
+    target = num_sm * 12
+    num_splits = max(1, min((Sk + n_block - 1) // n_block,
+                            (target + B * H - 1) // (B * H)))
+    split_size = ((Sk + num_splits - 1) // num_splits + n_block - 1) // n_block * n_block
+    num_splits = (Sk + split_size - 1) // split_size
+
+    o_part = torch.empty((B, H, num_splits, Sq, D), device=q.device, dtype=torch.float32)
+    l_part = torch.empty((B, H, num_splits, Sq), device=q.device, dtype=torch.float32)
+
+    key = ("decode", D, Sq, num_splits, split_size, causal, q.dtype)
+    op = FlashAttentionDecode(
+        head_dim=D, q_len=Sq, num_splits=num_splits, split_size=split_size,
+        n_block_size=n_block, num_threads=128,
+        is_causal=causal)
+
+    def wrap(t):
+        return from_dlpack(t, assumed_align=16).mark_layout_dynamic(leading_dim=t.dim() - 1)
+
+    mQ, mK, mV, mO = (_torch_to_cute(t) for t in (q, k, v, o))
+    mOp = wrap(o_part)
+    mLp = wrap(l_part)
+
+    if key not in _COMPILE_CACHE:
+        _COMPILE_CACHE[key] = cute.compile(
+            op, mQ, mK, mV, mO, mOp, mLp,
+            cutlass.Float32(sm_scale), _current_stream())
+    _COMPILE_CACHE[key](
+        mQ, mK, mV, mO, mOp, mLp, cutlass.Float32(sm_scale), _current_stream())
+    return o
 
 
+def attention(q, k, v, causal=True, sm_scale=None):
+    """FlashAttention (CuTe DSL)。支持 GQA、causal，自动分派 prefill / decode。
+
+    Args:
+        q: [B, H,    q_len,  D]
+        k: [B, H_kv, kv_len, D]
+        v: [B, H_kv, kv_len, D]
+        causal: 是否施加因果掩码。
+        sm_scale: softmax 缩放；默认 1/sqrt(D)。
+    Returns:
+        o: [B, H, q_len, D]，dtype 与 q 相同。
+    """
+    assert q.dim() == 4 and k.dim() == 4 and v.dim() == 4
+    B, H, q_len, D = q.shape
+    Bk, H_kv, kv_len, Dk = k.shape
+    assert D == Dk == v.shape[-1], "head_dim mismatch"
+    assert H % H_kv == 0, "H must be divisible by H_kv (GQA)"
+    assert q.is_cuda, "CuTe DSL FlashAttention requires CUDA tensors"
+    assert q.dtype in (torch.float16, torch.bfloat16), "use fp16/bf16"
+
+    if sm_scale is None:
+        sm_scale = 1.0 / math.sqrt(D)
+
+    q, k, v = (t.contiguous() for t in (q, k, v))
+
+    if q_len <= _DECODE_QLEN_THRESHOLD and q_len < kv_len:
+        return _run_decode(q, k, v, causal, float(sm_scale))
+    return _run_prefill(q, k, v, causal, float(sm_scale))
 
 
-register("yaojixiu_flashattention(CuTe DSL)", attention)
+register("yaojx_flash_attention(CuTe DSL)", attention)
