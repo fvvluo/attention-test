@@ -7,23 +7,22 @@
 
 ## ✅ 最终测试命令
 
-以下是最终 M128N128 stage-4 Prefill 版本的锁定测试命令，**其余文档中出现的命令
-均为用法示例，非最终测试命令**。`--gpu` 直接选择物理 GPU；当前使用 6 号卡：
+以下命令使用当前最新版 benchmark，在进程可见的 `cuda:0` 上同时测试 Prefill 和
+Decode。**其余文档中出现的命令均为用法示例，非最终测试命令**：
 
 ```bash
-python3 bench_attention.py --gpu 6 --shapes 1x64x8x131072x128 --dtype bf16 --causal --phases prefill --warmup 10 --iters 10
+python3 bench_attention.py --gpu 0 --shapes 1x64x8x131072x128 --dtype bf16 --causal \
+    --prefill-warmup 10 --prefill-iters 10 --decode-warmup 100 --decode-iters 100
 ```
 
+- `--gpu 0`：选择当前进程可见的第 0 张 GPU；
 - `--shapes 1x64x8x131072x128`：GQA，`batch=1, q_heads=64, kv_heads=8,
   seq_len=131072（128K）, head_dim=128`；
 - `--dtype bf16`；
-- `--causal`：开启因果掩码（当前默认值就是开启，这里显式指定）；
-- `--phases prefill`：最终 M128 算子只运行 Prefill；
-- `--warmup 10 --iters 10`：10 次预热 + 10 次正式计时。
-- 序列长度 128K 属于长序列场景，prefill 阶段单次前向本身就要几秒，加上
-  20 次调用（10 warmup + 10 iters），baseline 部分预计要跑数分钟，运行期间
-  终端不会有中间输出，是正常现象（可另开窗口用 `nvidia-smi` 确认 GPU
-  利用率来判断是否仍在计算，而非卡死）。
+- `--causal`：开启 Prefill 因果掩码（Decode 会按 benchmark 规则关闭 causal）；
+- Prefill 使用 10 次预热和 10 次正式计时，Decode 使用 100 次预热和 100 次正式计时。
+- 序列长度 128K 属于长序列场景，Prefill 阶段单次前向本身就要几秒，运行期间
+  终端可能暂时没有中间输出，可另开窗口用 `nvidia-smi` 确认 GPU 是否仍在计算。
 
 ## 目录结构
 
