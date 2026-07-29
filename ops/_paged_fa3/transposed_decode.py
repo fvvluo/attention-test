@@ -75,7 +75,7 @@ GROUP = 8          # 每个 kv_head 下的 q_head 数
 DIM = 128          # head_dim
 TILE_KV = 256      # 每次主循环处理的 kv 行数（大 tile 减少 softmax 次数->减少 barrier 气泡）
 STAGES = 1         # K 的 TMA 环形缓冲级数（大 tile 下单级即可，省 SMEM）
-DEF_VSTAGES = 1    # V 的环形缓冲级数
+DEF_VSTAGES = 2    # V 双级环形缓冲：在 H20 上更好遮蔽 TMA 延迟
 THREADS = 256      # 128 生产者 + 128 消费者（各一个 warpgroup）
 DEF_SPLITS = 9     # 默认 split 数（items=72≈78SM，每CTA独占近整个head，
                    # partial往返极小+combine极轻+DRAM读局部性好 -> 3586 vs sp39 的 3452）
@@ -488,7 +488,8 @@ def decode(q, k, v, sm_scale=None, splits=DEF_SPLITS, tile_kv=TILE_KV,
         ent = _CACHE.get(key)
         if ent is None:
             if workers is None:
-                workers = torch.cuda.get_device_properties(q.device).multi_processor_count
+                # 给 combine/调度保留一个 SM；H20 78 SM 时使用 77 workers。
+                workers = max(1, torch.cuda.get_device_properties(q.device).multi_processor_count - 1)
             ker = TransposedDecode(H, HK, S, B, splits=splits, tile_kv=tile_kv, v_stages=v_stages,
                                    stages=stages, workers=workers, sm_scale=sm_scale)
             opart = torch.empty((splits, HK, GROUP, D, B), dtype=torch.bfloat16, device=q.device)
