@@ -1,6 +1,6 @@
 from .base import register
 
-from .implement_attention_decode3 import qwen3_attention
+from .implement_attention_decode4 import qwen3_attention
 
 
 def attention(q, k, v, causal=True, sm_scale=None):
@@ -13,4 +13,4 @@ def attention(q, k, v, causal=True, sm_scale=None):
     )
 
 
-register("yinjun Hopper CuTe DSL optimized III [Decode]", attention)
+register("yinjun Hopper CuTe DSL optimized IV [Decode]", attention)
