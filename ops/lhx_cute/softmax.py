@@ -167,23 +167,19 @@ class Softmax(ParamsBase):
                 row_max_safe = row_max_new
 
             if cutlass.const_expr(is_first):
-                selected_row_max = row_max_new
-                selected_row_max_safe = row_max_safe
                 row_scale[r] = 1.0
             else:
                 acc_scale_log2 = (row_max_prev - row_max_safe) * scale_log2
                 row_scale[r] = cute.math.exp2(acc_scale_log2, fastmath=True)
 
-                selected_row_max = row_max_new
-                selected_row_max_safe = row_max_safe
                 if cutlass.const_expr(rescale_threshold_log2 > 0.0):
                     if acc_scale_log2 >= -Float32(rescale_threshold_log2):
-                        selected_row_max = row_max_prev
-                        selected_row_max_safe = row_max_prev
+                        row_max_new = row_max_prev
+                        row_max_safe = row_max_prev
                         row_scale[r] = 1.0
 
-            row_max[r] = selected_row_max
-            row_max_scaled = selected_row_max_safe * scale_log2
+            row_max[r] = row_max_new
+            row_max_scaled = row_max_safe * scale_log2
             acc_S_row_exp = cute.math.exp2(
                 acc_S_row * scale_log2 - row_max_scaled, fastmath=True
             )
