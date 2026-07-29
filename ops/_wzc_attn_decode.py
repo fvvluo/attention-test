@@ -752,7 +752,7 @@ def attention_decode(q, k, v, sm_scale=None, causal=False, num_splits=NUM_SPLITS
         and q.is_contiguous() and k.is_contiguous() and v.is_contiguous()
     )
     if not supported:
-        return _sdpa_fallback(q, k, v, sm_scale, causal=causal)
+        return _sdpa_fallback(q, k, v, causal=causal, sm_scale = sm_scale)
 
     key = (
         q.device.index, batch, q_heads, kv_heads, kv_len, head_dim,
