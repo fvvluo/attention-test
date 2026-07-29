@@ -81,7 +81,7 @@ def _fa_inner(o, l, m, q, k_desc, v_desc,
     """
     for j in range(j_lo, j_hi):
         k = k_desc.load([j * BC, 0])  # TMA：越界自动补零
-        s = tl.dot(q, tl.trans(k)) * qk_scale
+        s = tl.dot(q, tl.trans(k)) * qk_scale  # fp32
 
         if MASKED:
             cols = j * BC + tl.arange(0, BC)
@@ -91,6 +91,8 @@ def _fa_inner(o, l, m, q, k_desc, v_desc,
             s = tl.where(mask, s, float("-inf"))
 
         # qk_scale 已乘入 log2(e)，m/s 处于 log2 域，exp2(x) == exp(x_original)
+        # prefill 中间量全程 fp32（精度优先）；仅 p 在送入 tensor-core dot 前
+        # 转成 v 的 dtype
         m_new = tl.maximum(m, tl.max(s, axis=1))
         alpha = tl.math.exp2(m - m_new)  # 旧统计量的缩放系数（首个 block 时 m=-inf -> alpha=0）
         p = tl.math.exp2(s - m_new[:, None])
@@ -178,8 +180,8 @@ def _decode_fused_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
     阶段 1（partial）：每个 program 负责一个 kv head 的一段 kv [lo, hi)，
     一次性载入该组全部 g 个 q head（GNQ = g*n_q 行）与同一份 K/V 做
     attention —— K/V 只从 HBM 读一次，避免朴素 GQA 每 q head 各读一遍的
-    g 倍冗余流量。partial (o, m, l)（o 存 fp16 以减半暂存读写流量，
-    m/l 仍 fp32）写入全局暂存。
+    g 倍冗余流量。partial (o, m, l)（dtype 随输入的 16bit 类型，暂存读写
+    流量减半）写入全局暂存。
 
     阶段 2（merge）：每个 (b, kv_head) 组内最后一个完成 partial 的 program
     （通过对 cnt_ptr 计数判断）负责本组的 log-sum-exp 合并、归一化写出，
@@ -210,9 +212,10 @@ def _decode_fused_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
     lo = s_id * chunk
     hi = tl.minimum(n_kv, lo + chunk)
 
-    o = tl.zeros([M_PAD, D], dtype=tl.float32)
-    l = tl.zeros([M_PAD], dtype=tl.float32)
-    m = tl.full([M_PAD], float("-inf"), dtype=tl.float32)
+    # 中间量精度随输入（q.dtype 是编译期常量）：fp16 输入 -> fp16，bf16 输入 -> bf16
+    o = tl.zeros([M_PAD, D], dtype=q.dtype)
+    l = tl.zeros([M_PAD], dtype=q.dtype)
+    m = tl.full([M_PAD], float("-inf"), dtype=q.dtype)
 
     offset = n_kv - n_q
     rows = tl.arange(0, M_PAD)
@@ -220,7 +223,8 @@ def _decode_fused_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
 
     for j0 in range(lo, hi, BC):
         k = k_desc.load([j0, 0])
-        s = tl.dot(q, tl.trans(k)) * qk_scale
+        # 16bit 输入的 dot 输出恒为 fp32（tensor core 无 16bit 累加），显式转回
+        s = (tl.dot(q, tl.trans(k)) * qk_scale).to(q.dtype)
 
         cols = j0 + tl.arange(0, BC)
         mask = (cols < hi)[None, :]
@@ -228,16 +232,18 @@ def _decode_fused_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
             mask = mask & (cols[None, :] <= (r_local + offset)[:, None])
         s = tl.where(mask, s, float("-inf"))
 
-        m_new = tl.maximum(m, tl.max(s, axis=1))
+        m_new = tl.maximum(m, tl.max(s, axis=1))  # tl.max 对 16bit 输入返回 fp32
         # 该段可能对某些行全被掩码（m_new=-inf），用 0 兜底避免 exp(nan)
         m_safe = tl.where(m_new == float("-inf"), 0.0, m_new)
-        alpha = tl.math.exp2(m - m_safe)
-        p = tl.math.exp2(s - m_safe[:, None])
+        # tl.math.exp2 只接受 fp32/fp64；参数因 m_safe 为 fp32 而天然 fp32，
+        # 结果与跨迭代的 m 显式转回输入 dtype
+        alpha = tl.math.exp2(m - m_safe).to(q.dtype)
+        p = tl.math.exp2(s - m_safe[:, None]).to(q.dtype)
         l = l * alpha + tl.sum(p, axis=1)
 
         v = v_desc.load([j0, 0])
-        o = o * alpha[:, None] + tl.dot(p.to(v.dtype), v)
-        m = m_new
+        o = o * alpha[:, None] + tl.dot(p.to(v.dtype), v).to(q.dtype)
+        m = m_new.to(q.dtype)
 
     pid = bhk * splits + s_id
     dcols = tl.arange(0, D)
@@ -263,18 +269,18 @@ def _decode_fused_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
                         mask=smask, other=0.0)
         m_star = tl.max(m_all, axis=0)
         m_gsafe = tl.where(m_star == float("-inf"), 0.0, m_star)
-        w_all = tl.math.exp2(m_all - m_gsafe[None, :])  # 无效 split -> w=0
+        w_all = tl.math.exp2(m_all - m_gsafe[None, :]).to(q.dtype)  # 无效 split -> w=0
         l_g = tl.sum(l_all * w_all, axis=0)
 
-        o_g = tl.zeros([M_PAD, D], dtype=tl.float32)
+        o_g = tl.zeros([M_PAD, D], dtype=q.dtype)
         for sid in range(splits):
             pid2 = bhk * splits + sid
             m_s = tl.load(mp_ptr + pid2 * GNQ + rows, mask=valid,
                           other=float("-inf"))
-            w = tl.math.exp2(m_s - m_gsafe)
+            w = tl.math.exp2(m_s - m_gsafe).to(q.dtype)
             o_s = tl.load(op_ptr + (pid2 * GNQ + rows)[:, None] * D
                           + dcols[None, :], mask=valid[:, None], other=0.0)
-            o_g += w[:, None] * o_s.to(tl.float32)  # partial 为 fp16
+            o_g += w[:, None] * o_s  # partial dtype 随输入
 
         o_g = o_g / l_g[:, None]  # l_g==0 只在 valid=False 的 padding 行
         tl.store(o_ptr + (row0 + rows)[:, None] * D + dcols[None, :],
@@ -289,7 +295,8 @@ def _prep(q, k, v, sm_scale):
     b, h, n_q, d = q.shape
     _, h_kv, n_kv, _ = k.shape
     assert k.shape == v.shape
-    assert q.dtype in (torch.float16, torch.bfloat16), "TMA kernel 仅支持 fp16/bf16 q/k/v"
+    assert q.dtype in (torch.float16, torch.bfloat16), \
+        "q/k/v 需为 fp16/bf16（prefill 内部 fp32 累加；decode 中间量精度随输入）"
     assert q.device.type == "cuda" and k.device == q.device and v.device == q.device
     assert h % h_kv == 0, "q_heads 必须是 kv_heads 的整数倍"
     assert 16 <= d <= 256 and (d & (d - 1)) == 0, "head_dim 需为 [16,256] 内 2 的幂"
@@ -335,16 +342,16 @@ def prefill(q, k, v, causal=True, sm_scale=None):
 _DECODE_SCRATCH = {}
 
 
-def _decode_scratch(BHK, splits, GNQ, d, device):
-    key = (BHK, splits, GNQ, d, device)
+def _decode_scratch(BHK, splits, GNQ, d, device, dtype):
+    key = (BHK, splits, GNQ, d, device, dtype)
     if len(_DECODE_SCRATCH) > 32:
         _DECODE_SCRATCH.clear()
     if key not in _DECODE_SCRATCH:
-        # o_part 用 fp16（读写流量减半，merge 是带宽/延迟受限的；
-        # 精度足够 —— 最终输出也是 fp16，merge 权重 m/l 仍保持 fp32）
-        o_part = torch.empty(BHK * splits * GNQ * d, device=device, dtype=torch.float16)
-        m_part = torch.empty(BHK * splits * GNQ, device=device, dtype=torch.float32)
-        l_part = torch.empty(BHK * splits * GNQ, device=device, dtype=torch.float32)
+        # partial 用与输入相同的 16bit 类型（读写流量减半，merge 是带宽/延迟
+        # 受限的；精度足够 —— 最终输出也是同一 dtype）
+        o_part = torch.empty(BHK * splits * GNQ * d, device=device, dtype=dtype)
+        m_part = torch.empty(BHK * splits * GNQ, device=device, dtype=dtype)
+        l_part = torch.empty(BHK * splits * GNQ, device=device, dtype=dtype)
         cnt = torch.zeros(BHK, device=device, dtype=torch.int32)
         _DECODE_SCRATCH[key] = (o_part, m_part, l_part, cnt)
     return _DECODE_SCRATCH[key]
@@ -361,7 +368,7 @@ def _decode_run(q, k, v, o, qk_scale, causal, splits):
     BHK = b * h_kv
     chunk = triton.cdiv(triton.cdiv(n_kv, splits), 128) * 128
     sp = triton.cdiv(n_kv, chunk)
-    o_part, m_part, l_part, cnt = _decode_scratch(BHK, sp, GNQ, d, q.device)
+    o_part, m_part, l_part, cnt = _decode_scratch(BHK, sp, GNQ, d, q.device, q.dtype)
     _decode_fused_kernel[(sp, BHK)](q, k, v, o, o_part, m_part, l_part, cnt,
                                     b * h * n_q, n_q, n_kv, h_kv, g,
                                     qk_scale, chunk, sp,
@@ -406,7 +413,7 @@ def decode(q, k, v, causal=True, sm_scale=None):
 
     要求 n_q <= 16 且 g*n_q <= 128。同一 kv 组内的所有 q head 在一个 program
     里共享同一份 K/V（K/V 只从 HBM 读一次）；kv 按 splits 段并行算出
-    partial (o, m, l)（o 为 fp16），由组内最后一个 program（信号量计数）
+    partial (o, m, l)（dtype 随输入），由组内最后一个 program（信号量计数）
     直接做 log-sum-exp 合并并复位信号量。
     kernel 配置由 triton.autotune 调，splits 由 _tune_decode_splits 实测。
     """
