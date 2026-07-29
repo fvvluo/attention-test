@@ -8,4 +8,4 @@ def attention(q, k, v, causal=True, sm_scale=None):
     return run_wxl_sm90_gqa_decode(q, k, v, sm_scale=sm_scale)
 
 
-register("WXL CuTe DSL SM90 split-KV decode", attention, phases=("decode",))
+register("WXL CuTe DSL SM90 split-KV decode", attention)

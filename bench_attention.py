@@ -14,8 +14,11 @@ Prefill / Decode 说明：
                  去 attend 已缓存的 KV-Cache（访存密集，性能瓶颈是带宽而非算力）
     两个阶段会分别打印独立的对比表格（耗时 / TFLOPS / GB/s）。
 
-最终测试命令（锁定的 M128N128 stage-4 Prefill 版本）：
-    python3 bench_attention.py --gpu 6 --shapes 1x64x8x131072x128 --dtype bf16 --causal --phases prefill --warmup 10 --iters 10
+最终测试命令（本次评测实际使用的命令，非用法示例）：
+    python3 bench_attention.py --gpu 0 --shapes 1x64x8x131072x128 --dtype bf16 --causal \
+        --prefill-warmup 10 --prefill-iters 10 --decode-warmup 100 --decode-iters 100
+    （prefill 用 10+10；decode 单次耗时极小，用 100+100 降低测量噪声，
+     总耗时几乎不变，因为总时间由 prefill 主导。这也是各参数的默认值。）
 
 用法示例（以下均为参数用法演示，非最终测试命令）：
     python bench_attention.py --gpu 0
@@ -117,8 +120,16 @@ def parse_args():
         default=True,
         help="是否使用因果掩码（仅作用于 prefill 阶段，默认开启，用 --no-causal 关闭）",
     )
-    parser.add_argument("--warmup", type=int, default=5, help="正式计时前的 warmup 次数")
-    parser.add_argument("--iters", type=int, default=20, help="正式计时的迭代次数")
+    parser.add_argument("--prefill-warmup", type=int, default=10, help="prefill 阶段正式计时前的 warmup 次数")
+    parser.add_argument("--prefill-iters", type=int, default=10, help="prefill 阶段正式计时的迭代次数")
+    parser.add_argument(
+        "--decode-warmup",
+        type=int,
+        default=100,
+        help="decode 阶段正式计时前的 warmup 次数（decode 单次耗时远小于 "
+        "prefill，用更多次数降低测量噪声）",
+    )
+    parser.add_argument("--decode-iters", type=int, default=100, help="decode 阶段正式计时的迭代次数")
     parser.add_argument(
         "--check-only",
         action="store_true",
@@ -179,11 +190,24 @@ DTYPE_MAP = {
     "bf16": torch.bfloat16,
 }
 
-# 不同 dtype 下的正确性容差
+# 不同 dtype 下的正确性容差（prefill 阶段 / 未指定阶段时的默认值）。
+# prefill 是 q_len==kv_len 的长序列求和，bf16 累加误差随序列长度增大，
+# 实测正确实现的最大绝差可达 ~1.5e-2（128K 更大），因此保持 2e-2。
 TOLERANCE = {
     torch.float16: dict(abs_tol=2e-2, rel_tol=2e-2),
     torch.bfloat16: dict(abs_tol=2e-2, rel_tol=2e-2),
     torch.float32: dict(abs_tol=1e-4, rel_tol=1e-4),
+}
+
+# decode 阶段（q_len=1）累加规模远小于 prefill：在真实评测形状
+# (1x64x8x131072x128) 上，正确实现相对 baseline 的最大绝差实测仅 ~1e-4 量级
+# （fp32 softmax 6.1e-5，分数走 bf16 也只有 1.2e-4）；而"均值糊弄 softmax"
+# 之类的取巧实现最大绝差 ~1.5e-2、top-1/last-token 更是 >3。因此用 1e-3 的
+# 严阈值：正确实现仍有近一个数量级余量，投机实现全部被拦下。
+# 未在此列出的 dtype 回落到 TOLERANCE。
+DECODE_TOLERANCE = {
+    torch.float16: dict(abs_tol=1e-3, rel_tol=1e-3),
+    torch.bfloat16: dict(abs_tol=1e-3, rel_tol=1e-3),
 }
 
 
@@ -294,8 +318,17 @@ class CorrectnessResult:
     error: Optional[str] = None
 
 
-def check_correctness(output: torch.Tensor, baseline_output: torch.Tensor, dtype: torch.dtype) -> CorrectnessResult:
-    tol = TOLERANCE.get(dtype, dict(abs_tol=1e-4, rel_tol=1e-4))
+def check_correctness(
+    output: torch.Tensor,
+    baseline_output: torch.Tensor,
+    dtype: torch.dtype,
+    phase: Optional[str] = None,
+) -> CorrectnessResult:
+    # decode 阶段用更严的容差（见 DECODE_TOLERANCE 说明）；其余阶段用默认 TOLERANCE。
+    if phase == "decode" and dtype in DECODE_TOLERANCE:
+        tol = DECODE_TOLERANCE[dtype]
+    else:
+        tol = TOLERANCE.get(dtype, dict(abs_tol=1e-4, rel_tol=1e-4))
 
     out_f32 = output.float()
     base_f32 = baseline_output.float()
@@ -547,12 +580,16 @@ def main():
             if phase == "prefill":
                 q_len, kv_len = seq_len, seq_len
                 phase_causal = args.causal
+                phase_warmup = args.prefill_warmup
+                phase_iters = args.prefill_iters
             else:  # decode
                 q_len, kv_len = 1, seq_len
                 # decode 阶段新 token 天然位于序列末尾，能 attend 到全部已缓存的
                 # kv，等价于非因果；这里显式关闭 causal，避免部分朴素实现在
                 # q_len != kv_len 时对绝对位置的因果掩码处理出错。
                 phase_causal = False
+                phase_warmup = args.decode_warmup
+                phase_iters = args.decode_iters
 
             q, k, v = make_inputs(batch, q_heads, kv_heads, q_len, kv_len, head_dim, dtype, device)
             sm_scale = None  # 使用默认缩放 1/sqrt(head_dim)
@@ -568,7 +605,7 @@ def main():
             if not args.check_only:
                 baseline_bench = benchmark_fn(
                     baseline_fn, q, k, v, phase_causal, sm_scale,
-                    args.warmup, args.iters, device,
+                    phase_warmup, phase_iters, device,
                 )
                 phase_baseline_benches[phase] = baseline_bench
 
@@ -577,12 +614,12 @@ def main():
                 report = OpReport(name=name)
                 try:
                     output = fn(q, k, v, causal=phase_causal, sm_scale=sm_scale)
-                    report.correctness = check_correctness(output, baseline_output, dtype)
+                    report.correctness = check_correctness(output, baseline_output, dtype, phase)
 
                     if not args.check_only:
                         report.bench = benchmark_fn(
                             fn, q, k, v, phase_causal, sm_scale,
-                            args.warmup, args.iters, device,
+                            phase_warmup, phase_iters, device,
                         )
                 except Exception as e:  # noqa: BLE001
                     report.run_error = str(e)
