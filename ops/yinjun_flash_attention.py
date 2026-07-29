@@ -1,6 +1,6 @@
 from .base import register
 
-from .implement_attention_optimized import qwen3_attention
+from .implement_attention_optimized_edit import qwen3_attention
 
 
 def attention(q, k, v, causal=True, sm_scale=None):

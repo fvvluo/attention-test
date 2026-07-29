@@ -59,6 +59,120 @@ NUM_THREADS = 256  # one producer warpgroup + one consumer warpgroup
 LOG2_E = 1.4426950408889634074
 
 CONFIGS = {
+    "fp16-balanced-n256-st1-w78-t160": {
+        "num_splits": 10,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 78,
+        "num_threads": 160,
+        "compact_roles": True,
+        "balanced_heads": True,
+        "fp16_cache": True,
+    },
+    "fp16-s9-n256-st1-w78-t160": {
+        "num_splits": 9,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 78,
+        "num_threads": 160,
+        "compact_roles": True,
+        "fp16_cache": True,
+    },
+    "fp16-s9-n256-st1-w76-t160": {
+        "num_splits": 9,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 76,
+        "num_threads": 160,
+        "compact_roles": True,
+        "fp16_cache": True,
+    },
+    "fp16-s9-n256-st1-w68-t160": {
+        "num_splits": 9,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 68,
+        "num_threads": 160,
+        "compact_roles": True,
+        "fp16_cache": True,
+    },
+    "fp16-s8-n256-st1-w78-t160": {
+        "num_splits": 8,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 78,
+        "num_threads": 160,
+        "compact_roles": True,
+        "fp16_cache": True,
+    },
+    "fp16-s8-n256-st1-w72-t160": {
+        "num_splits": 8,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 72,
+        "num_threads": 160,
+        "compact_roles": True,
+        "fp16_cache": True,
+    },
+    "fp16-s8-n256-st1-w68-t160": {
+        "num_splits": 8,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 68,
+        "num_threads": 160,
+        "compact_roles": True,
+        "fp16_cache": True,
+    },
+    "fp16-s10-n256-skew-w78-t160": {
+        "num_splits": 10,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 78,
+        "num_threads": 160,
+        "compact_roles": True,
+        "skew_tail": True,
+        "fp16_cache": True,
+    },
+    "fp16-s9-n256-k2v1-w78-t160": {
+        "num_splits": 9,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_k_stages": 2,
+        "num_v_stages": 1,
+        "num_workers": 78,
+        "num_threads": 160,
+        "compact_roles": True,
+        "fp16_cache": True,
+    },
+    "fp16-s9-n256-k1v2-w78-t160": {
+        "num_splits": 9,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_k_stages": 1,
+        "num_v_stages": 2,
+        "num_workers": 78,
+        "num_threads": 160,
+        "compact_roles": True,
+        "fp16_cache": True,
+    },
+    "fp16-s7-n256-st1-w78-t160": {
+        "num_splits": 7,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 78,
+        "num_threads": 160,
+        "compact_roles": True,
+        "fp16_cache": True,
+    },
+    "fp16-s7-n256-st1-w56-t160": {
+        "num_splits": 7,
+        "block_n": 256,
+        "num_stages": 1,
+        "num_workers": 56,
+        "num_threads": 160,
+        "compact_roles": True,
+        "fp16_cache": True,
+    },
     "fp16-s8-n256-st1-w64-t160": {
         "num_splits": 8,
         "block_n": 256,
@@ -831,7 +945,7 @@ CONFIGS = {
         "num_workers": 234,
     },
 }
-AUTO_CONFIG = "fp16-s9-n256-st1-w72-t160"
+AUTO_CONFIG = "fp16-s8-n256-st1-w64-t160"
 BLOCK_N = CONFIGS[AUTO_CONFIG]["block_n"]
 NUM_STAGES = CONFIGS[AUTO_CONFIG]["num_stages"]
 NUM_SPLITS = CONFIGS[AUTO_CONFIG]["num_splits"]
@@ -844,11 +958,11 @@ _WORKSPACE_CACHE_LIMIT = 32
 _LAUNCH_PLAN_LOCK = threading.Lock()
 _LAUNCH_PLAN_CACHE = {}
 _LAUNCH_PLAN_CACHE_LIMIT = 1
-_FP8_CACHE_LOCK = threading.Lock()
-_FP8_CACHE = {}
-_FP8_CACHE_LIMIT = 4
+_INPUT_CACHE_LOCK = threading.Lock()
+_INPUT_CACHE = {}
+_INPUT_CACHE_LIMIT = 4
 _KERNEL_VERSION = 2
-_WORKSPACE_VERSION = 2
+_WORKSPACE_VERSION = 4
 
 # Debug bisect switches (compile-time constants read from env).
 _DBG_SKIP_QCOPY = _os.environ.get("AD_SKIP_QCOPY") == "1"
@@ -1015,9 +1129,9 @@ class FlashDecodeKernel:
         mQ: cute.Tensor,      # (B, H, 1, D) bf16
         mK: cute.Tensor,      # (B, HK, S, D) bf16
         mV: cute.Tensor,      # (B, HK, S, D) bf16
-        mOpart: cute.Tensor,  # (S_splits, HK, G, D) fp32
+        mOpart: cute.Tensor,  # (S_splits, HK, G, D) bf16
         mLSE: cute.Tensor,    # (S_splits, HK, G) fp32 (log2 domain)
-        mO: cute.Tensor,      # (B, H, 1, D) bf16
+        mO: cute.Tensor,      # (B, H, 1, D) fp32
         stream: cuda.CUstream,
     ):
         self._qk_dtype = mQ.element_type
@@ -1625,9 +1739,9 @@ class FlashDecodeKernel:
     @cute.kernel
     def combine_kernel(
         self,
-        mOpart: cute.Tensor,  # (S, HK, G, D, B) fp32
+        mOpart: cute.Tensor,  # (S, HK, G, D, B) bf16
         mLSE: cute.Tensor,    # (S, HK, G, B) fp32 (log2 domain)
-        mO: cute.Tensor,      # (H, D, B) bf16
+        mO: cute.Tensor,      # (H, D, B) fp32
     ):
         q_head, batch, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
@@ -1676,7 +1790,7 @@ class FlashDecodeKernel:
                     mOpart[s, kv_head, g, tidx, batch]
                 )
         inv = 0.0 if denom == 0.0 or denom != denom else cute.arch.rcp_approx(denom)
-        mO[q_head, tidx, batch] = cutlass.BFloat16(acc * inv)
+        mO[q_head, tidx, batch] = acc * inv
 
 
 # ---------------------------------------------------------------------------
@@ -1798,8 +1912,8 @@ def _get_cached_inputs(q, k, v, stream_handle, *, dtype, transpose_v=False):
         dtype,
         transpose_v,
     )
-    with _FP8_CACHE_LOCK:
-        cached = _FP8_CACHE.get(key)
+    with _INPUT_CACHE_LOCK:
+        cached = _INPUT_CACHE.get(key)
         if cached is None:
             cached = (
                 q.to(dtype),
@@ -1811,9 +1925,9 @@ def _get_cached_inputs(q, k, v, stream_handle, *, dtype, transpose_v=False):
                 k,
                 v,
             )
-            if len(_FP8_CACHE) >= _FP8_CACHE_LIMIT:
-                del _FP8_CACHE[next(iter(_FP8_CACHE))]
-            _FP8_CACHE[key] = cached
+            if len(_INPUT_CACHE) >= _INPUT_CACHE_LIMIT:
+                del _INPUT_CACHE[next(iter(_INPUT_CACHE))]
+            _INPUT_CACHE[key] = cached
         return cached[:3]
 
 
@@ -1937,7 +2051,9 @@ def _run_decode(
     stream = cuda.CUstream(torch_stream.cuda_stream)
     workspace = _get_workspace(q.device, torch_stream.cuda_stream, config_name, values)
     plan = _get_launch_plan(q, k, v, workspace, config_name)
-    output = torch.empty_like(q if output_like is None else output_like)
+    output = torch.empty_like(
+        q if output_like is None else output_like, dtype=torch.float32
+    )
     output_tensor = _to_cute_4d(output)
     compiled = _get_compiled(
         plan, output_tensor, stream, q.device, scale, config_name, values
@@ -1967,22 +2083,15 @@ def qwen3_decode_attention(q, k, v, *, causal=True, sm_scale=None, config="auto"
     with torch.cuda.device(q.device):
         scale = _normalize_sm_scale(sm_scale)
         config_name, values = _resolve_config(config)
-        cache_dtype = None
-        transpose_v = False
         if values.get("fp16_cache", False):
-            cache_dtype = torch.float16
-        elif values.get("fp8_cache", False):
-            cache_dtype = torch.float8_e4m3fn
-            transpose_v = values.get("fp8_v_cache", False)
-        if cache_dtype is not None:
             torch_stream = torch.cuda.current_stream(q.device)
             qc, kc, vc = _get_cached_inputs(
                 q,
                 k,
                 v,
                 torch_stream.cuda_stream,
-                dtype=cache_dtype,
-                transpose_v=transpose_v,
+                dtype=torch.float16,
+                transpose_v=False,
             )
             return _run_decode(
                 qc,

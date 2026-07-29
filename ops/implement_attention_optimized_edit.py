@@ -32,8 +32,8 @@ Targets fixed B=1, Hq=64, Hkv=8, D=128 workloads: tuned causal Prefill
 and concurrent split-KV Pack-GQA Decode with FP32 LSE combination.
 """
 
+import enum
 import math
-import os
 import sys
 import threading
 from typing import Type, Tuple, Optional, Sequence
@@ -42,32 +42,592 @@ import cuda.bindings.driver as cuda
 
 import cutlass
 import cutlass.cute as cute
-
 import cutlass.cute.nvgpu.warpgroup as warpgroup
-import cutlass.utils as utils
 import cutlass.pipeline as pipeline
-from cutlass._mlir.dialects import math as _math
-
+import cutlass.utils as utils
 import cutlass.utils.hopper_helpers as sm90_utils
-from cutlass.cute.runtime import from_dlpack
-
-CUTLASS_CUTE_EXAMPLES = os.environ.get(
-    "CUTLASS_CUTE_EXAMPLES", "/dockerdata/cutlass/examples/python/CuTeDSL"
-)
-if CUTLASS_CUTE_EXAMPLES not in sys.path:
-    sys.path.insert(0, CUTLASS_CUTE_EXAMPLES)
-
-from helpers import fmha_helpers as fmha_utils
-
-from cutlass.cutlass_dsl import (
-    Boolean, Int32, if_generate, while_generate, yield_out, not_, dsl_user_op,
-)
+from cutlass._mlir.dialects import math as _math
 from cutlass._mlir.dialects import nvvm
 from cutlass._mlir._mlir_libs._cutlass_ir._mlir.ir import IntegerType
-from contextlib import contextmanager
+from cutlass.cute.runtime import from_dlpack
+from cutlass.cute.typing import Boolean as CuteBoolean
+from cutlass.cutlass_dsl import (
+    Boolean,
+    Float32,
+    Int32,
+    dsl_user_op,
+    extract_mlir_values,
+    if_generate,
+    min as dsl_min,
+    new_from_mlir_values,
+    not_,
+    while_generate,
+    yield_out,
+)
+from cutlass.utils import WorkTileInfo
+from cutlass.utils.hardware_info import HardwareInfo
 
 
-import inspect as _inspect
+class _FmhaStaticTileSchedulerParams:
+    def __init__(self, is_persistent, problem_shape_mbh, *, loc=None, ip=None):
+        self.is_persistent = is_persistent
+        self.problem_shape_mbh = problem_shape_mbh
+        self._loc = loc
+        self._ip = ip
+
+    def __extract_mlir_values__(self):
+        values = extract_mlir_values(self.problem_shape_mbh)
+        self._problem_shape_value_count = len(values)
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        problem_shape = new_from_mlir_values(
+            self.problem_shape_mbh, values[: self._problem_shape_value_count]
+        )
+        return _FmhaStaticTileSchedulerParams(
+            self.is_persistent, problem_shape, loc=self._loc, ip=self._ip
+        )
+
+
+class _FmhaStaticTileScheduler:
+    def __init__(
+        self,
+        params,
+        current_work_linear_idx,
+        blk_coord,
+        grid_shape,
+        *,
+        loc=None,
+        ip=None,
+    ):
+        self._params = params
+        self._blk_coord = blk_coord
+        self._grid_shape = grid_shape
+        self._is_persistent = params.is_persistent
+        self._current_work_linear_idx = current_work_linear_idx
+        self._problem_shape_mbh = cute.make_layout(
+            params.problem_shape_mbh, loc=loc, ip=ip
+        )
+        self._num_blocks = cute.size(self._problem_shape_mbh, loc=loc, ip=ip)
+        self._is_first_block = True
+        self.num_persistent_sm = cute.size(grid_shape, loc=loc, ip=ip)
+
+    @staticmethod
+    def get_grid_shape(params, *, loc=None, ip=None):
+        if params.is_persistent:
+            sm_count = HardwareInfo().get_device_multiprocessor_count()
+            return (
+                dsl_min(
+                    sm_count,
+                    cute.size(params.problem_shape_mbh, loc=loc, ip=ip),
+                ),
+                1,
+                1,
+            )
+        return params.problem_shape_mbh
+
+    @staticmethod
+    def check_valid_work_for_seqlen_q(
+        q_tiler: int, current_idx: Int32, seqlen_q: Int32
+    ) -> CuteBoolean:
+        return current_idx * q_tiler < seqlen_q
+
+    def get_current_work(self, *, loc=None, ip=None):
+        is_valid = (
+            self._current_work_linear_idx < self._num_blocks
+            if self._is_persistent
+            else self._is_first_block
+        )
+        if self._is_persistent:
+            block_coord = self._problem_shape_mbh.get_hier_coord(
+                self._current_work_linear_idx, loc=loc, ip=ip
+            )
+        else:
+            block_coord = self._blk_coord
+        tile_coord = (
+            block_coord[0],
+            0,
+            (block_coord[1], block_coord[2]),
+        )
+        return WorkTileInfo(tile_coord, is_valid)
+
+    def initial_work_tile_info(self, *, loc=None, ip=None):
+        return self.get_current_work(loc=loc, ip=ip)
+
+    def advance_to_next_work(self, *, advance_count=1, loc=None, ip=None):
+        if self._is_persistent:
+            self._current_work_linear_idx += advance_count * self.num_persistent_sm
+        self._is_first_block = False
+
+    def __extract_mlir_values__(self):
+        values = extract_mlir_values(self._params)
+        values.extend(extract_mlir_values(self._current_work_linear_idx))
+        values.extend(extract_mlir_values(self._blk_coord))
+        values.extend(extract_mlir_values(self._grid_shape))
+        return values
+
+    def __new_from_mlir_values__(self, values):
+        return _FmhaStaticTileScheduler(
+            new_from_mlir_values(self._params, values[0:3]),
+            new_from_mlir_values(self._current_work_linear_idx, [values[3]]),
+            new_from_mlir_values(self._blk_coord, values[4:7]),
+            new_from_mlir_values(self._grid_shape, values[7:]),
+        )
+
+
+def _create_fmha_static_tile_scheduler(params, block_coord, grid_shape):
+    return _FmhaStaticTileScheduler(
+        params, block_coord[0], block_coord, grid_shape
+    )
+
+
+def _compute_fmha_grid(output_shape, cta_tiler, is_persistent):
+    params = _FmhaStaticTileSchedulerParams(
+        is_persistent,
+        (
+            cute.ceil_div(cute.size(output_shape[0]), cta_tiler[0]),
+            cute.size(output_shape[2][0]),
+            cute.size(output_shape[2][1]),
+        ),
+    )
+    return params, _FmhaStaticTileScheduler.get_grid_shape(params)
+
+
+class _MaskEnum(enum.Enum):
+    RESIDUAL_MASK = enum.auto()
+    RESIDUAL_MASK_BWD = enum.auto()
+    WINDOW_MASK = enum.auto()
+    WINDOW_MASK_INFERENCE = enum.auto()
+    WINDOW_MASK_BWD = enum.auto()
+    WINDOW_MASK_BWD_INFERENCE = enum.auto()
+
+
+class _FusedMask:
+    @staticmethod
+    def get_trip_count(
+        mask_type,
+        block_coord,
+        tile_shape,
+        seqlen_q,
+        seqlen_k,
+        window_size_left=None,
+        window_size_right=None,
+    ):
+        result = 0
+        offset = 0
+        if cutlass.const_expr(mask_type is _MaskEnum.WINDOW_MASK_INFERENCE):
+            offset = seqlen_k - seqlen_q
+        if cutlass.const_expr(mask_type is _MaskEnum.WINDOW_MASK_BWD_INFERENCE):
+            offset = seqlen_q - seqlen_k
+        if cutlass.const_expr(mask_type is _MaskEnum.RESIDUAL_MASK):
+            result = cute.ceil_div(seqlen_k, tile_shape[1])
+        if cutlass.const_expr(mask_type is _MaskEnum.RESIDUAL_MASK_BWD):
+            result = cute.ceil_div(seqlen_q, tile_shape[0])
+        if cutlass.const_expr(
+            mask_type is _MaskEnum.WINDOW_MASK
+            or mask_type is _MaskEnum.WINDOW_MASK_INFERENCE
+        ):
+            if cutlass.const_expr(window_size_right is None):
+                result = cute.ceil_div(seqlen_k, tile_shape[1])
+            else:
+                max_index_q = (block_coord[0] + 1) * tile_shape[0]
+                result = dsl_min(
+                    cute.ceil_div(seqlen_k, tile_shape[1]),
+                    cute.ceil_div(
+                        max_index_q + offset + window_size_right, tile_shape[1]
+                    ),
+                )
+        if cutlass.const_expr(
+            mask_type is _MaskEnum.WINDOW_MASK_BWD
+            or mask_type is _MaskEnum.WINDOW_MASK_BWD_INFERENCE
+        ):
+            if cutlass.const_expr(window_size_left is None):
+                result = cute.ceil_div(seqlen_q, tile_shape[0])
+            else:
+                max_index_k = (block_coord[1] + 1) * tile_shape[1]
+                result = dsl_min(
+                    cute.ceil_div(seqlen_q, tile_shape[0]),
+                    cute.ceil_div(
+                        max_index_k + offset + window_size_left, tile_shape[0]
+                    ),
+                )
+        return result - _FusedMask.get_trip_start(
+            mask_type,
+            block_coord,
+            tile_shape,
+            seqlen_q,
+            seqlen_k,
+            window_size_left,
+            window_size_right,
+        )
+
+    @staticmethod
+    @cute.jit
+    def get_trip_start(
+        mask_type,
+        block_coord,
+        tile_shape,
+        seqlen_q,
+        seqlen_k,
+        window_size_left=None,
+        window_size_right=None,
+    ):
+        result = 0
+        offset = 0
+        if cutlass.const_expr(mask_type is _MaskEnum.WINDOW_MASK_INFERENCE):
+            offset = seqlen_k - seqlen_q
+        if cutlass.const_expr(mask_type is _MaskEnum.WINDOW_MASK_BWD_INFERENCE):
+            offset = seqlen_q - seqlen_k
+        if cutlass.const_expr(
+            mask_type is _MaskEnum.WINDOW_MASK
+            or mask_type is _MaskEnum.WINDOW_MASK_INFERENCE
+        ):
+            if cutlass.const_expr(window_size_left is not None):
+                min_index_q = block_coord[0] * tile_shape[0]
+                result = max(
+                    (min_index_q + offset - window_size_left) // tile_shape[1],
+                    result,
+                )
+        if cutlass.const_expr(
+            mask_type is _MaskEnum.WINDOW_MASK_BWD
+            or mask_type is _MaskEnum.WINDOW_MASK_BWD_INFERENCE
+        ):
+            if cutlass.const_expr(window_size_right is not None):
+                min_index_k = block_coord[1] * tile_shape[1]
+                result = max(
+                    (min_index_k + offset - window_size_right) // tile_shape[0],
+                    result,
+                )
+        return result
+
+    @staticmethod
+    @cute.jit
+    def get_leading_mask_id(
+        mask_type,
+        block_coord,
+        tile_shape,
+        seqlen_q,
+        seqlen_k,
+        window_size_left=None,
+        window_size_right=None,
+    ):
+        offset = 0
+        if cutlass.const_expr(mask_type is _MaskEnum.WINDOW_MASK_INFERENCE):
+            offset = seqlen_k - seqlen_q
+        if cutlass.const_expr(mask_type is _MaskEnum.WINDOW_MASK_BWD_INFERENCE):
+            offset = seqlen_q - seqlen_k
+        begin = _FusedMask.get_trip_start(
+            mask_type,
+            block_coord,
+            tile_shape,
+            seqlen_q,
+            seqlen_k,
+            window_size_left,
+            window_size_right,
+        )
+        trip_count = _FusedMask.get_trip_count(
+            mask_type,
+            block_coord,
+            tile_shape,
+            seqlen_q,
+            seqlen_k,
+            window_size_left,
+            window_size_right,
+        )
+        end = begin
+        if cutlass.const_expr(
+            mask_type is _MaskEnum.WINDOW_MASK
+            or mask_type is _MaskEnum.WINDOW_MASK_INFERENCE
+        ):
+            if cutlass.const_expr(window_size_left is not None):
+                min_index_q = (
+                    (block_coord[0] + 1) * tile_shape[0]
+                    + offset
+                    - window_size_left
+                )
+                end = dsl_min(
+                    cute.ceil_div(min_index_q, tile_shape[1]) - 1,
+                    trip_count + begin - 1,
+                )
+            else:
+                end = begin - 1
+        elif cutlass.const_expr(
+            mask_type is _MaskEnum.WINDOW_MASK_BWD
+            or mask_type is _MaskEnum.WINDOW_MASK_BWD_INFERENCE
+        ):
+            if cutlass.const_expr(window_size_right is not None):
+                min_index_k = (
+                    (block_coord[1] + 1) * tile_shape[1]
+                    + offset
+                    - window_size_right
+                )
+                end = cute.ceil_div(min_index_k, tile_shape[0]) - 1
+            else:
+                end = begin - 1
+        return begin, end
+
+    @staticmethod
+    @cute.jit
+    def get_trailing_mask_id(
+        mask_type,
+        block_coord,
+        tile_shape,
+        seqlen_q,
+        seqlen_k,
+        window_size_left=None,
+        window_size_right=None,
+    ):
+        offset = 0
+        if cutlass.const_expr(mask_type is _MaskEnum.WINDOW_MASK_INFERENCE):
+            offset = seqlen_k - seqlen_q
+        if cutlass.const_expr(mask_type is _MaskEnum.WINDOW_MASK_BWD_INFERENCE):
+            offset = seqlen_q - seqlen_k
+        trip_start = _FusedMask.get_trip_start(
+            mask_type,
+            block_coord,
+            tile_shape,
+            seqlen_q,
+            seqlen_k,
+            window_size_left,
+            window_size_right,
+        )
+        trip_count = _FusedMask.get_trip_count(
+            mask_type,
+            block_coord,
+            tile_shape,
+            seqlen_q,
+            seqlen_k,
+            window_size_left,
+            window_size_right,
+        )
+        if cutlass.const_expr(
+            mask_type is _MaskEnum.WINDOW_MASK
+            or mask_type is _MaskEnum.WINDOW_MASK_INFERENCE
+        ):
+            if cutlass.const_expr(window_size_right is not None):
+                begin = dsl_min(
+                    (
+                        block_coord[0] * tile_shape[0]
+                        + offset
+                        + window_size_right
+                    )
+                    // tile_shape[1],
+                    trip_count + trip_start - 1,
+                )
+            else:
+                begin = trip_count + trip_start - 1
+            end = trip_count + trip_start - 1
+        else:
+            if cutlass.const_expr(window_size_left is not None):
+                min_index_k = (
+                    block_coord[1] * tile_shape[1]
+                    + offset
+                    + window_size_left
+                    + 1
+                )
+                max_index_k = (
+                    (block_coord[1] + 1) * tile_shape[1]
+                    + offset
+                    + window_size_left
+                )
+                begin = dsl_min(
+                    cute.ceil_div(min_index_k, tile_shape[0]) - 1,
+                    trip_count + trip_start - 1,
+                )
+                end = dsl_min(
+                    cute.ceil_div(max_index_k, tile_shape[0]) - 1,
+                    trip_count + trip_start - 1,
+                )
+            else:
+                begin = trip_count + trip_start - 1
+                end = trip_count + trip_start - 1
+        return begin, end
+
+    @staticmethod
+    @cute.jit
+    def get_masked_leading_count(
+        mask_type,
+        block_coord,
+        tile_shape,
+        seqlen_q,
+        seqlen_k,
+        window_size_left=None,
+        window_size_right=None,
+    ):
+        result = 0
+        if cutlass.const_expr(
+            mask_type is not _MaskEnum.RESIDUAL_MASK
+            and mask_type is not _MaskEnum.RESIDUAL_MASK_BWD
+        ):
+            if cutlass.const_expr(
+                window_size_left is not None or window_size_right is not None
+            ):
+                begin, end = _FusedMask.get_leading_mask_id(
+                    mask_type,
+                    block_coord,
+                    tile_shape,
+                    seqlen_q,
+                    seqlen_k,
+                    window_size_left,
+                    window_size_right,
+                )
+                result = max(end - begin + 1, 0)
+        return result
+
+    @staticmethod
+    @cute.jit
+    def get_masked_trailing_count(
+        mask_type,
+        block_coord,
+        tile_shape,
+        seqlen_q,
+        seqlen_k,
+        window_size_left=None,
+        window_size_right=None,
+        rem_count=0,
+    ):
+        result = 0
+        if cutlass.const_expr(
+            mask_type is not _MaskEnum.RESIDUAL_MASK
+            and mask_type is not _MaskEnum.RESIDUAL_MASK_BWD
+        ):
+            if cutlass.const_expr(
+                window_size_left is not None or window_size_right is not None
+            ):
+                trailing_begin, trailing_end = _FusedMask.get_trailing_mask_id(
+                    mask_type,
+                    block_coord,
+                    tile_shape,
+                    seqlen_q,
+                    seqlen_k,
+                    window_size_left,
+                    window_size_right,
+                )
+                _, leading_end = _FusedMask.get_leading_mask_id(
+                    mask_type,
+                    block_coord,
+                    tile_shape,
+                    seqlen_q,
+                    seqlen_k,
+                    window_size_left,
+                    window_size_right,
+                )
+                if trailing_begin <= leading_end:
+                    result = max(trailing_end - leading_end, 0)
+                else:
+                    result = max(trailing_end - trailing_begin + 1, 0)
+        elif seqlen_k % tile_shape[1] != 0:
+            result = 1
+        return result + rem_count
+
+    @staticmethod
+    @cute.jit
+    def get_unmasked_trip_count(
+        mask_type,
+        block_coord,
+        tile_shape,
+        seqlen_q,
+        seqlen_k,
+        window_size_left=None,
+        window_size_right=None,
+    ):
+        return (
+            _FusedMask.get_trip_count(
+                mask_type,
+                block_coord,
+                tile_shape,
+                seqlen_q,
+                seqlen_k,
+                window_size_left,
+                window_size_right,
+            )
+            - _FusedMask.get_masked_leading_count(
+                mask_type,
+                block_coord,
+                tile_shape,
+                seqlen_q,
+                seqlen_k,
+                window_size_left,
+                window_size_right,
+            )
+            - _FusedMask.get_masked_trailing_count(
+                mask_type,
+                block_coord,
+                tile_shape,
+                seqlen_q,
+                seqlen_k,
+                window_size_left,
+                window_size_right,
+                0,
+            )
+        )
+
+    @staticmethod
+    @cute.jit
+    def apply_mask(
+        mask_type,
+        acc_qk,
+        index_qk,
+        seqlen_q,
+        seqlen_k,
+        window_size_left=None,
+        window_size_right=None,
+        index_transform: cutlass.Constexpr = lambda index_q, index_k: (
+            index_q,
+            index_k,
+        ),
+    ):
+        offset = (
+            seqlen_k - seqlen_q
+            if cutlass.const_expr(
+                mask_type is _MaskEnum.WINDOW_MASK_INFERENCE
+                or mask_type is _MaskEnum.WINDOW_MASK_BWD_INFERENCE
+            )
+            else 0
+        )
+        for i in cutlass.range_constexpr(cute.size(acc_qk)):
+            index_q, index_k = index_transform(*index_qk[i])
+            if cutlass.const_expr(
+                window_size_left is not None or window_size_right is not None
+            ):
+                if cutlass.const_expr(window_size_left is None):
+                    if index_q + offset + window_size_right < index_k:
+                        acc_qk[i] = -Float32.inf
+                    if index_k >= seqlen_k or index_q >= seqlen_q:
+                        acc_qk[i] = -Float32.inf
+                elif cutlass.const_expr(window_size_right is None):
+                    if index_q + offset - window_size_left > index_k:
+                        acc_qk[i] = -Float32.inf
+                    if index_k >= seqlen_k or index_q >= seqlen_q:
+                        acc_qk[i] = -Float32.inf
+                else:
+                    max_k = dsl_min(
+                        index_q + offset + window_size_right, seqlen_k
+                    )
+                    min_k = max(0, index_q + offset - window_size_left)
+                    if index_k > max_k or index_k < min_k:
+                        acc_qk[i] = -Float32.inf
+                    if index_k >= seqlen_k or index_q >= seqlen_q:
+                        acc_qk[i] = -Float32.inf
+            if cutlass.const_expr(
+                mask_type is _MaskEnum.RESIDUAL_MASK
+                or mask_type is _MaskEnum.RESIDUAL_MASK_BWD
+            ):
+                if index_k >= seqlen_k or index_q >= seqlen_q:
+                    acc_qk[i] = -Float32.inf
+
+
+class _FmhaUtils:
+    FmhaStaticTileSchedulerParams = _FmhaStaticTileSchedulerParams
+    MaskEnum = _MaskEnum
+    FusedMask = _FusedMask
+    compute_grid = staticmethod(_compute_fmha_grid)
+    create_fmha_static_tile_scheduler = staticmethod(
+        _create_fmha_static_tile_scheduler
+    )
+
+
+fmha_utils = _FmhaUtils
 
 
 # Presets retained from H20 tuning; auto selects the validated N192/KV3 winner.
@@ -95,9 +655,9 @@ def _resolve_prefill_config(name: str) -> tuple[str, int, int]:
     return name, block_n, kv_stage
 
 
-_timelimit_has_res = "res" in _inspect.signature(
-    nvvm.mbarrier_try_wait_parity_timelimit
-).parameters
+_timelimit_code = getattr(nvvm.mbarrier_try_wait_parity_timelimit, "__code__", None)
+_timelimit_has_res = "res" in getattr(_timelimit_code, "co_varnames", ())
+del _timelimit_code
 _MBARRIER_PATCH_LOCK = threading.RLock()
 
 
@@ -137,20 +697,33 @@ def _optimized_mbarrier_wait(mbar_ptr, phase, *, loc=None, ip=None):
     if_generate(d, _true, _fallback, None, [Boolean], loc=loc, ip=ip)
 
 
-@contextmanager
-def _use_optimized_mbarrier_wait():
-    import cutlass.cute.arch as arch_mod
+class _OptimizedMbarrierWaitContext:
+    def __enter__(self):
+        _MBARRIER_PATCH_LOCK.acquire()
+        try:
+            import cutlass.cute.arch as arch_mod
 
+            self._arch_mod = arch_mod
+            self._orig_wait = arch_mod.mbarrier_wait
+            arch_mod.mbarrier_wait = _optimized_mbarrier_wait
+            return self
+        except BaseException:
+            _MBARRIER_PATCH_LOCK.release()
+            raise
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            self._arch_mod.mbarrier_wait = self._orig_wait
+        finally:
+            _MBARRIER_PATCH_LOCK.release()
+        return False
+
+
+def _use_optimized_mbarrier_wait():
     # CuTe tracing consults this process-global symbol. Serialize the temporary
     # patch so concurrent optimized-kernel compilations cannot restore it out of
     # order and leave a different trace observing the wrong implementation.
-    with _MBARRIER_PATCH_LOCK:
-        orig_wait = arch_mod.mbarrier_wait
-        arch_mod.mbarrier_wait = _optimized_mbarrier_wait
-        try:
-            yield
-        finally:
-            arch_mod.mbarrier_wait = orig_wait
+    return _OptimizedMbarrierWaitContext()
 
 
 class HopperFusedMultiHeadAttentionForward:
