@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+
+# 编译产物（机器相关，不入库）
+fp8_attn/build/
+*.so
+*.o
