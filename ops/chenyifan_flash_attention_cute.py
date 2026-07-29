@@ -11,6 +11,7 @@ from .base import register
 
 _OPTIMIZED_FLASH_ATTN = None
 _DECODE_EXT = None
+_TMA_TRANSPOSED_DECODE = None
 
 
 def _load_module(name, path):
@@ -47,6 +48,30 @@ def _get_optimized_flash_attn():
     )
     _OPTIMIZED_FLASH_ATTN = interface_module.flash_attn_func
     return _OPTIMIZED_FLASH_ATTN
+
+
+def _get_tma_transposed_decode():
+    global _TMA_TRANSPOSED_DECODE
+    if _TMA_TRANSPOSED_DECODE is not None:
+        return _TMA_TRANSPOSED_DECODE
+
+    package_dir = Path(__file__).resolve().parent / "_paged_fa3"
+    init_py = package_dir / "__init__.py"
+    if not init_py.exists():
+        raise ImportError(f"Missing vendored TMA package: {package_dir}")
+    if "paged_fa3" not in sys.modules:
+        spec = importlib.util.spec_from_file_location(
+            "paged_fa3", init_py, submodule_search_locations=[str(package_dir)]
+        )
+        if spec is None or spec.loader is None:
+            raise ImportError(f"Cannot load vendored TMA package from {package_dir}")
+        package = importlib.util.module_from_spec(spec)
+        sys.modules["paged_fa3"] = package
+        spec.loader.exec_module(package)
+    from paged_fa3.transposed_decode import decode
+
+    _TMA_TRANSPOSED_DECODE = decode
+    return _TMA_TRANSPOSED_DECODE
 
 
 def _get_decode_ext():
@@ -102,6 +127,24 @@ def attention(q, k, v, causal=True, sm_scale=None):
         raise ValueError("q_heads must be divisible by kv_heads")
 
     if q_len == 1:
+        if (
+            q.is_cuda
+            and q.dtype == torch.bfloat16
+            and k.dtype == torch.bfloat16
+            and v.dtype == torch.bfloat16
+            and d == 128
+            and q_heads == k.shape[1] * 8
+            and kv_len % 256 == 0
+            and q.is_contiguous()
+            and k.is_contiguous()
+            and v.is_contiguous()
+        ):
+            try:
+                return _get_tma_transposed_decode()(q, k, v, sm_scale=sm_scale)
+            except Exception:
+                # Preserve the proven CUDA path as a safe fallback for compile,
+                # runtime, or unsupported-environment failures.
+                pass
         if (
             q.is_cuda
             and q.dtype == torch.bfloat16
