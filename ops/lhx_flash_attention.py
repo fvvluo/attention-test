@@ -1353,9 +1353,10 @@ class GqaDecodeSm90:
             )
             acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
             for row in cutlass.range_constexpr(cute.size(row_scale)):
-                acc_O_mn[row, None].store(
-                    acc_O_mn[row, None].load() * row_scale[row]
-                )
+                if row_scale[row] != Float32(1.0):
+                    acc_O_mn[row, None].store(
+                        acc_O_mn[row, None].load() * row_scale[row]
+                    )
             rP = cute.make_fragment_like(acc_S, self.dtype)
             rP.store(acc_S.load().to(self.dtype))
             tOrP = layout_utils.reshape_acc_to_frgA(rP)
