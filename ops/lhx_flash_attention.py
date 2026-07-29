@@ -1526,28 +1526,52 @@ class GqaDecodeSm90:
         mPartialLSE: cute.Tensor,
         mO: cute.Tensor,
     ):
+        @cute.struct
+        class ReduceSharedStorage:
+            weights_and_inv_sum: cute.struct.MemRange[
+                Float32, self.num_splits + 1
+            ]
+
         d, _, _ = cute.arch.thread_idx()
         q_head, batch_idx, _ = cute.arch.block_idx()
 
-        lse_max = -Float32.inf
-        for split_idx in cutlass.range_constexpr(self.num_splits):
-            lse_max = cute.arch.fmax(
-                lse_max, mPartialLSE[batch_idx, split_idx, q_head]
-            )
+        smem = cutlass.utils.SmemAllocator()
+        storage = smem.allocate(ReduceSharedStorage)
+        sWeightsAndInvSum = storage.weights_and_inv_sum.get_tensor(
+            cute.make_layout(self.num_splits + 1)
+        )
 
-        weight_sum = Float32(0.0)
+        # The split LSE weights are identical for all 128 output dimensions.
+        # Compute them once per CTA and broadcast through shared memory.
+        if d == 0:
+            lse_max = -Float32.inf
+            for split_idx in cutlass.range_constexpr(self.num_splits):
+                lse_max = cute.arch.fmax(
+                    lse_max, mPartialLSE[batch_idx, split_idx, q_head]
+                )
+
+            weight_sum = Float32(0.0)
+            for split_idx in cutlass.range_constexpr(self.num_splits):
+                weight = cute.math.exp2(
+                    (mPartialLSE[batch_idx, split_idx, q_head] - lse_max)
+                    * math.log2(math.e),
+                    fastmath=True,
+                )
+                sWeightsAndInvSum[split_idx] = weight
+                weight_sum += weight
+            sWeightsAndInvSum[self.num_splits] = cute.arch.rcp_approx(weight_sum)
+
+        cute.arch.barrier()
+
         out = Float32(0.0)
         for split_idx in cutlass.range_constexpr(self.num_splits):
-            weight = cute.math.exp2(
-                (mPartialLSE[batch_idx, split_idx, q_head] - lse_max)
-                * math.log2(math.e),
-                fastmath=True,
+            out += (
+                mPartialO[batch_idx, split_idx, q_head, d]
+                * sWeightsAndInvSum[split_idx]
             )
-            weight_sum += weight
-            out += mPartialO[batch_idx, split_idx, q_head, d] * weight
 
         mO[batch_idx, 0, q_head, d] = (
-            out * cute.arch.rcp_approx(weight_sum)
+            out * sWeightsAndInvSum[self.num_splits]
         ).to(self.dtype)
 
 
