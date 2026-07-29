@@ -1,23 +1,27 @@
 # ============================================================
-# 融合算子 v17：按 q_len 路由 prefill / decode，得到完整 FlashAttention
-#   q_len == 1  -> ops/_decode10.py 的 CuTe DSL flash-decoding kernel
-#                  （decode9 内核 + 重新调参：3+3 stage 环 + 双生产者 warp，
-#                   static-softmax + pipe_gemm + L2 EVICT_FIRST，~3.45 TB/s）
-#   q_len  > 1  -> ops/_prefill3.py 的 Hopper SM90 FMHA kernel（CuTe DSL）
-# 只做"拼接/融合"，不修改任何已有文件（_prefill3.py / _decode10.py 保持只读）。
+# 融合算子 v21：按 q_len 路由 prefill / decode，得到完整 FlashAttention
+#   q_len == 1  -> ops/_decode13.py 的 CuTe DSL flash-decoding kernel
+#                  （decode9 内核 + 调参：num_splits 39->62 + num_workers=496，
+#                   static-softmax + pipe_gemm + L2 EVICT_FIRST）
+#   q_len  > 1  -> ops/_prefill.py（prefill v1）的 Hopper SM90 FMHA kernel（CuTe DSL）
+# 只做"拼接/融合"，不修改任何已有文件（_prefill.py / _decode13.py 保持只读）。
 # 全程 BHSD：
 #   q:  (b, q_heads,  q_len,  d)
 #   k/v:(b, kv_heads, kv_len, d)
 #   out 与 q 同 shape。q_heads 是 kv_heads 的整数倍（GQA）；MHA 时相等。
 #
-# 相比 v16：decode 后端换成 _decode10（与 decode9 同内核，仅默认配置不同：
-# num_stages 4->3 / num_stages_v 2->3 / num_producer_warps 1->2）。
+# 组合说明：prefill 用 v1（_prefill.py），decode 用 v13（当前实测最快的 decode）。
+#   - _prefill.py(v1) 与 _prefill3.py 的 attention 内核类完全相同（MD5 一致），
+#     区别仅在 v1 带 SM/显存锁频等 benchmark 辅助代码；计算逻辑一致。
+#   - decode13 = decode9 内核 + 纯调参（num_splits 39->62 + 显式 num_workers=496，
+#     496=62×8 更贴合 78 SM 波次）。严谨实测中位 ~3507 GB/s，比 decode9(~3414)、
+#     decode12(~3425) 都快，且是固定配置无 autotune 抖动。
 #
-# 注意：_decode10 的入口是 attention_decode，其默认参数 static_softmax=False
+# 注意：decode13 沿用 decode9 的 attention_decode，其默认 static_softmax=False
 # 会走 online-softmax 分支，该分支存在 TYPE_UNSTABLE_JOIN 编译问题；这里显式
-# 传入其生产配置（static_softmax=True + pipe_gemm 等，与 _decode10.attention()
-# 一致）绕开。只在 bf16 + q_len==1 + head_dim==128 + q_heads==8*kv_heads +
-# kv_len%128==0 时走高性能 kernel，否则内部退回 SDPA fallback。
+# 传入生产配置（static_softmax=True + pipe_gemm 等）绕开。只在 bf16 + q_len==1 +
+# head_dim==128 + q_heads==8*kv_heads + kv_len%128==0 时走高性能 kernel，
+# 否则内部退回 SDPA fallback。
 # ============================================================
 
 import math
@@ -30,7 +34,7 @@ from .base import register
 
 
 # ------------------------------------------------------------
-# 让 ops/_prefill3.py 能 import：其 `from . import fmha_helpers` 会回退到
+# 让 ops/_prefill.py 能 import：其 `from . import fmha_helpers` 会回退到
 # 顶层 `import fmha_helpers`，该模块住在 baseline 的 CuTeDSL utils 目录。
 # ------------------------------------------------------------
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -48,7 +52,7 @@ _CUTEDSL_UTILS = os.path.join(
 if os.path.isdir(_CUTEDSL_UTILS) and _CUTEDSL_UTILS not in sys.path:
     sys.path.insert(0, _CUTEDSL_UTILS)
 
-# _prefill3.py 用 compute_grid(..., device_id=...) 调用，但 baseline 的
+# _prefill.py 用 compute_grid(..., device_id=...) 调用，但 baseline 的
 # fmha_helpers.compute_grid 签名不含 device_id。包一层吞掉它再转调原实现
 # （单 GPU 下 device_id 恒为 0，忽略语义正确）。
 import fmha_helpers as _fmha_helpers  # noqa: E402
@@ -67,8 +71,8 @@ import cutlass.cute as cute  # noqa: E402
 from cutlass.cute.runtime import from_dlpack  # noqa: E402
 import cuda.bindings.driver as cuda  # noqa: E402
 
-from . import _prefill3 as _prefill_mod  # noqa: E402  (prefill kernel v3)
-from . import _decode10 as _decode_mod  # noqa: E402  (CuTe DSL decode kernel v9)
+from . import _prefill as _prefill_mod  # noqa: E402  (prefill kernel v1)
+from . import _decode13 as _decode_mod  # noqa: E402  (CuTe DSL decode kernel v13)
 
 
 _TORCH_TO_CUTLASS = {
@@ -123,7 +127,7 @@ def _alloc_lse_cute(b, h_r, h_k, s_q, dtype_torch, device):
 
 
 # ------------------------------------------------------------
-# prefill 驱动（q_len > 1）：调用 _prefill3.py 的 Hopper FMHA kernel
+# prefill 驱动（q_len > 1）：调用 _prefill.py 的 Hopper FMHA kernel
 # ------------------------------------------------------------
 def _run_prefill(q, k, v, causal, sm_scale):
     b, h, s_q, d = q.shape
@@ -156,7 +160,7 @@ def _run_prefill(q, k, v, causal, sm_scale):
     v_cute, _v_buf = _make_cute_from_bhsd(v, h_k, 1, dtype_cutlass)
 
     if cached is None:
-        # mask 类型：复刻 _prefill3.run 的逻辑
+        # mask 类型：复刻 _prefill.run 的逻辑
         window_size_right = None
         mask_type = _fmha_helpers.MaskEnum.WINDOW_MASK
         if causal:
@@ -220,11 +224,13 @@ def _run_prefill(q, k, v, causal, sm_scale):
 
 
 # ------------------------------------------------------------
-# decode 驱动（q_len == 1）：调用 _decode10.py 的 CuTe DSL flash-decoding kernel
-#   入口 attention_decode(q, k, v, sm_scale=, causal=)，BHSD，返回同 q shape。
-#   显式传入 _decode10 生产配置（与其 attention() 入口一致）：static_softmax
-#   走单屏障路径 + pipe_gemm 2-deep GEMM1 流水 + PDL + L2 EVICT_FIRST，
-#   绕开默认 online-softmax 分支的 TYPE_UNSTABLE_JOIN 编译问题。
+# decode 驱动（q_len == 1）：调用 _decode13.py 的 CuTe DSL flash-decoding kernel
+#   入口 attention_decode(q, k, v, sm_scale=, causal=, ...)，BHSD，返回同 q shape。
+#   decode13 = decode9 内核 + 纯调参（num_splits 39->62 + num_workers=496，
+#   即每个 (split,kv_head) 一个 CTA，496 更贴合 78 SM 的波次），严谨实测
+#   ~3507 GB/s（中位），比 decode9/decode12 都快，且无 autotune 抖动。
+#   显式传入其生产配置（static_softmax=True + pipe_gemm + PDL + EVICT_FIRST），
+#   绕开默认 static_softmax=False 的 online-softmax 分支 TYPE_UNSTABLE_JOIN 编译问题。
 #   仅 bf16 + q_len==1 + head_dim==128 + q_heads==8*kv_heads + kv_len%128==0
 #   时走高性能 kernel，否则内部退回 SDPA fallback。
 # ------------------------------------------------------------
@@ -234,13 +240,14 @@ def _run_decode(q, k, v, sm_scale):
         return x if x.is_contiguous() else x.contiguous()
 
     # decode 天然非因果（新 token attend 全部已缓存 kv），causal=False。
+    # 固定 decode13 生产配置（splits=62/workers=496），不走 autotune。
     return _decode_mod.attention_decode(
         _c(q), _c(k), _c(v),
         sm_scale=sm_scale,
         causal=False,
-        num_splits=39, block_n=128, num_stages=3, num_stages_v=3,
-        num_producer_warps=2, fused=False, use_pdl=True, evict_first=True,
-        static_softmax=True,
+        num_splits=62, num_workers=496, block_n=128,
+        num_stages=4, num_stages_v=2, num_producer_warps=1,
+        fused=False, use_pdl=True, evict_first=True, static_softmax=True,
     )
 
 
@@ -253,4 +260,4 @@ def attention(q, k, v, causal=True, sm_scale=None):
     return _run_prefill(q, k, v, causal, sm_scale)
 
 
-register("prefill_decode_fused17 (cute+cute)", attention)
+register("prefill_decode_fused21 (cute+cute)", attention)
