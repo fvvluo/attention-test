@@ -1,24 +1,23 @@
 # ============================================================
-# 融合算子 v16：按 q_len 路由 prefill / decode，得到完整 FlashAttention
-#   q_len == 1  -> ops/_decode9.py 的 CuTe DSL flash-decoding kernel
-#                  （persistent grid + 转置 WGMMA + TMA + static-softmax +
-#                   pipe_gemm 2-deep GEMM1 流水 + L2 EVICT_FIRST，~3.45 TB/s）
+# 融合算子 v17：按 q_len 路由 prefill / decode，得到完整 FlashAttention
+#   q_len == 1  -> ops/_decode10.py 的 CuTe DSL flash-decoding kernel
+#                  （decode9 内核 + 重新调参：3+3 stage 环 + 双生产者 warp，
+#                   static-softmax + pipe_gemm + L2 EVICT_FIRST，~3.45 TB/s）
 #   q_len  > 1  -> ops/_prefill3.py 的 Hopper SM90 FMHA kernel（CuTe DSL）
-# 只做"拼接/融合"，不修改任何已有文件（_prefill3.py / _decode9.py 保持只读）。
+# 只做"拼接/融合"，不修改任何已有文件（_prefill3.py / _decode10.py 保持只读）。
 # 全程 BHSD：
 #   q:  (b, q_heads,  q_len,  d)
 #   k/v:(b, kv_heads, kv_len, d)
 #   out 与 q 同 shape。q_heads 是 kv_heads 的整数倍（GQA）；MHA 时相等。
 #
-# 相比 v13：decode 后端从 _decode8 换成更新的 _decode9，实测在
-# 1x64x8x131072x128 bf16 上带宽更高（decode9 ~3.45 TB/s vs decode8 ~3.38）。
+# 相比 v16：decode 后端换成 _decode10（与 decode9 同内核，仅默认配置不同：
+# num_stages 4->3 / num_stages_v 2->3 / num_producer_warps 1->2）。
 #
-# 注意：_decode9 的入口是 attention_decode（与 _decode4/8 兼容），
-# 但其默认参数 static_softmax=False 会走 online-softmax 分支，该分支存在
-# TYPE_UNSTABLE_JOIN 编译问题；这里显式传入其生产配置
-# （static_softmax=True + pipe_gemm 等，与 _decode9.attention() 一致）绕开。
-# 只在 bf16 + q_len==1 + head_dim==128 + q_heads==8*kv_heads + kv_len%128==0
-# 时走高性能 kernel，否则内部退回 SDPA fallback。
+# 注意：_decode10 的入口是 attention_decode，其默认参数 static_softmax=False
+# 会走 online-softmax 分支，该分支存在 TYPE_UNSTABLE_JOIN 编译问题；这里显式
+# 传入其生产配置（static_softmax=True + pipe_gemm 等，与 _decode10.attention()
+# 一致）绕开。只在 bf16 + q_len==1 + head_dim==128 + q_heads==8*kv_heads +
+# kv_len%128==0 时走高性能 kernel，否则内部退回 SDPA fallback。
 # ============================================================
 
 import math
@@ -69,7 +68,7 @@ from cutlass.cute.runtime import from_dlpack  # noqa: E402
 import cuda.bindings.driver as cuda  # noqa: E402
 
 from . import _prefill3 as _prefill_mod  # noqa: E402  (prefill kernel v3)
-from . import _decode9 as _decode_mod  # noqa: E402  (CuTe DSL decode kernel v9)
+from . import _decode10 as _decode_mod  # noqa: E402  (CuTe DSL decode kernel v9)
 
 
 _TORCH_TO_CUTLASS = {
@@ -221,9 +220,9 @@ def _run_prefill(q, k, v, causal, sm_scale):
 
 
 # ------------------------------------------------------------
-# decode 驱动（q_len == 1）：调用 _decode9.py 的 CuTe DSL flash-decoding kernel
+# decode 驱动（q_len == 1）：调用 _decode10.py 的 CuTe DSL flash-decoding kernel
 #   入口 attention_decode(q, k, v, sm_scale=, causal=)，BHSD，返回同 q shape。
-#   显式传入 _decode9 生产配置（与其 attention() 入口一致）：static_softmax
+#   显式传入 _decode10 生产配置（与其 attention() 入口一致）：static_softmax
 #   走单屏障路径 + pipe_gemm 2-deep GEMM1 流水 + PDL + L2 EVICT_FIRST，
 #   绕开默认 online-softmax 分支的 TYPE_UNSTABLE_JOIN 编译问题。
 #   仅 bf16 + q_len==1 + head_dim==128 + q_heads==8*kv_heads + kv_len%128==0
@@ -239,8 +238,8 @@ def _run_decode(q, k, v, sm_scale):
         _c(q), _c(k), _c(v),
         sm_scale=sm_scale,
         causal=False,
-        num_splits=39, block_n=128, num_stages=4, num_stages_v=2,
-        num_producer_warps=1, fused=False, use_pdl=True, evict_first=True,
+        num_splits=39, block_n=128, num_stages=3, num_stages_v=3,
+        num_producer_warps=2, fused=False, use_pdl=True, evict_first=True,
         static_softmax=True,
     )
 
@@ -254,4 +253,4 @@ def attention(q, k, v, causal=True, sm_scale=None):
     return _run_prefill(q, k, v, causal, sm_scale)
 
 
-register("prefill_decode_fused16 (cute+cute)", attention)
+register("prefill_decode_fused17 (cute+cute)", attention)
