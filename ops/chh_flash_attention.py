@@ -21,7 +21,7 @@
 # 可以参考同目录下 _example_flash_attention.py（纯 PyTorch online-softmax 实现，
 # 仅供参考，文件名以 "_" 开头不会被自动扫描注册），里面有完整的分块 + online softmax 算法示例。
 
-
+import time
 import math
 
 import torch
