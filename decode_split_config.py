@@ -4,7 +4,7 @@ from typing import Optional, Tuple
 
 DECODE_TILE_N = 64
 DECODE_QHEADS_PER_CTA = 8
-DECODE_TARGET_CTAS_PER_SM = 2
+DECODE_TARGET_CTAS_PER_SM = 3
 
 
 @dataclass(frozen=True)

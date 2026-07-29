@@ -10,13 +10,13 @@ GQA_SOURCE = SOURCE.split("class GqaDecodeSm90:", 1)[1].split(
 
 
 class DecodeSplitWiringTest(unittest.TestCase):
-    def test_main_launch_targets_two_ctas_per_sm(self):
+    def test_main_launch_targets_three_ctas_per_sm(self):
         self.assertIn(
             "grid=(self.num_splits, self.kv_heads * self.q_groups, self.batch_size)",
             GQA_SOURCE,
         )
-        self.assertIn("min_blocks_per_mp=2", GQA_SOURCE)
-        self.assertNotIn("min_blocks_per_mp=1", GQA_SOURCE)
+        self.assertIn("min_blocks_per_mp=3", GQA_SOURCE)
+        self.assertNotIn("min_blocks_per_mp=2", GQA_SOURCE)
 
     def test_partial_buffers_use_resolved_split_count(self):
         self.assertIn(

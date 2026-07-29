@@ -1095,7 +1095,7 @@ class GqaDecodeSm90:
             grid=(self.num_splits, self.kv_heads * self.q_groups, self.batch_size),
             block=[self.num_threads, 1, 1],
             stream=stream,
-            min_blocks_per_mp=2,
+            min_blocks_per_mp=3,
         )
         self.reduce_kernel(mPartialO, mPartialLSE, mO).launch(
             grid=(self.q_heads, self.batch_size, 1),
@@ -1651,7 +1651,7 @@ def _run_attention_sm90(q, k, v, causal=True, sm_scale=None):
 def _decode_split_config(
     batch, q_heads, kv_heads, kv_len, device, num_splits: Optional[int] = None
 ):
-    """Target at most one resident wave at two four-warp CTAs per SM."""
+    """Target at most one resident wave at three four-warp CTAs per SM."""
     num_sms = torch.cuda.get_device_properties(device).multi_processor_count
     return compute_decode_split_config(
         batch_size=batch,
