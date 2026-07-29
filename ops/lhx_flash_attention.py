@@ -954,6 +954,9 @@ class GqaDecodeSm90:
     head_dim = 128
     num_threads = 128
     num_worker_warps = 4
+    # Natural-logit threshold after softmax_scale: exp(score - reference_max)
+    # may reach exp(0.5) ~= 1.65 before the reference maximum is updated.
+    rescale_threshold = 0.5
 
     def __init__(
         self,
@@ -1350,12 +1353,18 @@ class GqaDecodeSm90:
                 acc_S,
                 is_first=False,
                 check_inf=self.has_tail,
+                rescale_threshold_log2=(
+                    self.rescale_threshold * math.log2(math.e)
+                ),
             )
             acc_O_mn = layout_utils.reshape_acc_to_mn(acc_O)
-            for row in cutlass.range_constexpr(cute.size(row_scale)):
-                acc_O_mn[row, None].store(
-                    acc_O_mn[row, None].load() * row_scale[row]
-                )
+            # acc_O is zero before tile 0, so its first rescale is unnecessary.
+            if tile_idx != 0:
+                for row in cutlass.range_constexpr(cute.size(row_scale)):
+                    if row_scale[row] != Float32(1.0):
+                        acc_O_mn[row, None].store(
+                            acc_O_mn[row, None].load() * row_scale[row]
+                        )
             rP = cute.make_fragment_like(acc_S, self.dtype)
             rP.store(acc_S.load().to(self.dtype))
             tOrP = layout_utils.reshape_acc_to_frgA(rP)
