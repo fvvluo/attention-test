@@ -52,6 +52,7 @@ def _prefill_configs():
     """prefill kernel 的 autotune 候选（共享显存超限的配置会被自动跳过）。"""
     cfgs = []
     for BR, BC, w, s in [(128, 64, 4, 2), (128, 64, 4, 3), (128, 64, 8, 2),
+                         (128, 64, 8, 3), (128, 128, 4, 2),
                          (128, 128, 8, 2), (128, 128, 8, 3),
                          (64, 64, 4, 2), (64, 64, 4, 4),
                          (64, 128, 4, 2), (64, 128, 4, 3),
@@ -63,8 +64,9 @@ def _prefill_configs():
 def _decode_configs():
     """decode fused kernel 的 autotune 候选（共享显存超限的会被自动跳过）。"""
     cfgs = []
-    for BC, w, s in [(64, 4, 2), (64, 4, 4), (128, 4, 2), (128, 4, 3),
-                     (128, 4, 4), (128, 8, 3), (256, 4, 2), (256, 8, 2)]:
+    for BC, w, s in [(64, 4, 2), (64, 4, 3), (64, 4, 4), (64, 8, 3),
+                     (128, 4, 2), (128, 4, 3), (128, 4, 4), (128, 8, 2), (128, 8, 3),
+                     (256, 4, 2), (256, 8, 2), (256, 8, 3)]:
         cfgs.append(triton.Config({'BC': BC}, num_warps=w, num_stages=s))
     return cfgs
 
@@ -273,6 +275,9 @@ def _decode_fused_kernel(q_ptr, k_ptr, v_ptr, o_ptr,
         l_g = tl.sum(l_all * w_all, axis=0)
 
         o_g = tl.zeros([M_PAD, D], dtype=q.dtype)
+        # 注意：曾尝试按 CS 个 split 一组做 3D 向量 load 加速 merge（D1 优化），
+        # 实测 128K kv 下因寄存器占用膨胀、拉低 occupancy 反而慢 ~8%（2683 ->
+        # 2912 GB/s @sp=39），已回退为逐个 split 串行 load。
         for sid in range(splits):
             pid2 = bhk * splits + sid
             m_s = tl.load(mp_ptr + pid2 * GNQ + rows, mask=valid,
@@ -377,6 +382,38 @@ def _decode_run(q, k, v, o, qk_scale, causal, splits):
     return sp
 
 
+# decode 直接启动缓存：triton JITFunction.run 的 Python 包装开销 ~12us/次，
+# 对几十 us 的 decode kernel 占比可观。首次调用走正常 autotune 路径并固化
+# CompiledKernel 的 runner；之后同形状调用直接启动，绕过 JIT 包装层。
+# 值为 False 表示构建失败、永久回退正常路径。
+_DECODE_FAST = {}
+
+
+def _decode_fast_build(q, k, v, o, qk_scale, causal, splits, key):
+    """在首次正常 _decode_run 之后，固化编译产物构建直接启动器。
+
+    runner 复用编译期特化（指针 16B 对齐由 _prep 保证；标量值按 key 固化；
+    qk_scale 为运行时参数不参与特化，可随 sm_scale 变化）。"""
+    b, h, n_q, d = q.shape
+    _, h_kv, n_kv, _ = k.shape
+    g = h // h_kv
+    GNQ = g * n_q
+    M_PAD = max(16, triton.next_power_of_2(GNQ))
+    BHK = b * h_kv
+    chunk = triton.cdiv(triton.cdiv(n_kv, splits), 128) * 128
+    sp = triton.cdiv(n_kv, chunk)
+    o_part, m_part, l_part, cnt = _decode_scratch(BHK, sp, GNQ, d, q.device, q.dtype)
+    best = _decode_fused_kernel.best_config  # 由刚结束的 autotune 调用设置
+    compiled = _decode_fused_kernel.fn.run(
+        q, k, v, o, o_part, m_part, l_part, cnt,
+        b * h * n_q, n_q, n_kv, h_kv, g, qk_scale, chunk, sp,
+        D=d, M_PAD=M_PAD, BC=best.kwargs['BC'], S_PAD=64,
+        CAUSAL=causal, num_warps=best.num_warps, num_stages=best.num_stages,
+        grid=(sp, BHK), warmup=True)
+    _DECODE_FAST[key] = (compiled[(sp, BHK, 1)], sp, BHK, chunk, M_PAD,
+                         best.kwargs['BC'])
+
+
 # 每个 decode 形状实测最优 splits 的缓存（见 _tune_decode_splits）
 _DECODE_TUNE = {}
 
@@ -385,15 +422,18 @@ def _tune_decode_splits(q, k, v, o, qk_scale, causal, key):
     """splits 是 host 侧 grid 参数，triton.autotune 覆盖不到；实测少量候选
     并缓存最优值，语义与 autotune 相同：每个形状只在首次调用时调一次。
 
-    候选为目标总 program 数 ~= {1.5, 2, 2.7, 4} x SM 数 的 splits
+    候选为目标总 program 数 ~= {1, 1.5, 2, 2.7, 4} x SM 数 的 splits
     （每个工作项一个 program 的结构下，波次整数倍附近通常最优）。
+    splits 越大 partial 暂存读写流量越大（带宽受限场景的额外开销），
+    因此也覆盖较小的 1x 候选。
     """
     b, h, _, _ = q.shape
     _, h_kv, n_kv, _ = k.shape
     BHK = b * h_kv
     cap = min(triton.cdiv(n_kv, 256), 64)
-    cands = sorted({min(max(triton.cdiv(int(f * 78), BHK), 1), cap)
-                    for f in (1.5, 2.0, 2.7, 4.0)})
+    n_sm = torch.cuda.get_device_properties(q.device).multi_processor_count
+    cands = sorted({min(max(triton.cdiv(int(f * n_sm), BHK), 1), cap)
+                    for f in (1.0, 1.5, 2.0, 2.7, 4.0)})
     best_t, best_s = float("inf"), cands[0]
     for sp in cands:
         t = triton.testing.do_bench(
@@ -415,7 +455,8 @@ def decode(q, k, v, causal=True, sm_scale=None):
     里共享同一份 K/V（K/V 只从 HBM 读一次）；kv 按 splits 段并行算出
     partial (o, m, l)（dtype 随输入），由组内最后一个 program（信号量计数）
     直接做 log-sum-exp 合并并复位信号量。
-    kernel 配置由 triton.autotune 调，splits 由 _tune_decode_splits 实测。
+    kernel 配置由 triton.autotune 调，splits 由 _tune_decode_splits 实测；
+    同形状第二次起由 _DECODE_FAST 直接启动（绕过 JIT 包装层开销）。
     """
     b, h, n_q, d = q.shape
     _, h_kv, n_kv, _ = k.shape
@@ -427,11 +468,27 @@ def decode(q, k, v, causal=True, sm_scale=None):
     q, k, v, qk_scale = _prep(q, k, v, sm_scale)
     o = torch.empty_like(q)
 
-    key = (b, h, h_kv, n_q, n_kv, d, causal, q.device)
+    key = (b, h, h_kv, n_q, n_kv, d, causal, q.device, q.dtype)
+    fast = _DECODE_FAST.get(key)
+    if fast:
+        runner, sp, BHK, chunk, M_PAD, BC = fast
+        o_part, m_part, l_part, cnt = _decode_scratch(BHK, sp, g * n_q, d,
+                                                      q.device, q.dtype)
+        runner(q, k, v, o, o_part, m_part, l_part, cnt,
+               b * h * n_q, n_q, n_kv, h_kv, g, qk_scale, chunk, sp,
+               d, M_PAD, BC, 64, causal,
+               stream=torch.cuda.current_stream(q.device).cuda_stream)
+        return o
+
     splits = _DECODE_TUNE.get(key)
     if splits is None:
         splits = _tune_decode_splits(q, k, v, o, qk_scale, causal, key)
     _decode_run(q, k, v, o, qk_scale, causal, splits)
+    if fast is None:
+        try:
+            _decode_fast_build(q, k, v, o, qk_scale, causal, splits, key)
+        except Exception:
+            _DECODE_FAST[key] = False  # 构建失败则永久走正常路径
     return o
 
 
