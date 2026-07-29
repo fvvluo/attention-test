@@ -91,6 +91,7 @@ def main():
     parser = argparse.ArgumentParser(description="AttnSentinel Daemon")
     parser.add_argument("--branch", type=str, help="Specify a single branch to run")
     parser.add_argument("--gpu", type=str, default="0", help="Specify GPU ID to use (default: 0)")
+    parser.add_argument("--once-per-commit", action="store_true", default=False, help="Skip branches whose current commit was already evaluated (default: off, re-evaluate every sweep)",)
     args = parser.parse_args()
 
     if not os.path.exists(REPO_DIR):
@@ -98,7 +99,8 @@ def main():
         return
 
     mode_msg = f"targeting specific branch: {args.branch}" if args.branch else "in continuous daemon mode"
-    start_msg = f"🛡️ Starting AttnSentinel ({mode_msg}) targeting repo: {REPO_DIR} on GPU: {args.gpu}"
+    dedupe_msg = "once-per-commit ON" if args.once_per_commit else "once-per-commit OFF (re-evaluate every sweep)"
+    start_msg = f"🛡️ Starting AttnSentinel ({mode_msg}, {dedupe_msg}) targeting repo: {REPO_DIR} on GPU: {args.gpu}"
     print(start_msg)
     logging.info(start_msg)
     
@@ -137,9 +139,9 @@ def main():
                 continue
             
             already_benchmarked = branch in results and results[branch].get('Commit') == commit_hash
-            if already_benchmarked and not args.branch:
+            if already_benchmarked and args.once_per_commit and not args.branch:
                 continue
-            elif already_benchmarked and args.branch:
+            elif already_benchmarked:
                 print(f"ℹ️ Note: Branch {branch} already benchmarked at this commit, forcing rerun.")
             
             detect_msg = f"Commit detected ({commit_hash[:7]}) on branch: {branch}"
