@@ -1252,6 +1252,34 @@ class GqaDecodeSm90:
         cute.arch.cp_async_wait_group(0)
         cute.arch.sync_warp()
 
+        # V[0] primes the cross-iteration pipeline.
+        if const_expr(self.has_tail):
+            if first_n_block == self.num_blocks - 1:
+                tail_tokens = self.kv_len % self.tile_n
+                for n in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
+                    token_in_tile = warp_idx * 16 + tKVcKV[0, n, 0][0]
+                    if token_in_tile < tail_tokens:
+                        cute.copy(
+                            warp_gmem_tiled_copy,
+                            tVgV[None, n, None, first_n_block],
+                            tVsV[None, n, None],
+                        )
+                    else:
+                        tVsV[None, n, None].fill(0.0)
+            else:
+                cute.copy(
+                    warp_gmem_tiled_copy,
+                    tVgV[None, None, None, first_n_block],
+                    tVsV,
+                )
+        else:
+            cute.copy(
+                warp_gmem_tiled_copy,
+                tVgV[None, None, None, first_n_block],
+                tVsV,
+            )
+        cute.arch.cp_async_commit_group()
+
         # Keep one compact runtime loop instead of cloning the MMA body once per
         # KV tile. split_count is CTA-uniform and differs by at most one.
         for tile_idx in cutlass.range(split_count, unroll=1):
@@ -1260,34 +1288,6 @@ class GqaDecodeSm90:
             # CTA-uniform runtime bool and the warp sync/wait_group calls guarded
             # by it below execute consistently across every warp.
             has_next = tile_idx + 1 < split_count
-
-            # V[i] moves through the memory pipeline while QK and softmax use K[i].
-            if const_expr(self.has_tail):
-                if n_block == self.num_blocks - 1:
-                    tail_tokens = self.kv_len % self.tile_n
-                    for n in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
-                        token_in_tile = warp_idx * 16 + tKVcKV[0, n, 0][0]
-                        if token_in_tile < tail_tokens:
-                            cute.copy(
-                                warp_gmem_tiled_copy,
-                                tVgV[None, n, None, n_block],
-                                tVsV[None, n, None],
-                            )
-                        else:
-                            tVsV[None, n, None].fill(0.0)
-                else:
-                    cute.copy(
-                        warp_gmem_tiled_copy,
-                        tVgV[None, None, None, n_block],
-                        tVsV,
-                    )
-            else:
-                cute.copy(
-                    warp_gmem_tiled_copy,
-                    tVgV[None, None, None, n_block],
-                    tVsV,
-                )
-            cute.arch.cp_async_commit_group()
 
             acc_S = cute.make_rmem_tensor(
                 thr_mma.partition_shape_C((16, 16)), Float32
@@ -1394,10 +1394,42 @@ class GqaDecodeSm90:
                     acc_O,
                 )
 
-            # Finish this warp's PV reads before its next V overwrite, and make
-            # its completed K[i+1] copy visible before the next QK step.
             if has_next:
-                cute.arch.cp_async_wait_group(0)
+                # After PV[i], the warp no longer consumes sV_warp, so V[i+1]
+                # can overwrite the same warp-local slice.
+                cute.arch.sync_warp()
+
+                next_n_block = n_block + 1
+                if const_expr(self.has_tail):
+                    if next_n_block == self.num_blocks - 1:
+                        tail_tokens = self.kv_len % self.tile_n
+                        for n in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
+                            token_in_tile = warp_idx * 16 + tKVcKV[0, n, 0][0]
+                            if token_in_tile < tail_tokens:
+                                cute.copy(
+                                    warp_gmem_tiled_copy,
+                                    tVgV[None, n, None, next_n_block],
+                                    tVsV[None, n, None],
+                                )
+                            else:
+                                tVsV[None, n, None].fill(0.0)
+                    else:
+                        cute.copy(
+                            warp_gmem_tiled_copy,
+                            tVgV[None, None, None, next_n_block],
+                            tVsV,
+                        )
+                else:
+                    cute.copy(
+                        warp_gmem_tiled_copy,
+                        tVgV[None, None, None, next_n_block],
+                        tVsV,
+                    )
+                cute.arch.cp_async_commit_group()
+
+                # Retire the older K[i+1] group while leaving V[i+1]
+                # outstanding across the next iteration's QK.
+                cute.arch.cp_async_wait_group(1)
                 cute.arch.sync_warp()
 
         # CTA-wide: all warps must finish the final PV before the shared K/V
