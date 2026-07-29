@@ -1198,10 +1198,10 @@ class GqaDecodeSm90:
             (None, 0),
         )
         gK_warp = cute.local_tile(
-            gK, (16, self.head_dim), (warp_idx, 0)
+            gK, (16, self.head_dim), (warp_idx, 0, None)
         )
         gV_warp = cute.local_tile(
-            gV, (16, self.head_dim), (warp_idx, 0)
+            gV, (16, self.head_dim), (warp_idx, 0, None)
         )
         gmem_warp_copy = warp_gmem_tiled_copy.get_slice(lane_idx)
         tKgK = gmem_warp_copy.partition_S(gK_warp)
