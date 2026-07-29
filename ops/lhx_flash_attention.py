@@ -1036,16 +1036,17 @@ class GqaDecodeSm90:
                 cute.struct.MemRange[Float32, cute.cosize(sWarpLSE_layout)], 128
             ]
 
-        # 64 rows x 128 columns are cooperatively copied by 128 threads.
+        # Each warp exclusively copies and consumes one 16-token K/V slice.
+        # Its 32 lanes each issue eight 128-bit copies to cover 16 x 128 values.
         copy_atom = cute.make_copy_atom(
             cpasync.CopyG2SOp(cache_mode=cpasync.LoadCacheMode.GLOBAL),
             dtype,
             num_bits_per_copy=128,
         )
-        copy_threads = cute.make_layout((8, 16), stride=(16, 1))
-        copy_values = cute.make_layout((1, 8))
-        gmem_tiled_copy = cute.make_tiled_copy_tv(
-            copy_atom, copy_threads, copy_values
+        warp_copy_threads = cute.make_layout((2, 16), stride=(16, 1))
+        warp_copy_values = cute.make_layout((1, 8))
+        warp_gmem_tiled_copy = cute.make_tiled_copy_tv(
+            copy_atom, warp_copy_threads, warp_copy_values
         )
 
         # One independent m16n8k16 MMA per worker warp. Four warps cover the
@@ -1068,7 +1069,7 @@ class GqaDecodeSm90:
             sKV_layout,
             sWarpO_layout,
             sWarpLSE_layout,
-            gmem_tiled_copy,
+            warp_gmem_tiled_copy,
             tiled_mma,
             SharedStorage,
         ).launch(
@@ -1096,7 +1097,7 @@ class GqaDecodeSm90:
         sKV_layout: cute.ComposedLayout,
         sWarpO_layout: cute.Layout,
         sWarpLSE_layout: cute.Layout,
-        gmem_tiled_copy: cute.TiledCopy,
+        warp_gmem_tiled_copy: cute.TiledCopy,
         tiled_mma: cute.TiledMma,
         SharedStorage: cutlass.Constexpr,
     ):
@@ -1196,14 +1197,20 @@ class GqaDecodeSm90:
             (self.tile_n, self.head_dim),
             (None, 0),
         )
-        gmem_thr_copy = gmem_tiled_copy.get_slice(tidx)
-        tKgK = gmem_thr_copy.partition_S(gK)
-        tVgV = gmem_thr_copy.partition_S(gV)
-        tKsK = gmem_thr_copy.partition_D(sK)
-        tVsV = gmem_thr_copy.partition_D(sV)
+        gK_warp = cute.local_tile(
+            gK, (16, self.head_dim), (warp_idx, 0)
+        )
+        gV_warp = cute.local_tile(
+            gV, (16, self.head_dim), (warp_idx, 0)
+        )
+        gmem_warp_copy = warp_gmem_tiled_copy.get_slice(lane_idx)
+        tKgK = gmem_warp_copy.partition_S(gK_warp)
+        tVgV = gmem_warp_copy.partition_S(gV_warp)
+        tKsK = gmem_warp_copy.partition_D(sK_warp)
+        tVsV = gmem_warp_copy.partition_D(sV_warp)
         if const_expr(self.has_tail):
-            cKV = cute.make_identity_tensor((self.tile_n, self.head_dim))
-            tKVcKV = gmem_thr_copy.partition_S(cKV)
+            cKV_warp = cute.make_identity_tensor((16, self.head_dim))
+            tKVcKV = gmem_warp_copy.partition_S(cKV_warp)
 
         # Balance non-divisible block counts across splits; the runtime loop below
         # handles the 52/53 tiles without cloning its MMA body.
@@ -1220,9 +1227,10 @@ class GqaDecodeSm90:
             if first_n_block == self.num_blocks - 1:
                 tail_tokens = self.kv_len % self.tile_n
                 for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
-                    if tKVcKV[0, n, 0][0] < tail_tokens:
+                    token_in_tile = warp_idx * 16 + tKVcKV[0, n, 0][0]
+                    if token_in_tile < tail_tokens:
                         cute.copy(
-                            gmem_tiled_copy,
+                            warp_gmem_tiled_copy,
                             tKgK[None, n, None, first_n_block],
                             tKsK[None, n, None],
                         )
@@ -1230,26 +1238,26 @@ class GqaDecodeSm90:
                         tKsK[None, n, None].fill(0.0)
             else:
                 cute.copy(
-                    gmem_tiled_copy,
+                    warp_gmem_tiled_copy,
                     tKgK[None, None, None, first_n_block],
                     tKsK,
                 )
         else:
             cute.copy(
-                gmem_tiled_copy,
+                warp_gmem_tiled_copy,
                 tKgK[None, None, None, first_n_block],
                 tKsK,
             )
         cute.arch.cp_async_commit_group()
         cute.arch.cp_async_wait_group(0)
-        cute.arch.barrier()
+        cute.arch.sync_warp()
 
         # Keep one compact runtime loop instead of cloning the MMA body once per
         # KV tile. split_count is CTA-uniform and differs by at most one.
         for tile_idx in cutlass.range(split_count, unroll=1):
             n_block = first_n_block + tile_idx
             # tile_idx and split_count are both CTA-uniform, so has_next is a
-            # CTA-uniform runtime bool and the barrier/wait_group calls guarded
+            # CTA-uniform runtime bool and the warp sync/wait_group calls guarded
             # by it below execute consistently across every warp.
             has_next = tile_idx + 1 < split_count
 
@@ -1258,9 +1266,10 @@ class GqaDecodeSm90:
                 if n_block == self.num_blocks - 1:
                     tail_tokens = self.kv_len % self.tile_n
                     for n in cutlass.range_constexpr(cute.size(tVsV.shape[1])):
-                        if tKVcKV[0, n, 0][0] < tail_tokens:
+                        token_in_tile = warp_idx * 16 + tKVcKV[0, n, 0][0]
+                        if token_in_tile < tail_tokens:
                             cute.copy(
-                                gmem_tiled_copy,
+                                warp_gmem_tiled_copy,
                                 tVgV[None, n, None, n_block],
                                 tVsV[None, n, None],
                             )
@@ -1268,13 +1277,13 @@ class GqaDecodeSm90:
                             tVsV[None, n, None].fill(0.0)
                 else:
                     cute.copy(
-                        gmem_tiled_copy,
+                        warp_gmem_tiled_copy,
                         tVgV[None, None, None, n_block],
                         tVsV,
                     )
             else:
                 cute.copy(
-                    gmem_tiled_copy,
+                    warp_gmem_tiled_copy,
                     tVgV[None, None, None, n_block],
                     tVsV,
                 )
@@ -1310,21 +1319,20 @@ class GqaDecodeSm90:
                             if token_in_tile >= tail_tokens:
                                 acc_S_mn[row, col] = -Float32.inf
 
-            # K[i+1] reuses the same sK buffer as K[i]. All four warps read
-            # disjoint 16-token slices of sK during the QK loop above, so this
-            # CTA barrier (not a warp-local sync) must fire before any warp is
-            # allowed to start overwriting sK with K[i+1].
+            # K[i+1] reuses this warp's sK slice after its QK reads finish.
+            # K/V ownership is warp-local, so no other warp participates here.
             if has_next:
-                cute.arch.barrier()
+                cute.arch.sync_warp()
 
                 next_n_block = n_block + 1
                 if const_expr(self.has_tail):
                     if next_n_block == self.num_blocks - 1:
                         tail_tokens = self.kv_len % self.tile_n
                         for n in cutlass.range_constexpr(cute.size(tKsK.shape[1])):
-                            if tKVcKV[0, n, 0][0] < tail_tokens:
+                            token_in_tile = warp_idx * 16 + tKVcKV[0, n, 0][0]
+                            if token_in_tile < tail_tokens:
                                 cute.copy(
-                                    gmem_tiled_copy,
+                                    warp_gmem_tiled_copy,
                                     tKgK[None, n, None, next_n_block],
                                     tKsK[None, n, None],
                                 )
@@ -1332,13 +1340,13 @@ class GqaDecodeSm90:
                                 tKsK[None, n, None].fill(0.0)
                     else:
                         cute.copy(
-                            gmem_tiled_copy,
+                            warp_gmem_tiled_copy,
                             tKgK[None, None, None, next_n_block],
                             tKsK,
                         )
                 else:
                     cute.copy(
-                        gmem_tiled_copy,
+                        warp_gmem_tiled_copy,
                         tKgK[None, None, None, next_n_block],
                         tKsK,
                     )
@@ -1369,7 +1377,8 @@ class GqaDecodeSm90:
                 cute.arch.cp_async_wait_group(1)
             else:
                 cute.arch.cp_async_wait_group(0)
-            cute.arch.barrier()
+            # Publish only this warp's completed V copy to its PV consumers.
+            cute.arch.sync_warp()
 
             for k_tile in cutlass.range_constexpr(cute.size(tOrP.shape[2])):
                 cute.copy(
@@ -1385,13 +1394,14 @@ class GqaDecodeSm90:
                     acc_O,
                 )
 
-            # K[i+1] must be complete and visible to every warp before the next
-            # iteration's QK step is allowed to read sK.
+            # Finish this warp's PV reads before its next V overwrite, and make
+            # its completed K[i+1] copy visible before the next QK step.
             if has_next:
                 cute.arch.cp_async_wait_group(0)
-                cute.arch.barrier()
+                cute.arch.sync_warp()
 
-        # All warps have finished the final PV before K/V storage is repurposed.
+        # CTA-wide: all warps must finish the final PV before the shared K/V
+        # storage is repurposed for cross-warp output partials.
         cute.arch.barrier()
         sWarpO = cute.make_tensor(
             cute.recast_ptr(sK.iterator, dtype=Float32), sWarpO_layout
@@ -1435,6 +1445,7 @@ class GqaDecodeSm90:
         if tLcO[0][1] == 0:
             for row in cutlass.range_constexpr(cute.size(softmax.row_sum)):
                 tLsLSE[row, 0] = softmax.row_sum[row]
+        # CTA-wide: reduction reads output and LSE partials from every warp.
         cute.arch.barrier()
 
         # Four reduction warps each own two Q rows and merge the four disjoint
