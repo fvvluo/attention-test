@@ -465,13 +465,22 @@ class TransposedDecode:
 # ---------------------------------------------------------------------------
 _CACHE = {}
 _BUF = {}
+_VIEW_CACHE = {}
 
 
 def _cute4d(t):
-    return (from_dlpack(t, assumed_align=16)
+    key = (id(t), t.data_ptr(), tuple(t.shape), tuple(t.stride()), t.device.index)
+    view = _VIEW_CACHE.get(key)
+    if view is not None:
+        return view
+    view = (from_dlpack(t, assumed_align=16)
             .mark_layout_dynamic(leading_dim=3)
             .mark_compact_shape_dynamic(mode=3, stride_order=t.dim_order(),
                                         divisibility=128 // BF16.width))
+    if len(_VIEW_CACHE) >= 64:
+        _VIEW_CACHE.clear()
+    _VIEW_CACHE[key] = view
+    return view
 
 
 def decode(q, k, v, sm_scale=None, splits=DEF_SPLITS, tile_kv=TILE_KV,
@@ -494,14 +503,14 @@ def decode(q, k, v, sm_scale=None, splits=DEF_SPLITS, tile_kv=TILE_KV,
                                    stages=stages, workers=workers, sm_scale=sm_scale)
             opart = torch.empty((splits, HK, GROUP, D, B), dtype=torch.bfloat16, device=q.device)
             lse = torch.empty((splits, HK, GROUP, B), dtype=torch.float32, device=q.device)
+            opart_view = from_dlpack(opart, assumed_align=16)
+            lse_view = from_dlpack(lse, assumed_align=16)
             args = (_cute4d(q), _cute4d(k), _cute4d(v),
-                    from_dlpack(opart, assumed_align=16),
-                    from_dlpack(lse, assumed_align=16), _cute4d(o), stream)
+                    opart_view, lse_view, _cute4d(o), stream)
             comp = cute.compile(ker, *args)
-            ent = (comp, opart, lse)
+            ent = (comp, opart, lse, opart_view, lse_view)
             _CACHE[key] = ent
-        comp, opart, lse = ent
+        comp, opart, lse, opart_view, lse_view = ent
         comp(_cute4d(q), _cute4d(k), _cute4d(v),
-             from_dlpack(opart, assumed_align=16),
-             from_dlpack(lse, assumed_align=16), _cute4d(o), stream)
+             opart_view, lse_view, _cute4d(o), stream)
     return o
