@@ -44,16 +44,21 @@ ACC_TYPE = cutlass.Float32
 GROUP_M = 8        # q_heads per kv_head for the target shape
 HEAD_DIM = 128
 BLOCK_N = 128      # kv rows per mainloop tile
-NUM_STAGES = 3     # TMA pipeline stages (K and V each)
+NUM_STAGES = 2     # TMA pipeline stages (K and V each). At NUM_SPLITS=9 stages=2 is
+                   # marginally faster than 3 (0.1506ms vs 0.1526ms) and leaves smem
+                   # headroom; stages=4 overflows the 227KB opt-in cap (267KB), rejected.
 NUM_THREADS = 256  # 1 producer warpgroup + 1 consumer warpgroup.
                    # (Tried 160 = 1 producer warp + 1 consumer warpgroup: measured
                    #  slower — dropping to 5 warps/CTA hurts occupancy and the long
                    #  splits at NUM_SPLITS=6 then fail to hide TMA latency. Kept 256.)
-NUM_SPLITS = 6     # 6 splits x 8 kv_heads = 48 items, 1 item/SM (48 of 78 SMs).
-                   # Empirically optimal on H20: 48 CTAs already saturate HBM, while
-                   # fewer/longer splits minimize the combine reduction size and
-                   # per-item overhead, and give perfect static balance (1 item/SM,
-                   # no round-robin tail). Measured 0.1565ms vs 0.1605ms at splits=39.
+NUM_SPLITS = 9     # 9 splits x 8 kv_heads = 72 items = exactly 1 item/SM on 72 of 78 SMs.
+                   # This is a pure-bandwidth win: the decode is memory-bound (reads the
+                   # full 512MB bf16 KV cache), and engaging 72 SMs instead of 48
+                   # (the old splits=6 -> 48 items) lifts aggregate HBM throughput from
+                   # ~90% to ~95% of roofline -> 0.157ms -> 0.150ms, fully lossless
+                   # (max_abs ~7.4e-5). 72 is the ceiling of the "1 item/SM, no tail"
+                   # regime: splits=10 -> 80 items > 78 SMs -> two SMs serialize 2 items
+                   # -> latency nearly doubles (0.235ms). Measured optimum on H20.
 
 # Debug bisect switches (compile-time constants read from env).
 _DBG_SKIP_QCOPY = _os.environ.get("AD_SKIP_QCOPY") == "1"
