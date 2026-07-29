@@ -129,7 +129,7 @@ class Softmax(ParamsBase):
         acc_S: cute.Tensor,
         is_first: cutlass.Constexpr[bool] = False,
         check_inf: cutlass.Constexpr[bool] = True,
-        rescale_threshold_log2: cutlass.Constexpr[float] = 0.0,
+        rescale_floor: cutlass.Constexpr[float] = 1.0,
     ) -> cute.Tensor:
         """Apply online softmax and return the row_scale to rescale O.
 
@@ -151,37 +151,37 @@ class Softmax(ParamsBase):
         for r in cutlass.range(cute.size(row_max), unroll_full=True):
             acc_S_row = acc_S_mn[r, None].load()  # (n_block_size)
 
-            row_max_new = utils.fmax_reduce(
+            row_max_cur = utils.fmax_reduce(
                 acc_S_row,
                 init_val=row_max[r] if cutlass.const_expr(not is_first) else None,
                 arch=arch,
             )
-            row_max_new = cute.arch.warp_reduction_max(row_max_new, threads_in_group=4)
-            row_max_prev = row_max[r]
+            row_max_cur = cute.arch.warp_reduction_max(row_max_cur, threads_in_group=4)
 
             if cutlass.const_expr(check_inf):
-                row_max_safe = (
-                    Float32(0.0) if row_max_new == -Float32.inf else row_max_new
-                )
-            else:
-                row_max_safe = row_max_new
+                row_max_is_neg_inf = row_max_cur == -Float32.inf
+                row_max_cur = Float32(0.0) if row_max_is_neg_inf else row_max_cur
 
             if cutlass.const_expr(is_first):
                 row_scale[r] = 1.0
             else:
-                acc_scale_log2 = (row_max_prev - row_max_safe) * scale_log2
-                row_scale[r] = cute.math.exp2(acc_scale_log2, fastmath=True)
+                row_scale[r] = cute.math.exp2(
+                    (row_max[r] - row_max_cur) * scale_log2, fastmath=True
+                )
 
-                if cutlass.const_expr(rescale_threshold_log2 > 0.0):
-                    if acc_scale_log2 >= -Float32(rescale_threshold_log2):
-                        row_max_new = row_max_prev
-                        row_max_safe = row_max_prev
+                if cutlass.const_expr(rescale_floor < 1.0):
+                    if row_scale[r] >= Float32(rescale_floor):
+                        row_max_cur = row_max[r]
                         row_scale[r] = 1.0
 
-            row_max[r] = row_max_new
-            row_max_scaled = row_max_safe * scale_log2
+            if cutlass.const_expr(check_inf):
+                row_max[r] = -Float32.inf if row_max_is_neg_inf else row_max_cur
+            else:
+                row_max[r] = row_max_cur
+
+            row_max_cur = row_max_cur * scale_log2
             acc_S_row_exp = cute.math.exp2(
-                acc_S_row * scale_log2 - row_max_scaled, fastmath=True
+                acc_S_row * scale_log2 - row_max_cur, fastmath=True
             )
 
             if cutlass.const_expr(is_first):
