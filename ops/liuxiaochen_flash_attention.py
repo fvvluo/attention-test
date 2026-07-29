@@ -48,6 +48,47 @@ def attention(q, k, v, causal=True, sm_scale=None):
         )
         if _decode_dir not in sys.path:
             sys.path.insert(0, _decode_dir)
+        _mma_dir = os.path.join(os.path.dirname(__file__), "liuxiaochen_mma_decode")
+        if _mma_dir not in sys.path:
+            sys.path.insert(0, _mma_dir)
+
+        # ---- B7 fast path (optimized warp-MMA + cp.async + PDL) ----
+        # For the official fixed target shape, route decode to the B7 warp-MMA
+        # kernel (m16n8k16 Tensor-Core QK/PV, cp.async double-buffered K/V, PDL),
+        # ~1.5x faster than the B3/B4 SIMT split-KV path at 128K. Selection is by
+        # explicit shape check (NOT try/except), so a genuine B7 bug on a
+        # supported shape surfaces rather than being silently masked. Shapes B7
+        # does not support fall through to the B3/B4 auto path below.
+        #   B7 target: B=1, Hq=64, Hkv=8, D=128, BF16, CUDA SM90, contiguous,
+        #              kv_len % 64 == 0.
+        def _b7_supported():
+            impl_env = os.environ.get("LIUXIAOCHEN_DECODE_IMPL", "").strip().lower()
+            if impl_env not in ("", "auto", "b7", "mma"):
+                return False  # an explicit non-B7 impl was requested
+            import torch
+            if q.dtype != torch.bfloat16 or k.dtype != torch.bfloat16 or v.dtype != torch.bfloat16:
+                return False
+            if not (q.is_cuda and k.is_cuda and v.is_cuda):
+                return False
+            if tuple(q.shape) != (1, 64, 1, 128):
+                return False
+            if k.dim() != 4 or (k.shape[0], k.shape[1], k.shape[3]) != (1, 8, 128):
+                return False
+            if tuple(k.shape) != tuple(v.shape):
+                return False
+            if kv_len % 64 != 0:
+                return False
+            if not (q.is_contiguous() and k.is_contiguous() and v.is_contiguous()):
+                return False
+            major, minor = torch.cuda.get_device_capability(q.device)
+            if (major, minor) != (9, 0):
+                return False
+            return True
+
+        if _b7_supported():
+            from runner_b7 import mma_decode_b7
+            # num_splits=None -> B7 heuristic (min(256, kv_len//64), even divisor).
+            return mma_decode_b7(q, k, v, sm_scale=sm_scale, num_splits=None)
 
         # Length-adaptive threshold: B4 for kv_len >= this, else B3.
         B4_MIN_KV_LEN = 16384
