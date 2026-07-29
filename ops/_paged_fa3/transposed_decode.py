@@ -496,8 +496,8 @@ def decode(q, k, v, sm_scale=None, splits=DEF_SPLITS, tile_kv=TILE_KV,
         ent = _CACHE.get(key)
         if ent is None:
             if workers is None:
-                # 给 combine/调度保留一个 SM；H20 78 SM 时使用 77 workers。
-                workers = max(1, torch.cuda.get_device_properties(q.device).multi_processor_count - 1)
+                # 使用全部H20 SM运行persistent split workers。
+                workers = torch.cuda.get_device_properties(q.device).multi_processor_count
             ker = TransposedDecode(H, HK, S, B, splits=splits, tile_kv=tile_kv, v_stages=v_stages,
                                    stages=stages, workers=workers, sm_scale=sm_scale)
             opart = torch.empty((splits, HK, GROUP, D, B), dtype=torch.bfloat16, device=q.device)
